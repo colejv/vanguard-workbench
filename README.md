@@ -87,6 +87,34 @@ python -m src.crew
 
 ```
 
+Here is the exact markdown section to add to your `README.md` to document the new Purple Team and Defensive Engineering pipeline, followed by the terminal commands to push everything safely to your repository.
+
+## 4. Phase 3: Purple Team & Defensive Engineering
+
+Vanguard includes a decoupled, defensively-scoped compiler that consumes the Red Team MDMP plan to orchestrate validation testing and generate SIEM detection rules. To prevent weaponization, this pipeline **does not** generate offensive exploit code. It strictly crosswalks payloads against published atomic tests and flags coverage gaps.
+
+### Step 3A: The Purple Team Compiler
+The compiler parses the Stage 4 MDMP output, extracts the technique IDs, and crosswalks them against the live [Atomic Red Team](https://github.com/redcanaryco/atomic-red-team) index. 
+
+```bash
+python src/purple/purple_compiler.py
+
+```
+
+* **Coverage Map:** Outputs a CLI interface detailing which techniques have vetted `[VETTED]` tests ready to pull, and which are `[COVERAGE GAP]` items the Purple Team must source or author under their own authority.
+* **Scaffold Generation:** Exports the parsed telemetry and alert criteria to `outputs/purple_scaffold.json`.
+
+### Step 3B: Sigma Rule Generation
+
+Once the scaffold is generated, the defensive LLM translates the natural language Blue Team assessment criteria (e.g., "Position Jump > 1m") into structured, machine-readable Sigma rules.
+
+```bash
+python src/purple/sigma_generator.py
+
+```
+
+* **Detection Artifacts:** Automatically writes strictly formatted `.yml` Sigma rules to `outputs/sigma_rules/` for immediate ingestion into Blue Team SIEM platforms (Splunk, Elastic, etc.).
+
 ### The Autonomous Pipeline
 
 Vanguard executes via a strict, doctrinal sequential process:

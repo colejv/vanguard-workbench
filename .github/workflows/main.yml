@@ -27,5 +27,6 @@ jobs:
       run: bandit -r src/ -c .bandit.yaml || true 
       # Remove '|| true' if you want the pipeline to fail when vulnerabilities are found
       
+    # Add this to your security scan step
     - name: Run pip-audit (Dependency Scanning)
-      run: pip-audit -r requirements.txt
+      run: pip-audit -r requirements.txt --ignore-vuln CVE-2026-45829

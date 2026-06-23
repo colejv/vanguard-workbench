@@ -1,0 +1,4 @@
+ATT&CK Enterprise/ICS/Mobile : v18.1
+CAPEC                        : 3.9
+EMB3D                        : 2.0
+SPARTA                       : v3.1

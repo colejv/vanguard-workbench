@@ -1,0 +1,23 @@
+# Python Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Project Specific Directories (Local State)
+sources/*
+outputs/*
+
+# Ignore dynamically generated corpus data, but keep the MITRE indices
+corpus-index/corpus_chunks.json
+corpus-index/manifest_v*.json
+
+# CrewAI / Local DBs
+*.db
+*.sqlite3
+
+# Environment Variables (Keep API keys and configs local)
+.env
+
+# OS generated files
+.DS_Store

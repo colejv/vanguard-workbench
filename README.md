@@ -135,6 +135,6 @@ All outputs are saved to the `outputs/` directory in Markdown format.
 
 * [ ] **Streamlit GUI:** Transition from CLI to a web-based dashboard for dynamic SUT selection and individual stage execution.
 * [ ] **Corpus Chat (Local RAG):** Implementation of ChromaDB and local embedding models (`mxbai-embed-large`) for conversational Q&A against the versioned SUT corpus.
-* [ ] **Dynamic Tooling:** Direct Shodan/Nmap parsing integration for Live-Environment testing.
+* [ ] **Dynamic Tooling:** Direct Shodan/Nmap parsing integration for Live-Environment testing. (This will be fun!)
 
 

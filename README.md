@@ -1,8 +1,3 @@
-Here is a comprehensive `README.md` drafted specifically for the Vanguard Workbench architecture we just built. It covers the local LLM setup, the OPSEC-safe collection pipeline using SearXNG, and the automated snapshot execution.
-
----
-
-```markdown
 # Vanguard Workbench: Autonomous Information Warfare Analysis
 
 Vanguard Workbench is an agentic AI pipeline designed for Information Warfare (IW) analysis, Reverse Intelligence Preparation of the Battlefield (IPB), and Red Team mission planning against friendly Systems Under Test (SUT). 

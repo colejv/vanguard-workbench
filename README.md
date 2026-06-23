@@ -108,6 +108,4 @@ All outputs are saved to the `outputs/` directory in Markdown format.
 * [ ] **Corpus Chat (Local RAG):** Implementation of ChromaDB and local embedding models (`mxbai-embed-large`) for conversational Q&A against the versioned SUT corpus.
 * [ ] **Dynamic Tooling:** Direct Shodan/Nmap parsing integration for Live-Environment testing.
 
-```
 
-```

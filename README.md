@@ -58,11 +58,11 @@ docker-compose up -d
 
 *SearXNG is now running locally on `http://localhost:8080`.*
 
-### Step 1B: Define the Assessment Brief (Target SUT)
+### Step 2B: Define the Assessment Brief (Target SUT)
 
 Open `collection/brief.md`. This file acts as the single source of truth for the entire operation. Define your System Under Test (SUT) designation, the vendor, and specific collection priorities.
 
-### Step 1C: Execute Autonomous Collection
+### Step 2C: Execute Autonomous Collection
 Run the collector script to query the local SearXNG instance for technical documentation, vendor whitepapers, and exercise reports regarding the SUT. It will read your `brief.md`, autonomously generate iterative search queries using Gemma 4, scrape the results via SearXNG, score them for relevance, and save the best documents to the corpus.
 
 ```bash

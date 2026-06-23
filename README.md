@@ -58,22 +58,23 @@ docker-compose up -d
 
 *SearXNG is now running locally on `http://localhost:8080`.*
 
-### Step 2B: Execute Collection
+### Step 1B: Define the Assessment Brief (Target SUT)
 
-Use the collector script to query the local SearXNG instance for technical documentation, vendor whitepapers, and exercise reports regarding the SUT.
+Open `collection/brief.md`. This file acts as the single source of truth for the entire operation. Define your System Under Test (SUT) designation, the vendor, and specific collection priorities.
+
+### Step 1C: Execute Autonomous Collection
+Run the collector script to query the local SearXNG instance for technical documentation, vendor whitepapers, and exercise reports regarding the SUT. It will read your `brief.md`, autonomously generate iterative search queries using Gemma 4, scrape the results via SearXNG, score them for relevance, and save the best documents to the corpus.
 
 ```bash
 cd ..
-python collector.py
+python collection/collector.py collection/brief.md
 
 ```
 
-* Save the downloaded PDF, TXT, or MD reports directly into the root `sources/` directory.
+* Saves the downloaded PDF, TXT, or MD reports directly into the root `sources/` directory.
+* A provenance log is automatically generated at `sources/_provenance.jsonl` to track the origin and hash of every piece of intelligence gathered.
 * **Note:** The pipeline supports dynamic ingestion. You can drop new files into `sources/` at any time between runs.
 
-### Step 2C: Define the Assessment Brief
-
-Open `collection/brief.md` and define the specific Intelligence Requirements (IRs) and SUT scope for the Red Team agents to focus on.
 
 ---
 

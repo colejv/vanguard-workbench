@@ -1,0 +1,31 @@
+name: Python Security Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit pip-audit
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        
+    - name: Run Bandit (Code Scanning)
+      run: bandit -r src/ -c .bandit.yaml || true 
+      # Remove '|| true' if you want the pipeline to fail when vulnerabilities are found
+      
+    - name: Run pip-audit (Dependency Scanning)
+      run: pip-audit -r requirements.txt

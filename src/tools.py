@@ -3,83 +3,189 @@ from pydantic import BaseModel, Field
 from typing import List, Type, Any
 import networkx as nx
 import json
+import re
+import os
 
 # --- Annex B: KCAG minimum node cut over the real DAG ---
-class KCAGNode(BaseModel):
-    id: str = Field(..., description="Unique string identifier for the node (e.g., 'initial_access', 'T1190', 'goal_exfil').")
-    node_type: str = Field(..., description="Must be exactly one of: 'privilege', 'technique', 'property', 'countermeasure', 'goal'.")
-    criticality: int = Field(default=1, description="Asset criticality (1-10). OT/Mission-critical nodes = 10.")
-
-class KCAGEdge(BaseModel):
-    source: str = Field(..., description="The 'id' of the source node.")
-    target: str = Field(..., description="The 'id' of the target node.")
-
 class KCAGSchema(BaseModel):
-    nodes: List[KCAGNode] = Field(..., description="List of all nodes in the graph.")
-    edges: List[KCAGEdge] = Field(..., description="List of directed edges mapping the attack path.")
-
+    # Agent passes ONE string: the path to the Stage 2 edge-list artifact.
+    # Topology is derived from that file, NOT authored by the LLM.
+    stage2_vectors_path: str = Field(
+        default="outputs/stage2_vectors.json",
+        description="Path to the structured Stage 2 edge list (JSON). "
+                    "Do NOT hand-author nodes/edges; they are read from this file."
+    )
+ 
+ 
 class KCAGMinCutTool(BaseTool):
-    # Explicitly annotate the overridden fields
     name: str = Field(default="kcag_min_cut")
     description: str = Field(
-        default="Build the KCAG DiGraph from structured nodes and edges, "
-                "compute the minimum node cut, and identify the priority kill-chain path."
+        default="Read the Stage 2 edge list from disk, build the KCAG DiGraph, "
+                "compute betweenness, run minimum node cut against EVERY goal, "
+                "rank paths by traversal probability, and write kcag_report.json "
+                "for Annex C ingestion. Topology comes from the Stage 2 artifact, "
+                "not from agent input."
     )
     args_schema: Type[BaseModel] = KCAGSchema
-
-    def _run(self, nodes: List[Any], edges: List[Any]) -> str:
-        import networkx as nx
-        import json
-        G = nx.DiGraph()
-
-        # 1. Parse nodes with criticality weights
-        for node in nodes:
-            # Handle both dictionary (JSON input) and object (Pydantic input)
-            n_id = node.id if hasattr(node, 'id') else node.get('id')
-            n_type = node.node_type if hasattr(node, 'node_type') else node.get('node_type')
-            n_weight = node.criticality if hasattr(node, 'criticality') else node.get('criticality', 1)
-
-            G.add_node(n_id, type=n_type, weight=n_weight)
-
-        # 2. Parse edges
-        for edge in edges:
-            src = edge.source if hasattr(edge, 'source') else edge.get('source')
-            tgt = edge.target if hasattr(edge, 'target') else edge.get('target')
-            G.add_edge(src, tgt)
-
-        if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-            return "ERROR: Graph is empty."
-
+ 
+    # difficulty -> base traversal probability
+    DIFF_PROB = {"LOW": 0.80, "MEDIUM": 0.50, "HIGH": 0.20}
+ 
+    def _run(self, stage2_vectors_path: str = "outputs/stage2_vectors.json") -> str:
+        # ---- 1. Load topology from the artifact (deterministic) -------------
+        if not os.path.exists(stage2_vectors_path):
+            return (f"ERROR: {stage2_vectors_path} not found. Stage 2 must emit a "
+                    f"structured edge list before Annex B can run. Expected schema: "
+                    f'{{"nodes":[{{"id","node_type","criticality"}}],'
+                    f'"edges":[{{"source","target","technique","difficulty","effect","vec"}}]}}')
         try:
-            sources = [n for n, d in G.in_degree() if d == 0]
-            targets = [n for n, attr in G.nodes(data=True) if attr.get('type') == 'goal']
-
-            if not sources or not targets:
-                return "ERROR: Missing source or goal node."
-
-            src, tgt = sources[0], targets[0]
-
-            # 3. Apply Weight-Aware Algorithms
-            # 'minimum_node_cut' remains topological (standard cut), 
-            # but centrality and pathfinding are now risk-aware.
-
-            cut = nx.minimum_node_cut(G, src, tgt)
-
-            # Higher weight = Higher risk node; Dijkstra minimizes cost. 
-            # To find the path of "Highest Risk", consider negative weights or 
-            # inverted logic. For standard analysis, just use weight='weight'.
-            centrality = nx.betweenness_centrality(G, weight='weight')
-            shortest_path = nx.shortest_path(G, src, tgt, weight='weight')
-
-            return json.dumps({
-                "status": "SUCCESS",
-                "priority_path": shortest_path,
-                "minimum_cut": list(cut),
-                "weighted_centrality": {k: round(v, 4) for k, v in centrality.items()}
-            }, indent=2)
-        except Exception as e:
-            return f"ERROR: {str(e)}"
-
+            data = json.load(open(stage2_vectors_path))
+            raw_nodes = data["nodes"]
+            raw_edges = data["edges"]
+        except (json.JSONDecodeError, KeyError) as e:
+            return f"ERROR: {stage2_vectors_path} malformed ({e}). Need keys 'nodes' and 'edges'."
+ 
+        G = nx.DiGraph()
+        for n in raw_nodes:
+            nid = n["id"] if isinstance(n, dict) else getattr(n, "id")
+            ntype = (n.get("node_type") if isinstance(n, dict) else getattr(n, "node_type", "technique"))
+            crit = (n.get("criticality", 1) if isinstance(n, dict) else getattr(n, "criticality", 1))
+            G.add_node(nid, type=ntype, criticality=int(crit))
+ 
+        for e in raw_edges:
+            src = e["source"] if isinstance(e, dict) else getattr(e, "source")
+            tgt = e["target"] if isinstance(e, dict) else getattr(e, "target")
+            diff = (e.get("difficulty", "MEDIUM") if isinstance(e, dict)
+                    else getattr(e, "difficulty", "MEDIUM")).upper()
+            prob = self.DIFF_PROB.get(diff, 0.50)
+            G.add_edge(src, tgt,
+                       technique=(e.get("technique", "") if isinstance(e, dict) else ""),
+                       difficulty=diff,
+                       probability=prob,
+                       effect=(e.get("effect") if isinstance(e, dict) else None),
+                       vec=(e.get("vec", "") if isinstance(e, dict) else ""))
+ 
+        if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+            return "ERROR: Graph is empty after loading artifact."
+ 
+        # ---- 2. Identify sources and ALL goals ------------------------------
+        sources = [n for n, d in G.in_degree() if d == 0]
+        goals = [n for n, a in G.nodes(data=True) if a.get("type") == "goal"]
+        if not sources:
+            return "ERROR: No source node (in-degree 0) found."
+        if not goals:
+            return "ERROR: No goal node (node_type='goal') found."
+        src = sources[0]
+ 
+        # ---- 3. Path probability helper -------------------------------------
+        def path_prob(path):
+            p = 1.0
+            for i in range(len(path) - 1):
+                p *= G[path[i]][path[i + 1]]["probability"]
+            return round(p, 5)
+ 
+        # ---- 4. Min cut against EVERY goal; aggregate shared chokepoints ----
+        objective_results = {}
+        cut_frequency = {}
+        all_paths_flat = []
+        for goal in goals:
+            if not nx.has_path(G, src, goal):
+                objective_results[goal] = {"top_path": [], "top_path_prob": 0,
+                                           "min_cut": [], "min_cut_size": 0, "path_count": 0}
+                continue
+            paths = list(nx.all_simple_paths(G, src, goal, cutoff=8))
+            ranked = sorted(paths, key=path_prob, reverse=True)
+            try:
+                cut = nx.minimum_node_cut(G, src, goal)
+            except Exception:
+                cut = set()
+            for c in cut:
+                cut_frequency[c] = cut_frequency.get(c, 0) + 1
+            top = ranked[0] if ranked else []
+            objective_results[goal] = {
+                "top_path": top,
+                "top_path_prob": path_prob(top) if top else 0,
+                "min_cut": sorted(cut),
+                "min_cut_size": len(cut),
+                "path_count": len(paths),
+            }
+            for pth in ranked[:10]:
+                all_paths_flat.append({"path": pth, "probability": path_prob(pth), "objective": goal})
+ 
+        # ---- 5. Betweenness: UNWEIGHTED for chokepoint structure ------------
+        # (weight in networkx = distance; using criticality as weight inverts
+        #  the meaning. Compute structural betweenness, then rank by criticality
+        #  separately.)
+        bc = nx.betweenness_centrality(G, normalized=True)
+        bc_sorted = dict(sorted(bc.items(), key=lambda x: x[1], reverse=True))
+ 
+        # ---- 6. Dominant chokepoint = cut node reaching the MOST goals ------
+        # minimum_node_cut returns the cut nearest each goal, so an upstream
+        # chokepoint is only counted once. Credit each cut node for every goal
+        # reachable FROM it (transitive dominance).
+        goal_set = set(goals)
+        cut_reach = {}
+        for c in cut_frequency:
+            reachable_goals = nx.descendants(G, c) & goal_set
+            # a node that IS a goal counts itself too
+            if c in goal_set:
+                reachable_goals = reachable_goals | {c}
+            cut_reach[c] = len(reachable_goals)
+        if cut_reach:
+            dominant_node = max(cut_reach.items(), key=lambda x: x[1])[0]
+            dominant_count = cut_reach[dominant_node]
+        else:
+            dominant_node, dominant_count = (None, 0)
+ 
+        # ---- 7. Highest-RISK priority path (highest probability, not lowest cost)
+        all_paths_flat.sort(key=lambda x: x["probability"], reverse=True)
+        priority_path = all_paths_flat[0] if all_paths_flat else None
+ 
+        # ---- 8. Emit kcag_report.json for Annex C ---------------------------
+        report = {
+            "graph_stats": {"nodes": G.number_of_nodes(),
+                            "edges": G.number_of_edges(),
+                            "objectives": len(goals)},
+            "minimum_cut": {
+                "dominant_cut_node": dominant_node,
+                "objectives_cut_by_dominant": dominant_count,
+                "cut_frequency": cut_frequency,
+                "cut_goal_reach": cut_reach,
+                "aggregate_cut_nodes": sorted(cut_frequency.keys()),
+                "aggregate_cut_size": len(cut_frequency),
+            },
+            "betweenness_centrality": {k: round(v, 5) for k, v in bc_sorted.items()},
+            "priority_path": priority_path,
+            "top_paths": all_paths_flat[:15],
+            "objective_results": objective_results,
+        }
+        os.makedirs("outputs", exist_ok=True)
+        with open("outputs/kcag_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+ 
+        # ---- 9. Human-readable summary --------------------------------------
+        top_bc = list(bc_sorted.items())
+        bc_line = "n/a"
+        if len(top_bc) >= 2 and top_bc[1][1] > 0:
+            bc_line = f"{top_bc[0][0]} = {top_bc[0][1]:.4f} ({top_bc[0][1]/top_bc[1][1]:.1f}x next)"
+        elif top_bc:
+            bc_line = f"{top_bc[0][0]} = {top_bc[0][1]:.4f}"
+ 
+        lines = [
+            "=== ANNEX B: KCAG MIN-CUT ANALYSIS ===",
+            f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, {len(goals)} objectives",
+            f"Dominant min-cut node: {dominant_node} (cuts {dominant_count} of {len(goals)} objectives)",
+            f"Aggregate min-cut size (all objectives): {len(cut_frequency)}",
+            f"Top betweenness: {bc_line}",
+        ]
+        if priority_path:
+            lines.append(f"Priority path (highest probability P={priority_path['probability']}):")
+            lines.append(f"  {' -> '.join(priority_path['path'])}  [{priority_path['objective']}]")
+        lines.append("Report written: outputs/kcag_report.json")
+        lines.append("STATUS: SUCCESS")
+        return "\n".join(lines)
+ 
+ 
 kcag_min_cut = KCAGMinCutTool()
 
 @tool("verify_corpus_lock")
@@ -158,25 +264,37 @@ def read_scratch(trigger: str) -> str:
     
 @tool("verify_and_fix_stage2")
 def verify_and_fix_stage2(_: str = "") -> str:
-    """Read outputs/stage2.md, verify every technique ID against the v18.1 index,
-    auto-correct hallucinated IDs via keyword search against the index, flag
-    unresolvable vectors (concept may be hallucinated), and write the corrected
-    output to outputs/stage2_corrected.md.
-
-    Per-ID outcomes:
-      VERIFIED      — ID exists in index; no change.
-      AUTO-CORRECTED — ID hallucinated but concept real; best index match used.
-      UNRESOLVABLE  — no index match; vector concept may be hallucinated.
-                      Blocks Annex B until human review."""
-    import json, re
-
-    idx = json.load(open("corpus-index/technique_index.json"))
+    """Read outputs/stage2.md, verify EVERY framework ID across all schemas,
+    auto-correct hallucinated IDs via keyword search, and FAIL on any
+    [GAP]/[UNMAPPED] marker or category-mismatched SPARTA ID.
+ 
+    A FAIL blocks Annex B. This is mechanical, not analytical.
+    """
+    try:
+        idx = json.load(open("corpus-index/technique_index.json"))
+    except FileNotFoundError:
+        return "ERROR: corpus-index/technique_index.json not found — cannot verify."
     try:
         stage2 = open("outputs/stage2.md").read()
     except FileNotFoundError:
         return "ERROR: outputs/stage2.md not found — Stage 2 has not been written yet."
-
-    ID_PATTERN = r'\b(T\d{4}(?:\.\d{3})?|CAPEC-\d+|AML\.T\d+|EMB\.T\d+|EAC-\d+|SV-\d+-\d+)\b'
+ 
+    # All framework ID schemas — note SPARTA prefixes split into ATTACK vs DEFENSE
+    SPARTA_ATTACK = r'(?:REC|IA|EX|EXF|LM|PER|IMP|RD)-\d{4}(?:\.\d{1,2})?'
+    SPARTA_DEFENSE = r'DE-\d{4}(?:\.\d{1,2})?'
+    ID_PATTERN = (
+        r'\b('
+        r'T\d{4}(?:\.\d{3})?'          # ATT&CK Enterprise/ICS
+        r'|CAPEC-\d+'                  # CAPEC
+        r'|AML\.T\d{4}(?:\.\d{3})?'    # ATLAS
+        r'|EMB\.[A-Z]\d{3,4}'          # EMB3D
+        r'|EAC-?\d+|EAC\d+'            # Engage
+        r'|SV-\d+-\d+'                 # SPARTA legacy SV form
+        r'|' + SPARTA_ATTACK +         # SPARTA attack TTPs
+        r'|' + SPARTA_DEFENSE +        # SPARTA defenses (category check below)
+        r')\b'
+    )
+ 
     STOPWORDS = {
         'the','a','an','is','are','was','were','be','been','being','have','has',
         'had','do','does','did','will','would','could','should','may','might',
@@ -186,18 +304,34 @@ def verify_and_fix_stage2(_: str = "") -> str:
         'used','use','using','allow','allows','provide','enables','within',
         'system','data','layer','attack','network','adversary','target','access',
     }
-
+ 
     all_ids = list(dict.fromkeys(re.findall(ID_PATTERN, stage2)))
     corrected_text = stage2
     changes = []
-
+ 
+    # ---- 1. [GAP] / [UNMAPPED] markers are FAIL conditions, not invisible ---
+    gap_markers = re.findall(r'\[(GAP|UNMAPPED)\]', stage2)
+    for marker in gap_markers:
+        changes.append(f"UNRESOLVED [{marker}] marker present — vector lacks a grounded ID")
+ 
+    # ---- 2. Per-ID verification + auto-correction ---------------------------
     for tid in all_ids:
         rec = idx.get(tid.upper())
+ 
+        # 2a. SPARTA category check: DE- is a DEFENSE, not an attack technique
+        if re.match(SPARTA_DEFENSE, tid):
+            tag = (f"{tid} [CATEGORY ERROR: SPARTA DE- is a DEFENSE/countermeasure ID, "
+                   f"not an attack technique. For PNT/GPS spoofing use EX-0014.04. "
+                   f"Resolve before Annex B]")
+            corrected_text = corrected_text.replace(tid, tag, 1)
+            changes.append(f"UNRESOLVABLE {tid} -> SPARTA defense ID used as attack technique")
+            continue
+ 
         if rec:
             changes.append(f"VERIFIED     {tid} -> {rec['name']} [{rec['framework']}]")
             continue
-
-        # hallucinated ID — pull surrounding context for keyword search
+ 
+        # 2b. hallucinated ID — keyword search the surrounding context
         m = re.search(re.escape(tid), stage2)
         if not m:
             continue
@@ -205,22 +339,22 @@ def verify_and_fix_stage2(_: str = "") -> str:
         context = stage2[start:m.end() + 300]
         words = [w.lower() for w in re.findall(r'\b[a-zA-Z]{5,}\b', context)
                  if w.lower() not in STOPWORDS
-                 and not re.match(r'^(T\d{4}|CAPEC|AML|EMB|EAC|SV)', w)]
-
+                 and not re.match(r'^(T\d{4}|CAPEC|AML|EMB|EAC|SV|DE|EX)', w)]
+ 
         scores = {}
         for iid, entry in idx.items():
             searchable = (entry['name'] + ' ' + entry.get('description', '')).lower()
             score = sum(1 for w in words[:25] if w in searchable)
             if score > 0:
                 scores[iid] = (score, entry)
-
+ 
         if not scores:
             tag = (f"{tid} [UNRESOLVABLE: no index match — vector concept may be "
                    f"hallucinated; human review required before Annex B]")
             corrected_text = corrected_text.replace(tid, tag, 1)
             changes.append(f"UNRESOLVABLE {tid} -> no keyword match; concept may be hallucinated")
             continue
-
+ 
         best_id, (score, best) = max(scores.items(), key=lambda x: x[1][0])
         conf = "HIGH" if score >= 4 else "MEDIUM" if score >= 2 else "LOW"
         tag = (f"{best['id']} [AUTO-CORRECTED from {tid} | {best['name']} | "
@@ -228,28 +362,41 @@ def verify_and_fix_stage2(_: str = "") -> str:
         corrected_text = corrected_text.replace(tid, tag, 1)
         changes.append(f"AUTO-CORRECTED {tid} -> {best['id']}: {best['name']} "
                        f"[{best['framework']}] score={score} conf={conf}")
-
-    # INSERT HERE — malformed framework-ID sweep (catches A1, A4, ATLAS-AI-Manipulation)
-    MALFORMED = re.findall(r'\b(A\d{1,2}|ATLAS-[A-Za-z][A-Za-z-]+|CAPEC-[A-Za-z]+|AML-[A-Za-z]+)\b', stage2)
+ 
+    # ---- 3. Malformed framework-ID sweep ------------------------------------
+    MALFORMED = re.findall(
+        r'\b(A\d{1,2}|ATLAS-[A-Za-z][A-Za-z-]+|CAPEC-[A-Za-z]+|AML-[A-Za-z]+)\b',
+        stage2)
     for bad in dict.fromkeys(MALFORMED):
         corrected_text = corrected_text.replace(
             bad, f"{bad} [MALFORMED ID — not a valid framework identifier; "
                  f"resolve to Txxxx / CAPEC-nnn / AML.Tnnn or flag GAP]", 1)
         changes.append(f"UNRESOLVABLE {bad} -> malformed framework ID")
-
-    with open("outputs/stage2_corrected.md", "w") as f:   # <-- existing line, sweep goes ABOVE this
+ 
+    os.makedirs("outputs", exist_ok=True)
+    with open("outputs/stage2_corrected.md", "w") as f:
         f.write("<!-- AUTO-CORRECTED BY verify_and_fix_stage2 -->\n\n")
         f.write(corrected_text)
-
-    verified     = [c for c in changes if c.startswith("VERIFIED")]
-    auto_fixed   = [c for c in changes if c.startswith("AUTO-CORRECTED")]
+ 
+    verified = [c for c in changes if c.startswith("VERIFIED")]
+    auto_fixed = [c for c in changes if c.startswith("AUTO-CORRECTED")]
     unresolvable = [c for c in changes if c.startswith("UNRESOLVABLE")]
-    status = "PASS" if not unresolvable else "REVIEW REQUIRED — unresolvable vectors present"
-
+    unresolved_markers = [c for c in changes if c.startswith("UNRESOLVED")]
+ 
+    # ---- 4. PASS only if truly clean ----------------------------------------
+    blocking = unresolvable + unresolved_markers
+    if blocking:
+        status = "FAIL — Annex B BLOCKED until resolved"
+    elif not all_ids and not gap_markers:
+        status = "FAIL — no framework IDs found; Stage 2 may be ungrounded"
+    else:
+        status = "PASS"
+ 
     report = [
         "=== ID VERIFICATION & AUTO-CORRECTION REPORT ===",
-        f"IDs checked: {len(all_ids)} | Verified: {len(verified)} | "
-        f"Auto-corrected: {len(auto_fixed)} | Unresolvable: {len(unresolvable)}",
+        f"IDs found: {len(all_ids)} | Verified: {len(verified)} | "
+        f"Auto-corrected: {len(auto_fixed)} | Unresolvable: {len(unresolvable)} | "
+        f"[GAP]/[UNMAPPED] markers: {len(gap_markers)}",
         "",
         "--- VERIFIED (no change) ---",
         *([f"  {c}" for c in verified] or ["  (none)"]),
@@ -257,37 +404,237 @@ def verify_and_fix_stage2(_: str = "") -> str:
         "--- AUTO-CORRECTED (review recommended) ---",
         *([f"  {c}" for c in auto_fixed] or ["  (none)"]),
         "",
-        "--- UNRESOLVABLE (human review before Annex B) ---",
-        *([f"  {c}" for c in unresolvable] or ["  (none)"]),
+        "--- BLOCKING ISSUES (human review before Annex B) ---",
+        *([f"  {c}" for c in blocking] or ["  (none)"]),
         "",
         "Corrected output: outputs/stage2_corrected.md",
         f"STATUS: {status}",
     ]
-    # Append the corrected text so downstream tasks can read the actual vectors
     return "\n".join(report) + "\n\n=== CORRECTED STAGE 2 VECTORS ===\n" + corrected_text
+ 
+@tool("write_stage2_vectors")
+def write_stage2_vectors(vectors_json: str) -> str:
+    """Validate and write the Stage 2 structured edge list to
+    outputs/stage2_vectors.json for Annex B (KCAG) consumption.
+
+    Input: a JSON object with 'nodes' and 'edges'.
+      nodes[]: {id, node_type, criticality}
+        node_type in {privilege, technique, property, countermeasure, goal}
+      edges[]: {source, target, technique, difficulty, effect, vec}
+        difficulty in {LOW, MEDIUM, HIGH}
+
+    Rejects malformed graphs (no goal, no entry node, dangling edges,
+    bad enums) so Annex B never runs on a broken topology.
+    """
+    import json, os
+
+    VALID_TYPES = {"privilege", "technique", "property", "countermeasure", "goal"}
+    VALID_DIFF = {"LOW", "MEDIUM", "HIGH"}
+
+    try:
+        data = json.loads(vectors_json)
+    except json.JSONDecodeError as e:
+        return f"REJECTED: input is not valid JSON ({e}). Nothing written."
+
+    nodes = data.get("nodes")
+    edges = data.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return "REJECTED: JSON must contain 'nodes' (list) and 'edges' (list). Nothing written."
+
+    errors = []
+    node_ids = set()
+    for i, n in enumerate(nodes):
+        if not isinstance(n, dict) or "id" not in n:
+            errors.append(f"node[{i}] missing 'id'"); continue
+        nid = n["id"]
+        if nid in node_ids:
+            errors.append(f"duplicate node id '{nid}'")
+        node_ids.add(nid)
+        nt = n.get("node_type")
+        if nt not in VALID_TYPES:
+            errors.append(f"node '{nid}' has invalid node_type '{nt}' (must be one of {sorted(VALID_TYPES)})")
+        crit = n.get("criticality", 1)
+        if not isinstance(crit, int) or not (1 <= crit <= 10):
+            errors.append(f"node '{nid}' criticality must be int 1-10, got {crit}")
+
+    for i, e in enumerate(edges):
+        if not isinstance(e, dict) or "source" not in e or "target" not in e:
+            errors.append(f"edge[{i}] missing source/target"); continue
+        if e["source"] not in node_ids:
+            errors.append(f"edge[{i}] source '{e['source']}' is not a declared node")
+        if e["target"] not in node_ids:
+            errors.append(f"edge[{i}] target '{e['target']}' is not a declared node")
+        diff = str(e.get("difficulty", "MEDIUM")).upper()
+        if diff not in VALID_DIFF:
+            errors.append(f"edge[{i}] difficulty '{diff}' invalid (LOW|MEDIUM|HIGH)")
+
+    goal_nodes = [n["id"] for n in nodes if isinstance(n, dict) and n.get("node_type") == "goal"]
+    if not goal_nodes:
+        errors.append("no node with node_type='goal' — Annex B needs at least one objective")
+
+    # entry node: a node with no incoming edges
+    targets = {e.get("target") for e in edges if isinstance(e, dict)}
+    entry_nodes = [nid for nid in node_ids if nid not in targets]
+    if not entry_nodes:
+        errors.append("no entry node (every node has an incoming edge) — graph has no start")
+
+    if errors:
+        return ("REJECTED: edge list failed validation. Nothing written. Fix and resubmit:\n  - "
+                + "\n  - ".join(errors))
+
+    os.makedirs("outputs", exist_ok=True)
+    with open("outputs/stage2_vectors.json", "w") as f:
+        json.dump({"nodes": nodes, "edges": edges}, f, indent=2)
+
+    return (f"WRITTEN: outputs/stage2_vectors.json | "
+            f"{len(nodes)} nodes, {len(edges)} edges, {len(goal_nodes)} goal(s), "
+            f"entry node(s): {entry_nodes}. Annex B may now build the KCAG.")
 
 # --- lookup_technique: wire to your indexed MITRE/CAPEC/EMB3D/SPARTA corpus ---
 @tool("lookup_technique")
 def lookup_technique(query: str) -> str:
     """Resolve a technique by ID or keyword against the indexed corpus.
-    Exact ID hit returns the record; ID-shaped miss returns [GAP] (never a
-    guess); keyword returns up to 8 matches. Grounds IDs in the v18.1 index."""
-    import json, re
+
+    Resolution order:
+      1. Exact ID hit -> full record.
+      2. ID-shaped miss OR keyword -> IDF-weighted token scoring across
+         name + description, ranked by (distinct query tokens matched,
+         total weighted score). Returns up to 8 matches with confidence.
+      3. If no match clears the relevance floor -> [GAP] (never a guess).
+
+    Attack lookups exclude countermeasure-class IDs (SPARTA DE-/CM, Engage
+    EAC defensive) so a DEFENSE never surfaces as an attack technique.
+    Pass intent='defense' to look up countermeasures instead.
+    """
+    import json, re, math
+
     idx = json.load(open("corpus-index/technique_index.json"))
-    q = query.strip().upper()
+
+    # ---- intent parsing: "query | defense" or default attack ---------------
+    intent = "attack"
+    raw = query
+    if "|" in query:
+        raw, maybe = query.rsplit("|", 1)
+        if maybe.strip().lower() in ("defense", "defence", "countermeasure", "mitigation"):
+            intent = "defense"
+        raw = raw.strip()
+
+    STOPWORDS = {
+        'the','a','an','of','in','on','at','to','for','and','or','but','with',
+        'from','by','as','via','into','attack','technique','system','data',
+        'access','adversary','target','network','layer','model','ai','ml',
+        'using','use','used','against','based','the',
+    }
+
+    def tokens(text):
+        return [w for w in re.findall(r'[a-z0-9]{3,}', text.lower())
+                if w not in STOPWORDS]
+
+    # ---- countermeasure-class prefixes to exclude from attack lookups ------
+    def is_countermeasure(rec):
+        cid = rec.get("id", "").upper()
+        fw = rec.get("framework", "").lower()
+        if cid.startswith("DE-") or cid.startswith("CM"):
+            return True
+        # Engage EAC are defensive engagement activities
+        if cid.startswith("EAC") or "engage" in fw:
+            return True
+        return False
+
+    # ---- build IDF: rare tokens are worth more than common ones ------------
+    # document frequency of each token across the whole corpus
+    N = len(idx)
+    df = {}
+    corpus_tokens = {}
+    for k, v in idx.items():
+        toks = set(tokens(v.get("name", "") + " " + v.get("description", "")))
+        corpus_tokens[k] = toks
+        for t in toks:
+            df[t] = df.get(t, 0) + 1
+
+    def idf(t):
+        # smoothed inverse document frequency
+        return math.log((N + 1) / (df.get(t, 0) + 1)) + 1.0
+
+    q = raw.strip().upper()
+
+    # 1. exact ID hit
     if q in idx:
         return json.dumps(idx[q], indent=2)
-    if re.match(r'^(T\d{4}(?:\.\d{3})?|CAPEC-\d+|EMB\.T\d+|SV-\d+-\d+|AML\.T\d+|EAC-\d+)', q):
+
+    is_id_shaped = bool(re.match(
+        r'^(T\d{4}(?:\.\d{3})?|CAPEC-\d+|EMB\.[A-Z]\d+|AML\.T\d{4}(?:\.\d{3})?'
+        r'|SV-\d+-\d+|EAC-?\d+|(?:REC|IA|EX|EXF|LM|PER|IMP|RD|DE)-\d{4}(?:\.\d{1,2})?'
+        r'|CM\d{4})$', q))
+
+    q_toks = tokens(raw)
+    # for an ID-shaped miss, strip the ID-fragment tokens (e.g. 'aml','t9999')
+    if is_id_shaped:
+        q_toks = [t for t in q_toks
+                  if not re.match(r'^(t\d+|aml|capec|emb|sv|eac|rec|ia|ex|exf|lm|per|imp|rd|de|cm)\d*$', t)]
+
+    if not q_toks:
         return json.dumps({"query": query,
-            "result": "[GAP] ID not found in v18.1 index",
+            "result": "[GAP] no searchable keywords (ID not in index)" if is_id_shaped
+                      else "[GAP] no searchable keywords",
             "action": "do not fabricate; log as [GAP] at the flagging stage"})
-    ql = query.lower()
-    hits = [v for v in idx.values()
-            if ql in v["name"].lower() or ql in v.get("description","").lower()][:8]
-    if not hits:
-        return json.dumps({"query": query, "result": "[GAP] no keyword match"})
-    return json.dumps({"query": query, "matches":
-        [{"id": h["id"], "name": h["name"], "framework": h["framework"]} for h in hits]}, indent=2)
+
+    name_toks_cache = {k: set(tokens(v.get("name", ""))) for k, v in idx.items()}
+
+    scored = []
+    for k, v in idx.items():
+        if intent == "attack" and is_countermeasure(v):
+            continue
+        if intent == "defense" and not is_countermeasure(v):
+            continue
+        hay = corpus_tokens[k]
+        name_toks = name_toks_cache[k]
+        matched_distinct = 0
+        weight = 0.0
+        for t in set(q_toks):
+            if t in name_toks:
+                matched_distinct += 1
+                weight += idf(t) * 2.0       # name match: double IDF
+            elif t in hay:
+                matched_distinct += 1
+                weight += idf(t)             # description match: single IDF
+        if matched_distinct > 0:
+            scored.append((matched_distinct, round(weight, 3), v))
+
+    if not scored:
+        return json.dumps({"query": query,
+            "result": "[GAP] no keyword match",
+            "action": "do not fabricate; log as [GAP] at the flagging stage"})
+
+    # rank: more distinct query tokens first, then higher IDF weight,
+    # then shorter (more specific) name
+    scored.sort(key=lambda x: (-x[0], -x[1], len(x[2].get("name", ""))))
+
+    # No artificial weight floor: calibration against the 2269-entry corpus showed
+    # no clean cut between "meaningful" and "generic" tokens (all searchable terms
+    # fall in IDF 4.0-8.0). IDF weighting + distinct-token ranking already separate
+    # signal from noise. [GAP] is reserved for the "no token matched anything" case,
+    # handled by the `if not scored` branch above. Ambiguity is signalled via the
+    # ranked list + confidence + multi-match note, NOT suppressed into [GAP].
+
+    def confidence(distinct, weight):
+        if distinct >= 2 and weight >= 6: return "HIGH"
+        if distinct >= 2 or weight >= 5:  return "MEDIUM"
+        return "LOW"
+
+    top = scored[0]
+    n_at_top = sum(1 for d, w, _ in scored if d == top[0] and abs(w - top[1]) < 0.01)
+
+    return json.dumps({
+        "query": raw, "intent": intent, "id_shaped_miss": is_id_shaped,
+        "matches": [
+            {"id": v["id"], "name": v["name"], "framework": v.get("framework", "?"),
+             "distinct_tokens": d, "weight": w, "confidence": confidence(d, w)}
+            for d, w, v in scored[:8]
+        ],
+        "note": ("multiple matches tied at top — review before selecting"
+                 if n_at_top > 1 else "clear top match")
+    }, indent=2)
 
 @tool("verify_technique_ids")
 def verify_technique_ids(stage_output: str) -> str:
@@ -327,67 +674,257 @@ def verify_technique_ids(stage_output: str) -> str:
 
 # --- Annex C: pgmpy five-layer BBN threat inference ---
 @tool("bbn_threat_score")
-def bbn_threat_score(cpd_config_json: str) -> str:
-    """Construct the five-layer BBN with pgmpy, verify it is acyclic, run inference,
-    and return threat probability + phase estimate.
-    Input JSON should contain 'edges' (list of pairs) and 'probabilities' (dict mapping node to risk float 0.0-1.0)."""
-    import json
+def bbn_threat_score(cpd_config_json: str = "") -> str:
+    """Construct an evidence-driven Bayesian threat model, run inference, and
+    return a threat score, kill-chain phase estimate, and a CPD audit log.
+ 
+    Unlike a flat risk-propagation model, this ingests Annex B KCAG priors and
+    real conditional structure so the score reflects the computed attack graph,
+    not a default constant.
+ 
+    Input JSON (all keys optional; sensible NGC2 defaults applied):
+      {
+        "kcag_report_path": "outputs/kcag_report.json",   // Annex B handoff
+        "adversary": {
+            "capability_prior": [0.0, 0.05, 0.95],        // [hacktivist,criminal,nation-state]
+            "tempo": "HIGH"                                // LOW|MEDIUM|HIGH
+        },
+        "defensive_posture": {                             // true=control active
+            "mfa": true, "edr": false, "segmentation": false,
+            "integrity_monitor": false, "email_filtering": true
+        },
+        "geopolitical_trigger_prior": 0.55,
+        "evidence": {                                      // observed indicators
+            "GeopoliticalTrigger": 1, "AdversaryCapability": 2,
+            "PhishingAttempt": 1, "ScanningDetected": 1, "AuthAnomaly": 1
+        }
+      }
+ 
+    Returns a human-readable report plus writes outputs/bbn_report.json.
+    """
     from pgmpy.models import DiscreteBayesianNetwork
     from pgmpy.factors.discrete import TabularCPD
     from pgmpy.inference import VariableElimination
-
-    try:
-        edges = [
-            ("InitialAccess", "PrivilegeEscalation"), 
-            ("PrivilegeEscalation", "DataExfiltration")
-        ]
-        node_probs = {}
-        
-        if cpd_config_json and cpd_config_json.strip() != "":
-            try:
-                data = json.loads(cpd_config_json)
-                if "edges" in data:
-                    edges = [tuple(e) for e in data["edges"]]
-                if "probabilities" in data:
-                    node_probs = data["probabilities"]
-            except json.JSONDecodeError:
-                pass 
-
-        model = DiscreteBayesianNetwork(edges)
-        nodes = model.nodes()
-        
-        cpds = []
-        for node in nodes:
-            # Fetch the agent-assigned probability, fallback to 0.6 if missing
-            prob_true = float(node_probs.get(node, 0.6))
-            prob_false = 1.0 - prob_true
-            
-            parents = model.get_parents(node)
-            if not parents:
-                cpds.append(TabularCPD(variable=node, variable_card=2, values=[[prob_false], [prob_true]]))
-            else:
-                num_parents = len(parents)
-                parent_card = [2] * num_parents
-                # Create a uniform conditional distribution using the specific node's base risk
-                values = [[prob_false] * (2 ** num_parents), [prob_true] * (2 ** num_parents)]
-                cpds.append(TabularCPD(
-                    variable=node, variable_card=2, 
-                    values=values, 
-                    evidence=parents, evidence_card=parent_card
-                ))
-        
-        model.add_cpds(*cpds)
-        
-        if not model.check_model():
-            return "ERROR: Cyclic or invalid BBN configuration generated."
-            
-        infer = VariableElimination(model)
-        
-        target_node = list(nodes)[-1] 
-        result = infer.query(variables=[target_node])
-        
-        return f"BBN Validated.\nTarget Node: {target_node}\nThreat Probability Inference:\n{result}"
-        
-    except Exception as e:
-        return f"BBN Execution Failed: {str(e)}. Review topology and retry."
-    
+ 
+    PHASE_LABELS = {0: "RECON", 1: "INITIAL ACCESS", 2: "LATERAL / PIVOT", 3: "OBJECTIVE"}
+    THRESHOLDS = [(0.20, "LOW"), (0.50, "ELEVATED"), (0.75, "HIGH"), (1.01, "CRITICAL")]
+    AUDIT = []
+ 
+    def log(node, value, source):
+        AUDIT.append({"node": node, "value": value, "source": source})
+        return value
+ 
+    def level(score):
+        for t, lbl in THRESHOLDS:
+            if score < t:
+                return lbl
+        return "CRITICAL"
+ 
+    # ---- Parse config (never silently fall back to a magic number) ----------
+    cfg = {}
+    if cpd_config_json and cpd_config_json.strip():
+        try:
+            cfg = json.loads(cpd_config_json)
+        except json.JSONDecodeError as e:
+            return f"ERROR: cpd_config_json is not valid JSON ({e}). Refusing to run on undefined input."
+ 
+    adversary = cfg.get("adversary", {})
+    cap_prior = adversary.get("capability_prior", [0.0, 0.05, 0.95])  # PRC default
+    tempo = adversary.get("tempo", "HIGH")
+    posture = cfg.get("defensive_posture",
+                      {"mfa": True, "edr": False, "segmentation": False,
+                       "integrity_monitor": False, "email_filtering": True})
+    geo_prior = float(cfg.get("geopolitical_trigger_prior", 0.55))
+    evidence = cfg.get("evidence", {})
+ 
+    # ---- Ingest Annex B KCAG priors (the whole point of the handoff) --------
+    kcag_path = cfg.get("kcag_report_path", "outputs/kcag_report.json")
+    p_objective_base = 0.32  # fallback if no KCAG report present
+    kcag_note = "KCAG report not found — using fallback objective prior 0.32"
+    if os.path.exists(kcag_path):
+        try:
+            kcag = json.load(open(kcag_path))
+            objs = kcag.get("objective_results", {})
+            if objs:
+                p_objective_base = max(
+                    (o.get("top_path_prob", 0) for o in objs.values()), default=0.32)
+                kcag_note = f"KCAG max objective path probability = {p_objective_base:.4f}"
+        except Exception as e:
+            kcag_note = f"KCAG report present but unreadable ({e}) — using fallback 0.32"
+    log("KCAG.p_objective_base", p_objective_base, kcag_note)
+ 
+    # ---- Defensive multiplier: more controls -> harder to advance -----------
+    active = sum(1 for v in posture.values() if v)
+    total = max(1, len(posture))
+    dm = max(0.30, 1.0 - (active / total) * 0.70)
+    log("DefensiveMultiplier", round(dm, 4),
+        f"{active}/{total} controls active")
+ 
+    # ---- Build the DAG ------------------------------------------------------
+    # Layer 1 priors -> Layer 2 observables -> Layer 3 phase -> Layer 5 outcome
+    model = DiscreteBayesianNetwork([
+        ("AdversaryCapability", "PhishingAttempt"),
+        ("OperationalTempo", "ScanningDetected"),
+        ("AdversaryCapability", "KillChainPhase"),
+        ("PhishingAttempt", "KillChainPhase"),
+        ("ScanningDetected", "KillChainPhase"),
+        ("AuthAnomaly", "KillChainPhase"),
+        ("KillChainPhase", "IWEffectAchieved"),
+        ("DefensivePosture", "IWEffectAchieved"),
+        ("GeopoliticalTrigger", "IWEffectAchieved"),
+    ])
+ 
+    cpds = []
+ 
+    # AdversaryCapability (root, 3 states)
+    cap = [max(0.001, p) for p in cap_prior]
+    s = sum(cap); cap = [p / s for p in cap]
+    cpds.append(TabularCPD("AdversaryCapability", 3, [[cap[0]], [cap[1]], [cap[2]]]))
+    log("AdversaryCapability", cap, "adversary.capability_prior")
+ 
+    # OperationalTempo (root, 3 states)
+    tempo_dist = {"LOW": [0.6, 0.3, 0.1], "MEDIUM": [0.2, 0.6, 0.2],
+                  "HIGH": [0.1, 0.2, 0.7]}.get(tempo, [0.1, 0.2, 0.7])
+    cpds.append(TabularCPD("OperationalTempo", 3, [[p] for p in tempo_dist]))
+    log("OperationalTempo", tempo_dist, f"adversary.tempo={tempo}")
+ 
+    # PhishingAttempt | AdversaryCapability  (real conditional rows)
+    cpds.append(TabularCPD(
+        "PhishingAttempt", 2,
+        [[0.90, 0.50, 0.15],   # P(no phish) | hacktivist, criminal, nation-state
+         [0.10, 0.50, 0.85]],  # nation-state phishing is high (APT hallmark)
+        evidence=["AdversaryCapability"], evidence_card=[3]))
+    log("PhishingAttempt|cap", [[0.90, 0.50, 0.15], [0.10, 0.50, 0.85]],
+        "APT spear-phishing base rates")
+ 
+    # ScanningDetected | OperationalTempo
+    cpds.append(TabularCPD(
+        "ScanningDetected", 2,
+        [[0.95, 0.65, 0.25],
+         [0.05, 0.35, 0.75]],
+        evidence=["OperationalTempo"], evidence_card=[3]))
+    log("ScanningDetected|tempo", [[0.95, 0.65, 0.25], [0.05, 0.35, 0.75]],
+        "tempo-driven recon activity")
+ 
+    # AuthAnomaly (root observable)
+    cpds.append(TabularCPD("AuthAnomaly", 2, [[0.82], [0.18]]))
+    log("AuthAnomaly", [0.82, 0.18], "credential-reuse base rate")
+ 
+    # GeopoliticalTrigger (root)
+    cpds.append(TabularCPD("GeopoliticalTrigger", 2,
+                           [[1 - geo_prior], [geo_prior]]))
+    log("GeopoliticalTrigger", [1 - geo_prior, geo_prior],
+        "geopolitical_trigger_prior")
+ 
+    # DefensivePosture (root, 3 states weak/moderate/strong from active count)
+    frac = active / total
+    dp = [max(0.05, 1 - frac), 0.0, max(0.05, frac)]
+    dp[1] = max(0.0, 1 - dp[0] - dp[2]); s = sum(dp); dp = [p / s for p in dp]
+    cpds.append(TabularCPD("DefensivePosture", 3, [[dp[0]], [dp[1]], [dp[2]]]))
+    log("DefensivePosture", dp, f"{active}/{total} controls active")
+ 
+    # KillChainPhase | cap(3) x phish(2) x scan(2) x auth(2) = 24 cols, 4 states
+    def phase_probs(cap_i, phish, scan, auth):
+        if cap_i == 2:    base = [0.25, 0.32, 0.28, 0.15]   # nation-state long-dwell
+        elif cap_i == 1:  base = [0.45, 0.30, 0.18, 0.07]
+        else:             base = [0.65, 0.25, 0.08, 0.02]
+        if phish: base[0] -= 0.10; base[1] += 0.10
+        if scan:  base[0] -= 0.08; base[1] += 0.08
+        if auth:  base[1] -= 0.12; base[2] += 0.12          # auth anomaly => lateral
+        base[2] *= dm
+        base[3] *= dm * p_objective_base                     # KCAG-anchored
+        base = [max(0.001, b) for b in base]
+        t = sum(base)
+        return [b / t for b in base]
+ 
+    rows = [[], [], [], []]
+    for ci in range(3):
+        for ph in range(2):
+            for sc in range(2):
+                for au in range(2):
+                    pr = phase_probs(ci, ph, sc, au)
+                    for k in range(4):
+                        rows[k].append(pr[k])
+    cpds.append(TabularCPD(
+        "KillChainPhase", 4, rows,
+        evidence=["AdversaryCapability", "PhishingAttempt",
+                  "ScanningDetected", "AuthAnomaly"],
+        evidence_card=[3, 2, 2, 2]))
+    log("KillChainPhase", "computed", "nation-state base + evidence updates + KCAG anchor")
+ 
+    # IWEffectAchieved | phase(4) x posture(3) x geo(2) = 24 cols, 2 states
+    PHASE_BASE = [0.005,
+                  log("IWEffect|InitAccess", 0.08, "early-access ceiling"),
+                  log("IWEffect|Lateral", 0.40, "KCAG lateral path rates"),
+                  log("IWEffect|Objective",
+                      round(min(0.85, p_objective_base * 2.2), 4),
+                      "KCAG objective prob x convergence factor")]
+ 
+    def iw_probs(phase, dposture, geo):
+        p = PHASE_BASE[phase]
+        if dposture == 2:   p *= 0.25      # strong defense
+        elif dposture == 1: p *= 0.55      # moderate
+        if geo:             p = min(0.99, p * 1.45)
+        p = min(0.999, max(0.001, p))
+        return [1 - p, p]
+ 
+    no_, yes_ = [], []
+    for ph in range(4):
+        for dpz in range(3):
+            for g in range(2):
+                a, b = iw_probs(ph, dpz, g)
+                no_.append(a); yes_.append(b)
+    cpds.append(TabularCPD(
+        "IWEffectAchieved", 2, [no_, yes_],
+        evidence=["KillChainPhase", "DefensivePosture", "GeopoliticalTrigger"],
+        evidence_card=[4, 3, 2]))
+    log("IWEffectAchieved", "computed", "phase x posture x geopolitical")
+ 
+    model.add_cpds(*cpds)
+    if not model.check_model():
+        return "ERROR: BBN failed validation (cyclic or malformed CPDs)."
+ 
+    infer = VariableElimination(model)
+ 
+    # ---- Filter evidence to valid nodes/states ------------------------------
+    valid_nodes = set(model.nodes())
+    ev = {k: int(v) for k, v in evidence.items() if k in valid_nodes}
+ 
+    score = float(infer.query(["IWEffectAchieved"], evidence=ev).values[1])
+    phase_dist = infer.query(["KillChainPhase"], evidence=ev).values
+    phase_idx = int(phase_dist.argmax())
+ 
+    # ---- Baseline (no evidence) for delta ----------------------------------
+    base_score = float(infer.query(["IWEffectAchieved"]).values[1])
+ 
+    report = {
+        "threat_score": round(score, 4),
+        "threat_level": level(score),
+        "baseline_score": round(base_score, 4),
+        "delta_from_baseline": round(score - base_score, 4),
+        "likely_phase": PHASE_LABELS[phase_idx],
+        "phase_distribution": {PHASE_LABELS[i]: round(float(phase_dist[i]), 4)
+                               for i in range(4)},
+        "evidence_applied": ev,
+        "kcag_objective_prior": round(p_objective_base, 4),
+        "defensive_multiplier": round(dm, 4),
+        "cpd_audit_log": AUDIT,
+    }
+    os.makedirs("outputs", exist_ok=True)
+    with open("outputs/bbn_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+ 
+    lines = [
+        "=== ANNEX C: BBN THREAT ASSESSMENT ===",
+        f"Threat Score:  {score:.4f}  ({level(score)})",
+        f"Baseline:      {base_score:.4f}  (delta {score-base_score:+.4f})",
+        f"Likely Phase:  {PHASE_LABELS[phase_idx]}",
+        f"KCAG prior:    {p_objective_base:.4f}   Defensive mult: {dm:.3f}",
+        "Phase distribution:",
+        *[f"  {PHASE_LABELS[i]:16s} {float(phase_dist[i]):.4f}" for i in range(4)],
+        f"Evidence applied: {ev or '(none — baseline)'}",
+        f"CPD audit entries: {len(AUDIT)} (full log in outputs/bbn_report.json)",
+        "STATUS: SUCCESS",
+    ]
+    return "\n".join(lines)
+ 

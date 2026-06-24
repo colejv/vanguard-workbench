@@ -2,7 +2,7 @@ from crewai import Crew, Process, Task
 import sys, os
 from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator, verifier)
-from src.tasks import (t_research, t_synthesize_stage0, t_stage2, 
+from src.tasks import (t_research, t_synthesize_stage0, t_stage1,t_stage2, 
                        t_verify_stage2, t_annexB, t_annexC, t_stage3, t_stage4)
 from src.tools import extract_to_scratch, verify_corpus_lock
 
@@ -130,6 +130,7 @@ if __name__ == "__main__":
 
     dynamic_tasks.extend([
         t_synthesize_stage0, 
+        t_stage1,
         t_stage2, 
         t_verify_stage2, 
         t_annexB, 

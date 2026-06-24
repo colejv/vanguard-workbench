@@ -6,6 +6,7 @@ import json
 import re
 import os
 
+
 # --- Annex B: KCAG minimum node cut over the real DAG ---
 class KCAGSchema(BaseModel):
     # Agent passes ONE string: the path to the Stage 2 edge-list artifact.
@@ -16,7 +17,10 @@ class KCAGSchema(BaseModel):
                     "Do NOT hand-author nodes/edges; they are read from this file."
     )
  
- 
+# 1. Move the dictionary OUTSIDE the class
+# difficulty -> base traversal probability
+DIFF_PROB = {'LOW': 0.8, 'MEDIUM': 0.5, 'HIGH': 0.2}
+
 class KCAGMinCutTool(BaseTool):
     name: str = Field(default="kcag_min_cut")
     description: str = Field(
@@ -29,7 +33,7 @@ class KCAGMinCutTool(BaseTool):
     args_schema: Type[BaseModel] = KCAGSchema
  
     # difficulty -> base traversal probability
-    DIFF_PROB = {"LOW": 0.80, "MEDIUM": 0.50, "HIGH": 0.20}
+    # DIFF_PROB = {"LOW": 0.80, "MEDIUM": 0.50, "HIGH": 0.20}
  
     def _run(self, stage2_vectors_path: str = "outputs/stage2_vectors.json") -> str:
         # ---- 1. Load topology from the artifact (deterministic) -------------
@@ -57,7 +61,7 @@ class KCAGMinCutTool(BaseTool):
             tgt = e["target"] if isinstance(e, dict) else getattr(e, "target")
             diff = (e.get("difficulty", "MEDIUM") if isinstance(e, dict)
                     else getattr(e, "difficulty", "MEDIUM")).upper()
-            prob = self.DIFF_PROB.get(diff, 0.50)
+            prob = DIFF_PROB.get(diff, 0.50)
             G.add_edge(src, tgt,
                        technique=(e.get("technique", "") if isinstance(e, dict) else ""),
                        difficulty=diff,

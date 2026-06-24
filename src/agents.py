@@ -11,7 +11,8 @@ from src.tools import (
     extract_to_scratch, 
     read_scratch,
     verify_technique_ids, 
-    verify_and_fix_stage2
+    verify_and_fix_stage2,
+    write_stage2_vectors
 )
 
 researcher = Agent(
@@ -47,6 +48,7 @@ mapper = Agent(
     llm=reason_llm, 
     allow_delegation=False, 
     verbose=True,
+    tools=[write_stage2_vectors]
 )
 
 modeler = Agent(

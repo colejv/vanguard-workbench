@@ -138,7 +138,16 @@ if __name__ == "__main__":
         t_stage3, 
         t_stage4
     ])
-
+    '''
+    # --- TEMPORARY OVERRIDE TO RESUME AT ANNEX B ---
+    dynamic_tasks = [
+        t_annexB, 
+        t_annexC, 
+        t_stage3, 
+        t_stage4
+    ]
+    '''
+    
     vanguard_crew = Crew(
         agents=[researcher, decomposer, mapper, modeler, red_team_lead, orchestrator, verifier],
         tasks=dynamic_tasks,

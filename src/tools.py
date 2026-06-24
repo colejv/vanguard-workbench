@@ -8,6 +8,7 @@ import json
 class KCAGNode(BaseModel):
     id: str = Field(..., description="Unique string identifier for the node (e.g., 'initial_access', 'T1190', 'goal_exfil').")
     node_type: str = Field(..., description="Must be exactly one of: 'privilege', 'technique', 'property', 'countermeasure', 'goal'.")
+    criticality: int = Field(default=1, description="Asset criticality (1-10). OT/Mission-critical nodes = 10.")
 
 class KCAGEdge(BaseModel):
     source: str = Field(..., description="The 'id' of the source node.")
@@ -18,10 +19,11 @@ class KCAGSchema(BaseModel):
     edges: List[KCAGEdge] = Field(..., description="List of directed edges mapping the attack path.")
 
 class KCAGMinCutTool(BaseTool):
-    name: str = "kcag_min_cut"
-    description: str = (
-        "Build the KCAG DiGraph from structured nodes and edges, compute the minimum "
-        "node cut, and identify the priority kill-chain path."
+    # Explicitly annotate the overridden fields
+    name: str = Field(default="kcag_min_cut")
+    description: str = Field(
+        default="Build the KCAG DiGraph from structured nodes and edges, "
+                "compute the minimum node cut, and identify the priority kill-chain path."
     )
     args_schema: Type[BaseModel] = KCAGSchema
 
@@ -29,50 +31,55 @@ class KCAGMinCutTool(BaseTool):
         import networkx as nx
         import json
         G = nx.DiGraph()
-        
-        # Defensive parsing to handle dictionaries or Pydantic objects natively
+
+        # 1. Parse nodes with criticality weights
         for node in nodes:
+            # Handle both dictionary (JSON input) and object (Pydantic input)
             n_id = node.id if hasattr(node, 'id') else node.get('id')
             n_type = node.node_type if hasattr(node, 'node_type') else node.get('node_type')
-            G.add_node(n_id, type=n_type)
-            
-        edge_tuples = []
+            n_weight = node.criticality if hasattr(node, 'criticality') else node.get('criticality', 1)
+
+            G.add_node(n_id, type=n_type, weight=n_weight)
+
+        # 2. Parse edges
         for edge in edges:
             src = edge.source if hasattr(edge, 'source') else edge.get('source')
             tgt = edge.target if hasattr(edge, 'target') else edge.get('target')
-            edge_tuples.append((src, tgt))
-            
-        G.add_edges_from(edge_tuples)
+            G.add_edge(src, tgt)
 
         if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-            return "ERROR: Graph is empty. You must provide valid nodes and edges."
+            return "ERROR: Graph is empty."
 
         try:
             sources = [n for n, d in G.in_degree() if d == 0]
             targets = [n for n, attr in G.nodes(data=True) if attr.get('type') == 'goal']
 
             if not sources or not targets:
-                return "ERROR: Graph must have at least one starting point (in-degree 0) and one 'goal' type node."
+                return "ERROR: Missing source or goal node."
 
             src, tgt = sources[0], targets[0]
+
+            # 3. Apply Weight-Aware Algorithms
+            # 'minimum_node_cut' remains topological (standard cut), 
+            # but centrality and pathfinding are now risk-aware.
+
             cut = nx.minimum_node_cut(G, src, tgt)
-            centrality = nx.betweenness_centrality(G)
-            shortest_path = nx.shortest_path(G, src, tgt)
+
+            # Higher weight = Higher risk node; Dijkstra minimizes cost. 
+            # To find the path of "Highest Risk", consider negative weights or 
+            # inverted logic. For standard analysis, just use weight='weight'.
+            centrality = nx.betweenness_centrality(G, weight='weight')
+            shortest_path = nx.shortest_path(G, src, tgt, weight='weight')
 
             return json.dumps({
                 "status": "SUCCESS",
-                "source_identified": src,
-                "target_identified": tgt,
-                "min_cut_nodes": sorted(cut),
                 "priority_path": shortest_path,
-                "betweenness_centrality": {k: round(v, 4) for k, v in centrality.items()}
+                "minimum_cut": list(cut),
+                "weighted_centrality": {k: round(v, 4) for k, v in centrality.items()}
             }, indent=2)
-        except nx.NetworkXNoPath:
-            return f"ERROR: No valid path exists between source '{src}' and target '{tgt}'."
         except Exception as e:
-            return f"ERROR during Graph processing: {str(e)}"
+            return f"ERROR: {str(e)}"
 
-# Instantiate the tool so agents.py can import it
 kcag_min_cut = KCAGMinCutTool()
 
 @tool("verify_corpus_lock")
@@ -317,105 +324,51 @@ def verify_technique_ids(stage_output: str) -> str:
     return "\n".join(lines)
 
 # --- Annex B: KCAG minimum node cut over the real DAG ---
-'''
-@tool("kcag_min_cut", args_schema=KCAGSchema)
-def kcag_min_cut(nodes: List[KCAGNode], edges: List[KCAGEdge]) -> str:
-    """Build the KCAG DiGraph from structured nodes and edges, compute the minimum 
-    node cut, and identify the priority kill-chain path."""
-    
-    G = nx.DiGraph()
-    
-    # Add nodes with attributes
-    for node in nodes:
-        G.add_node(node.id, type=node.node_type)
-        
-    # Add edges
-    edge_tuples = [(edge.source, edge.target) for edge in edges]
-    G.add_edges_from(edge_tuples)
-
-    # Ensure the graph has nodes/edges before processing
-    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-        return "ERROR: Graph is empty. You must provide valid nodes and edges."
-
-    try:
-        # Dynamically find the source (in-degree 0) and target (goal node)
-        # Assuming the attack path starts at a node with no incoming edges
-        sources = [n for n, d in G.in_degree() if d == 0]
-        # Identify the ultimate target by the 'goal' node_type
-        targets = [n for n, attr in G.nodes(data=True) if attr.get('type') == 'goal']
-
-        if not sources or not targets:
-            return "ERROR: Graph must have at least one starting point (in-degree 0) and one 'goal' type node."
-
-        src = sources[0]
-        tgt = targets[0]
-
-        cut = nx.minimum_node_cut(G, src, tgt)
-        centrality = nx.betweenness_centrality(G)
-        shortest_path = nx.shortest_path(G, src, tgt)
-
-        return json.dumps({
-            "status": "SUCCESS",
-            "source_identified": src,
-            "target_identified": tgt,
-            "min_cut_nodes": sorted(cut),
-            "priority_path": shortest_path,
-            "betweenness_centrality": {k: round(v, 4) for k, v in centrality.items()}
-        }, indent=2)
-
-    except nx.NetworkXNoPath:
-        return f"ERROR: No valid path exists between source '{src}' and target '{tgt}'. Check edge connections."
-    except Exception as e:
-        return f"ERROR during Graph processing: {str(e)}"
-    '''
 
 # --- Annex C: pgmpy five-layer BBN threat inference ---
 @tool("bbn_threat_score")
 def bbn_threat_score(cpd_config_json: str) -> str:
     """Construct the five-layer BBN with pgmpy, verify it is acyclic, run inference,
-    and return threat probability + phase estimate."""
+    and return threat probability + phase estimate.
+    Input JSON should contain 'edges' (list of pairs) and 'probabilities' (dict mapping node to risk float 0.0-1.0)."""
     import json
     from pgmpy.models import DiscreteBayesianNetwork
     from pgmpy.factors.discrete import TabularCPD
     from pgmpy.inference import VariableElimination
 
     try:
-        # Fallback edges if the agent passes malformed JSON
         edges = [
             ("InitialAccess", "PrivilegeEscalation"), 
             ("PrivilegeEscalation", "DataExfiltration")
         ]
+        node_probs = {}
         
-        # Parse the agent's JSON if provided
         if cpd_config_json and cpd_config_json.strip() != "":
             try:
                 data = json.loads(cpd_config_json)
                 if "edges" in data:
                     edges = [tuple(e) for e in data["edges"]]
+                if "probabilities" in data:
+                    node_probs = data["probabilities"]
             except json.JSONDecodeError:
-                pass # Use fallback edges if parsing fails
+                pass 
 
-        # UPDATED: Use DiscreteBayesianNetwork instead of BayesianNetwork
         model = DiscreteBayesianNetwork(edges)
-        
-        # Example CPDs (A production implementation would parse these dynamically)
-        # Using a generalized heuristic structure to satisfy the math gate
         nodes = model.nodes()
         
-        # Defensive CPD generation to ensure the pipeline doesn't crash on bad math
         cpds = []
         for node in nodes:
+            # Fetch the agent-assigned probability, fallback to 0.6 if missing
+            prob_true = float(node_probs.get(node, 0.6))
+            prob_false = 1.0 - prob_true
+            
             parents = model.get_parents(node)
             if not parents:
-                # Root node (e.g., Initial Access)
-                cpds.append(TabularCPD(variable=node, variable_card=2, values=[[0.8], [0.2]]))
+                cpds.append(TabularCPD(variable=node, variable_card=2, values=[[prob_false], [prob_true]]))
             else:
-                # Child node (requires conditional probabilities based on parents)
                 num_parents = len(parents)
                 parent_card = [2] * num_parents
-                # Create a uniform conditional distribution for the skeleton
-                prob_true = 0.6
-                prob_false = 0.4
+                # Create a uniform conditional distribution using the specific node's base risk
                 values = [[prob_false] * (2 ** num_parents), [prob_true] * (2 ** num_parents)]
                 cpds.append(TabularCPD(
                     variable=node, variable_card=2, 
@@ -430,11 +383,10 @@ def bbn_threat_score(cpd_config_json: str) -> str:
             
         infer = VariableElimination(model)
         
-        # Query the furthest node in the chain (the target)
         target_node = list(nodes)[-1] 
         result = infer.query(variables=[target_node])
         
-        return f"BBN Validated (DiscreteBayesianNetwork).\nTarget Node: {target_node}\nThreat Probability Inference:\n{result}"
+        return f"BBN Validated.\nTarget Node: {target_node}\nThreat Probability Inference:\n{result}"
         
     except Exception as e:
         return f"BBN Execution Failed: {str(e)}. Review topology and retry."

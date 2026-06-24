@@ -132,6 +132,31 @@ class PurplePlanCompiler:
                     })
         return phases
 
+    def export_graph_data(self, phases: List[EngagementPhase], output_path: str = "outputs/kcag_data.json"):
+        nodes = []
+        edges = []
+        
+        for i, phase in enumerate(phases):
+            # DIAGNOSTIC: Print the status to the terminal to confirm we see it
+            # print(f"Phase {i} ({phase.phase_name}) tests: {phase.test_references}")
+            
+            # This logic only works if phase.test_references is populated 
+            # by the perform_crosswalk() method BEFORE this is called.
+            has_gap = any(ref["status"] == "COVERAGE GAP" for ref in phase.test_references)
+            node_color = "#FF4B4B" if has_gap else "#00FF00"
+            
+            nodes.append({
+                "id": str(i), 
+                "label": phase.phase_name,
+                "color": node_color
+            })
+            
+            if i < len(phases) - 1:
+                edges.append({"source": str(i), "target": str(i+1)})
+                
+        with open(output_path, "w") as f:
+            json.dump({"nodes": nodes, "edges": edges}, f, indent=2)
+            
     def print_coverage_map(self, phases: List[EngagementPhase]):
         """Renders the immediate coverage map for the Purple Team."""
         print("\n" + "="*60)
@@ -150,7 +175,6 @@ class PurplePlanCompiler:
                     print(f"  [!] {ref['id']}: {ref['status']} — {ref['technique_name']}")
 
 if __name__ == "__main__":
-    # Ensure pip install pyyaml is run before execution
     compiler = PurplePlanCompiler("outputs/stage4_mission_plan.md")
     
     print(f"Loaded {len(compiler.art_index)} techniques from index.")
@@ -162,7 +186,14 @@ if __name__ == "__main__":
     
     compiler.print_coverage_map(mapped_phases)
     
+    # 1. The Coverage Scaffold for the UI
     scaffold_path = "outputs/purple_scaffold.json"
     with open(scaffold_path, "w") as f:
         json.dump([asdict(p) for p in mapped_phases], f, indent=2)
-    print(f"\nScaffold exported to {scaffold_path} for Phase 2 Sigma generation.")
+    print(f"Scaffold exported to {scaffold_path}")
+        
+    # 2. Export the Graph Data (This contains the color logic!)
+    # We remove the manual dictionary creation and call the method instead
+    compiler.export_graph_data(mapped_phases, "outputs/kcag_data.json")
+    
+    print(f"Graph data exported to outputs/kcag_data.json")

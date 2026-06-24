@@ -178,3 +178,6 @@ xlsxwriter==3.2.9
 yarl==1.24.2
 youtube-transcript-api==1.2.4
 zipp==4.1.0
+streamlit>=1.36.0
+plotly>=5.22.0
+streamlit-agraph>=0.0.42

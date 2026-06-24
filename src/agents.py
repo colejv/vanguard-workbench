@@ -1,15 +1,24 @@
 from crewai import Agent
 from config.llm import light_llm, reason_llm
-from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
-                       verify_corpus_lock, read_corpus_chunk,
-                       extract_to_scratch, read_scratch,
-                       verify_technique_ids, verify_and_fix_stage2)
+
+# CRITICAL FIX 1: Consolidated imports from src.tools
+from src.tools import (
+    kcag_min_cut, 
+    bbn_threat_score,
+    lookup_technique, 
+    verify_corpus_lock, 
+    read_corpus_chunk,
+    extract_to_scratch, 
+    read_scratch,
+    verify_technique_ids, 
+    verify_and_fix_stage2
+)
 
 researcher = Agent(
     role="IW Researcher",
     goal="Confirm corpus lock status before Stage 0 proceeds.",
     backstory="Enforces pre-analysis corpus discipline per Annex A Phase 1.",
-    llm=reason_llm,    # changed from light_llm
+    llm=reason_llm,
     allow_delegation=False,
     verbose=True,
 )
@@ -28,15 +37,27 @@ mapper = Agent(
     role="Attack Surface Mapper",
     goal="Stage 2: map components to ATT&CK/CAPEC/ATLAS/EMB3D/SPARTA "
          "with technique IDs and confidence annotations.",
-    backstory="Selects frameworks by system type; flags [GAP] items inline.",
-    llm=reason_llm, allow_delegation=False, verbose=True,
+    # CRITICAL FIX 2: Instruct the mapper to assign criticality weights
+    backstory=(
+        "Selects frameworks by system type; flags [GAP] items inline. "
+        "CRITICAL: When mapping components, you must evaluate and assign a "
+        "'criticality' score (1-10) to every node, where 10 is mission-critical "
+        "OT/Command systems. These scores are passed to the Modeler for Annex B analysis."
+    ),
+    llm=reason_llm, 
+    allow_delegation=False, 
+    verbose=True,
 )
 
 modeler = Agent(
     role="Graph & Probability Modeler",
     goal="Annex B KCAG minimum-cut analysis and Annex C BBN threat scoring.",
     backstory="Runs NetworkX and pgmpy pipelines via tools; guards against cycles.",
-    llm=reason_llm, allow_delegation=False, verbose=True,
+    llm=reason_llm, 
+    allow_delegation=False, 
+    verbose=True,
+    # CRITICAL FIX 3: Give the modeler the tools to execute the math
+    tools=[kcag_min_cut, bbn_threat_score]
 )
 
 red_team_lead = Agent(
@@ -46,14 +67,16 @@ red_team_lead = Agent(
     llm=reason_llm, 
     allow_delegation=False, 
     verbose=True,
-    tools=[lookup_technique]  # <-- CRITICAL FIX: Grants access to the MITRE index
+    tools=[lookup_technique]
 )
 
 orchestrator = Agent(
     role="Orchestrator",
     goal="Track stage state, verify upstream outputs, log gaps.",
     backstory="Maintains the analytical record and gap log across stages.",
-    llm=light_llm, allow_delegation=False, verbose=True,
+    llm=light_llm, 
+    allow_delegation=False, 
+    verbose=True,
 )
 
 verifier = Agent(

@@ -415,7 +415,118 @@ def verify_and_fix_stage2(_: str = "") -> str:
         f"STATUS: {status}",
     ]
     return "\n".join(report) + "\n\n=== CORRECTED STAGE 2 VECTORS ===\n" + corrected_text
- 
+
+# ============================================================================
+#  DETERMINISTIC STAGE 2 GATE  (plain Python — NOT a CrewAI tool)
+#  Add to src/tools.py. Called directly from src/crew.py between crews.
+#  Single function, single return contract: {"is_valid": bool, ...}
+# ============================================================================
+def verify_stage2_vectors(vectors_path: str = "outputs/stage2_vectors.json",
+                          index_path: str = "corpus-index/technique_index.json") -> dict:
+    """Deterministically verify every technique ID in the Stage 2 attack GRAPH
+    (not the prose) against the indexed corpus. This is the enforcement gate:
+    crew.py raises on is_valid=False and never builds the downstream crew.
+
+    Verifies the authoritative artifact (stage2_vectors.json) — the file Annex B
+    actually consumes — so prose/graph drift cannot pass unverified IDs to the KCAG.
+
+    Returns:
+      {
+        "is_valid": bool,
+        "status": "PASS" | "FAIL",
+        "checked": int,
+        "invalid_edges": [ {edge_index, source, target, technique, reason, suggestion} ],
+        "gap_edges":     [ {edge_index, source, target, technique} ],
+        "summary": str
+      }
+    Does NOT mutate the graph. Corrections are advisory (suggestion field only).
+    """
+    import json, os, re
+
+    result = {"is_valid": False, "status": "FAIL", "checked": 0,
+              "invalid_edges": [], "gap_edges": [], "summary": ""}
+
+    if not os.path.exists(vectors_path):
+        result["summary"] = f"{vectors_path} not found — Stage 2 did not emit an edge list."
+        return result
+    if not os.path.exists(index_path):
+        result["summary"] = f"{index_path} not found — cannot verify."
+        return result
+
+    try:
+        data = json.load(open(vectors_path))
+        index = json.load(open(index_path))
+    except json.JSONDecodeError as e:
+        result["summary"] = f"JSON parse error: {e}"
+        return result
+
+    edges = data.get("edges")
+    if not isinstance(edges, list):
+        result["summary"] = "edge list missing 'edges' array."
+        return result
+
+    # countermeasure-class prefixes must not appear as ATTACK technique IDs
+    def is_countermeasure(tid):
+        u = tid.upper()
+        return u.startswith("DE-") or u.startswith("CM")
+
+    GAP_MARKERS = {"[GAP]", "[UNMAPPED]", "", "NONE", "N/A"}
+
+    def keyword_suggest(text, k=3):
+        STOP = {'the','a','an','of','in','on','to','for','and','or','with','from',
+                'by','as','via','into','attack','technique','system','data','access',
+                'adversary','target','network','layer','using','use','used'}
+        toks = [w for w in re.findall(r'[a-z0-9]{3,}', text.lower()) if w not in STOP]
+        scored = []
+        for v in index.values():
+            hay = (v.get("name","") + " " + v.get("description","")).lower()
+            score = sum(1 for t in set(toks) if t in hay)
+            if score:
+                scored.append((score, v["id"], v.get("name","")))
+        scored.sort(reverse=True)
+        return [{"id": i, "name": n, "score": s} for s, i, n in scored[:k]]
+
+    for i, e in enumerate(edges):
+        tid = str(e.get("technique", "")).strip()
+        result["checked"] += 1
+        ctx = f"{e.get('source','')} {e.get('target','')} {e.get('effect','') or ''}"
+
+        if tid.upper() in GAP_MARKERS or tid == "":
+            result["gap_edges"].append({
+                "edge_index": i, "source": e.get("source"),
+                "target": e.get("target"), "technique": tid or "(empty)"})
+            continue
+
+        if is_countermeasure(tid):
+            result["invalid_edges"].append({
+                "edge_index": i, "source": e.get("source"), "target": e.get("target"),
+                "technique": tid,
+                "reason": "countermeasure/defense ID used as attack technique",
+                "suggestion": keyword_suggest(ctx)})
+            continue
+
+        if tid.upper() not in index:
+            result["invalid_edges"].append({
+                "edge_index": i, "source": e.get("source"), "target": e.get("target"),
+                "technique": tid,
+                "reason": "technique ID not found in corpus index",
+                "suggestion": keyword_suggest(ctx)})
+
+    n_bad = len(result["invalid_edges"])
+    n_gap = len(result["gap_edges"])
+
+    if n_bad == 0 and n_gap == 0:
+        result["is_valid"] = True
+        result["status"] = "PASS"
+        result["summary"] = f"PASS — {result['checked']} edges verified, all IDs resolve."
+    else:
+        result["is_valid"] = False
+        result["status"] = "FAIL"
+        result["summary"] = (f"FAIL — {result['checked']} edges checked, "
+                             f"{n_bad} invalid ID(s), {n_gap} [GAP]/unmapped edge(s). "
+                             f"Annex B blocked.")
+    return result
+
 @tool("write_stage2_vectors")
 def write_stage2_vectors(vectors_json: str) -> str:
     """Validate and write the Stage 2 structured edge list to

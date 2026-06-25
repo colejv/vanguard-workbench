@@ -1,10 +1,8 @@
 from crewai import Task
 from src.agents import (researcher, decomposer, mapper,
-                        modeler, red_team_lead, orchestrator, verifier)
+                        modeler, red_team_lead, orchestrator)
 from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
-                       verify_corpus_lock, read_corpus_chunk,
-                       extract_to_scratch, read_scratch,
-                       verify_and_fix_stage2, write_stage2_vectors)
+                       extract_to_scratch, read_scratch, write_stage2_vectors)
 
 # Gate 1: corpus lock confirmation (human authorizes before analysis)
 t_research = Task(
@@ -19,20 +17,6 @@ t_research = Task(
     human_input=True,
     output_file="outputs/corpus_manifest.md",
 )
-
-'''
-t_extract_chunk = Task(
-    description=(
-        "You are processing a single corpus chunk: {chunk_content}\n\n"
-        "Extract EVERY: named system, AAMCAT or other subsystem, vendor product, "
-        "interface, protocol, version, exercise event, named person, and organization. "
-        "Call `extract_to_scratch` with the chunk index ({chunk_index}) and your findings."
-    ),
-    expected_output="Confirmation that findings were written to scratchpad.",
-    agent=decomposer,
-    tools=[extract_to_scratch],
-)
-'''
 
 t_synthesize_stage0 = Task(
     description=(
@@ -128,28 +112,6 @@ t_stage2 = Task(
     output_file="outputs/stage2.md",
 )
 
-t_verify_stage2 = Task(
-    description=(
-        "You are an adversarial verifier. Your job is mechanical, not analytical.\n"
-        "Step 1: Read the contents of outputs/stage2.md.\n"
-        "Step 2: Call verify_and_fix_stage2 with the full text of that file.\n"
-        "Step 3: Report the tool's output VERBATIM — do not paraphrase or interpret.\n"
-        "Step 4: If STATUS is FAIL, list every hallucinated ID and what it should "
-        "be corrected to by searching the index with lookup_technique using keywords "
-        "from the vector description.\n"
-        "Step 5: Do NOT pass a FAIL result downstream. State that Stage 2 must be "
-        "corrected before Annex B can proceed.\n"
-        "You may not produce analysis. Only verification and correction suggestions."
-    ),
-    expected_output=(
-        "Verbatim ID verification report (PASS or FAIL). "
-        "If FAIL: list of hallucinated IDs with suggested corrections from index lookup."
-    ),
-    agent=verifier,
-    tools=[verify_and_fix_stage2, lookup_technique],
-    output_file="outputs/stage2_verification.md",
-)
-
 t_annexB = Task(
     description=(
         "Annex B: build the Kill Chain Attack Graph and compute the minimum node "
@@ -213,7 +175,7 @@ t_stage3 = Task(
     ),
     expected_output="Authorized payload set keyed directly to Stage 2 vectors, rigorously cross-referenced with real MITRE IDs.",
     agent=red_team_lead,
-    context=[t_verify_stage2, t_annexB],  # <-- Changed t_stage2 to t_verify_stage2
+    context=[t_annexB],  
     human_input=True,              
     output_file="outputs/stage3.md",
 )

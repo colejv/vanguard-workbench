@@ -1,10 +1,11 @@
 from crewai import Crew, Process, Task
 import sys, os
 from src.agents import (researcher, decomposer, mapper,
-                        modeler, red_team_lead, orchestrator, verifier)
+                        modeler, red_team_lead, orchestrator)
 from src.tasks import (t_research, t_synthesize_stage0, t_stage1,t_stage2, 
-                       t_verify_stage2, t_annexB, t_annexC, t_stage3, t_stage4)
-from src.tools import extract_to_scratch, verify_corpus_lock
+                       t_annexB, t_annexC, t_stage3, t_stage4)
+from src.tools import extract_to_scratch, verify_corpus_lock, verify_stage2_vectors
+
 
 if __name__ == "__main__":
     import sys, os, glob, json, hashlib
@@ -111,10 +112,9 @@ if __name__ == "__main__":
     # ==========================================
     # DYNAMIC TASK ASSEMBLY
     # ==========================================
-    dynamic_tasks = [t_research]
-
+    chunk_tasks = []
     for i, chunk in enumerate(chunks):
-        chunk_task = Task(
+        chunk_tasks.append(Task(
             description=(
                 f"You are processing corpus chunk index {i}.\n\n"
                 f"=== CHUNK CONTENT ===\n{chunk}\n=====================\n\n"
@@ -124,45 +124,59 @@ if __name__ == "__main__":
             ),
             expected_output=f"Confirmation that chunk {i} findings were written to scratchpad.",
             agent=decomposer,
-            tools=[extract_to_scratch]
-        )
-        dynamic_tasks.append(chunk_task)
+            tools=[extract_to_scratch],
+        ))
 
-    dynamic_tasks.extend([
-        t_synthesize_stage0, 
-        t_stage1,
-        t_stage2, 
-        t_verify_stage2, 
-        t_annexB, 
-        t_annexC, 
-        t_stage3, 
-        t_stage4
-    ])
-    '''
-    # --- TEMPORARY OVERRIDE TO RESUME AT ANNEX B ---
-    dynamic_tasks = [
-        t_annexB, 
-        t_annexC, 
-        t_stage3, 
-        t_stage4
-    ]
-    '''
-    
-    vanguard_crew = Crew(
-        agents=[researcher, decomposer, mapper, modeler, red_team_lead, orchestrator, verifier],
-        tasks=dynamic_tasks,
+    # ---- CREW 1: through Stage 2 (produces stage2_vectors.json) ----
+    pre_tasks = [t_research] + chunk_tasks + [t_synthesize_stage0, t_stage1, t_stage2]
+
+    pre_crew = Crew(
+        agents=[researcher, decomposer, mapper],
+        tasks=pre_tasks,
         process=Process.sequential,
         verbose=True,
     )
-
-    # Pass the versioning variables into the kickoff inputs
-    result = vanguard_crew.kickoff(inputs={
+    pre_crew.kickoff(inputs={
         "sut_brief": brief_text,
         "file_count": c_count,
-        "corpus_version": c_version
+        "corpus_version": c_version,
     })
-    
-    # Optional: Stamp the final mission plan with the corpus version
+
+    # ---- DETERMINISTIC GATE (plain Python — the actual enforcement point) ----
+    verification = verify_stage2_vectors(
+        vectors_path="outputs/stage2_vectors.json",
+        index_path="corpus-index/technique_index.json",
+    )
+    with open("outputs/stage2_verification.md", "w") as f:
+        f.write(f"# Stage 2 Verification\n\nSTATUS: {verification['status']}\n\n")
+        f.write(verification["summary"] + "\n\n")
+        for ie in verification["invalid_edges"]:
+            sug = ie["suggestion"][0]["id"] if ie["suggestion"] else "none"
+            f.write(f"- INVALID edge[{ie['edge_index']}] `{ie['technique']}` "
+                    f"({ie['reason']}) — suggest `{sug}`\n")
+        for ge in verification["gap_edges"]:
+            f.write(f"- GAP edge[{ge['edge_index']}] `{ge['technique']}`\n")
+
+    if not verification["is_valid"]:
+        raise RuntimeError(
+            f"Stage 2 verification FAILED: {verification['summary']} "
+            f"See outputs/stage2_verification.md. Annex B and downstream NOT executed."
+        )
+
+    # ---- CREW 2: Annex B onward (only reached if gate passed) ----
+    post_crew = Crew(
+        agents=[modeler, red_team_lead, orchestrator],
+        tasks=[t_annexB, t_annexC, t_stage3, t_stage4],
+        process=Process.sequential,
+        verbose=True,
+    )
+    result = post_crew.kickoff(inputs={
+        "sut_brief": brief_text,
+        "file_count": c_count,
+        "corpus_version": c_version,
+    })
+
+    # Stamp the final mission plan with the corpus version
     try:
         with open("outputs/stage4_mission_plan.md", "a") as f:
             f.write(f"\n\n---\n*Analysis grounded in Corpus Version v{c_version} ({c_count} files)*")

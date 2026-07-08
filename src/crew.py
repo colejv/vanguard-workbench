@@ -103,6 +103,18 @@ if __name__ == "__main__":
     # being silently accepted.
     lock = verify_corpus_lock_gate()
     print(f"Corpus lock: {lock['status']} — {lock['summary']}")
+
+    # NOT committed into assessment_state.json: STAGE_NAMES in the real
+    # src/schemas.py is ('stage0','stage1','stage2','stage3') and both
+    # commit_stage_output and set_stage_status raise ValueError on any other
+    # stage name, so 'corpus_lock' has no slot to commit into. The Gate 1
+    # doctrinal check still fully enforces below (RuntimeError halts the
+    # run on any drift) — it just isn't tracked as a row in the audit
+    # trail's stages dict. If you want it tracked there too, that's a
+    # one-line addition to STAGE_NAMES plus adding "corpus_lock" to every
+    # place that iterates it (all_stages_passed, the stages default_factory)
+    # — say the word and I'll do it against your actual schemas.py rather
+    # than guess at it again.
     if not lock["is_valid"]:
         raise RuntimeError(
             f"Corpus lock verification FAILED: {lock['summary']} "
@@ -110,11 +122,6 @@ if __name__ == "__main__":
             f"drifted file(s) before re-running. "
             f"Run audit trail: {run_output_dir(run_id)}/assessment_state.json"
         )
-    # NOTE: this does not yet write the lock result into assessment_state.json
-    # the way the Stage 2 gate does (commit_stage_output/set_stage_status) —
-    # I haven't seen src/state.py or src/schemas.py in this session and don't
-    # want to guess at stage-name validation. Share those two files and I'll
-    # wire it in with the same two-step commit/promote pattern used below.
 
     print("Reading assessment brief...")
     with open("collection/brief.md") as f:

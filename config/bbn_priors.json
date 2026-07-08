@@ -1,0 +1,100 @@
+{
+  "version": "1.0",
+  "description": "Structural/doctrinal CPD priors for Annex C bbn_threat_score. These are cross-assessment modeling constants (how nodes relate to each other), NOT per-assessment analyst inputs. Per-assessment inputs (adversary.capability_prior, adversary.tempo, defensive_posture, geopolitical_trigger_prior) are supplied fresh each run via cpd_config_json and are never read from this file or defaulted -- bbn_threat_score refuses to run if they're missing. IMPORTANT: nearly every value below is an inherited analyst-judgment template default from the original Annex C tutorial, NOT empirically fit to any specific CTI dataset. Review and replace with case-specific sourcing (ATT&CK Groups data, actual SIEM/IDS base rates, CTI reporting) before relying on this for a scored, Commander-ready assessment. Every entry's 'source' field states what it actually is -- do not upgrade these to look more authoritative than they are.",
+
+  "priors": {
+
+    "operational_tempo_distribution": {
+      "LOW":    { "value": [0.6, 0.3, 0.1], "source": "Analyst-judgment template default: confidence smoothing around a LOW tempo assessment (P(actual tempo=low/med/high) given assessed=LOW). Not empirically fit." },
+      "MEDIUM": { "value": [0.2, 0.6, 0.2], "source": "Analyst-judgment template default: confidence smoothing around a MEDIUM tempo assessment. Not empirically fit." },
+      "HIGH":   { "value": [0.1, 0.2, 0.7], "source": "Analyst-judgment template default: confidence smoothing around a HIGH tempo assessment. Not empirically fit." }
+    },
+
+    "phishing_given_capability": {
+      "value": [[0.90, 0.50, 0.15], [0.10, 0.50, 0.85]],
+      "source": "Analyst judgment: nation-state APT groups documented as relying more heavily on spear-phishing for initial access than criminal or hacktivist actors, consistent with general MITRE ATT&CK Groups TTP-frequency patterns. Not fit to a specific CTI dataset for any given assessment -- verify against actor-specific reporting before scored use. Columns are [hacktivist, criminal, nation-state]; rows are [no-phish, phish]."
+    },
+
+    "scanning_given_tempo": {
+      "value": [[0.95, 0.65, 0.25], [0.05, 0.35, 0.75]],
+      "source": "Analyst judgment: higher assessed operational tempo implies proportionally more active reconnaissance/scanning. Not empirically fit -- calibrate against actual SIEM/IDS base rates if available. Columns are [LOW, MEDIUM, HIGH tempo]; rows are [no-scan, scan-detected]."
+    },
+
+    "auth_anomaly_root": {
+      "value": [0.82, 0.18],
+      "source": "Analyst-judgment credential-reuse/auth-anomaly base rate inherited from the Annex C tutorial template. Treat as a placeholder pending case-specific IAM/SIEM baseline data for the actual system under test."
+    },
+
+    "defensive_posture_floor": {
+      "value": 0.05,
+      "source": "Modeling-stability floor from the Annex C template's DefensivePosture CPD construction -- prevents a fully-open or fully-hardened posture from producing a degenerate (exactly 0) probability mass. Not an empirical estimate."
+    },
+
+    "defensive_multiplier_floor": {
+      "value": 0.30,
+      "source": "Annex C template defensive_multiplier() formula: 'max(0.30, 1.0 - (controls_active/total)*0.70)'. A fully-controlled posture still leaves a 30% residual adversary-success floor (defense is never modeled as perfect). Template default, not empirically derived."
+    },
+    "defensive_multiplier_scale": {
+      "value": 0.70,
+      "source": "Annex C template defensive_multiplier() formula: each active control reduces adversary success proportionally, scaled so full control coverage reduces success by 70% (bounded by the floor above). Template default, not empirically derived."
+    },
+
+    "killchain_phase_base": {
+      "nation_state": { "value": [0.25, 0.32, 0.28, 0.15], "source": "Analyst judgment: nation-state actors modeled with a 'long-dwell' pattern -- proportionally more probability mass on lateral movement and objective phases -- consistent with general APT tradecraft literature. Not fit to this assessment's specific adversary; treat as a template default. Order: [Recon, InitialAccess, Lateral, Objective]." },
+      "criminal":     { "value": [0.45, 0.30, 0.18, 0.07], "source": "Analyst judgment template default for criminal-tier actors: faster, shallower kill chains than nation-state. Not empirically fit. Order: [Recon, InitialAccess, Lateral, Objective]." },
+      "hacktivist":   { "value": [0.65, 0.25, 0.08, 0.02], "source": "Analyst judgment template default for hacktivist-tier actors: mostly recon/opportunistic, rarely reaching Objective. Not empirically fit. Order: [Recon, InitialAccess, Lateral, Objective]." }
+    },
+
+    "killchain_phase_evidence_delta_phishing": {
+      "value": [-0.10, 0.10, 0.0, 0.0],
+      "source": "Analyst-judgment probability-mass shift applied to KillChainPhase when a phishing attempt is observed: reallocates from Recon to InitialAccess. Magnitude is a template default, not empirically calibrated."
+    },
+    "killchain_phase_evidence_delta_scanning": {
+      "value": [-0.08, 0.08, 0.0, 0.0],
+      "source": "Analyst-judgment probability-mass shift when scanning is detected: reallocates from Recon to InitialAccess. Template default, not empirically calibrated."
+    },
+    "killchain_phase_evidence_delta_auth_anomaly": {
+      "value": [0.0, -0.12, 0.12, 0.0],
+      "source": "Analyst-judgment probability-mass shift when an auth anomaly is observed: reallocates from InitialAccess to Lateral (auth anomalies are treated as a lateral-movement signal). Template default, not empirically calibrated."
+    },
+
+    "iw_effect_phase_base_recon": {
+      "value": 0.005,
+      "source": "Analyst-judgment ceiling on P(IW effect achieved) when the adversary is only assessed at Recon phase. Template default, not empirically derived."
+    },
+    "iw_effect_phase_base_initial_access": {
+      "value": 0.08,
+      "source": "Analyst-judgment ceiling on P(IW effect achieved) at InitialAccess phase ('early-access ceiling'). Template default."
+    },
+    "iw_effect_phase_base_lateral": {
+      "value": 0.40,
+      "source": "Analyst-judgment ceiling on P(IW effect achieved) at Lateral/Pivot phase. Template default, loosely anchored to KCAG lateral-path traversal rates but not directly computed from them."
+    },
+    "iw_effect_objective_convergence_factor": {
+      "value": 2.2,
+      "source": "Multiplier applied to the Annex B KCAG's max objective-path traversal probability to derive the Objective-phase P(IW effect achieved) ceiling. Template default -- the choice of 2.2 is not empirically derived, only bounded by iw_effect_objective_cap below."
+    },
+    "iw_effect_objective_cap": {
+      "value": 0.85,
+      "source": "Hard ceiling on the Objective-phase P(IW effect achieved) base rate, applied after the convergence-factor multiplication, so the model never asserts near-certainty regardless of KCAG input. Modeling-stability constant."
+    },
+
+    "iw_effect_posture_multiplier_strong": {
+      "value": 0.25,
+      "source": "Analyst judgment: a strong (fully-controlled) defensive posture reduces P(IW effect) to 25% of its phase-base value. Template default, not empirically derived."
+    },
+    "iw_effect_posture_multiplier_moderate": {
+      "value": 0.55,
+      "source": "Analyst judgment: a moderate defensive posture reduces P(IW effect) to 55% of its phase-base value. Template default, not empirically derived."
+    },
+
+    "iw_effect_geo_multiplier": {
+      "value": 1.45,
+      "source": "Analyst judgment: an active geopolitical trigger event amplifies P(IW effect) by 45%. Template default, not empirically derived."
+    },
+    "iw_effect_geo_cap": {
+      "value": 0.99,
+      "source": "Hard ceiling applied after the geopolitical multiplier so the model never asserts absolute certainty. Modeling-stability constant."
+    }
+  }
+}

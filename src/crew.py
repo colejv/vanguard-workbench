@@ -4,7 +4,10 @@ from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
 from src.tasks import (t_research, t_synthesize_stage0, t_stage1,t_stage2, 
                        t_annexB, t_annexC, t_stage3, t_stage4)
-from src.tools import extract_to_scratch, verify_corpus_lock, verify_stage2_vectors
+from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
+                       discover_corpus_files, read_corpus_file,
+                       check_attribution_boundary, check_phase0_safety_gate,
+                       verify_stage2_vectors)
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status)
@@ -21,13 +24,10 @@ if __name__ == "__main__":
             with open(filepath, "rb") as f:
                 return hashlib.sha256(f.read()).hexdigest()
 
-        # Get current files
-        current_files = sorted([
-            f for f in os.listdir(src_dir) 
-            if f.endswith((".md", ".txt", ".pdf", ".json")) 
-            and not f.startswith("_") 
-            and f != "corpus_manifest.md"
-        ])
+        # Get current files — via the shared discover_corpus_files, so this
+        # hash scope is by construction the same set the chunk assembler
+        # below reads for analysis. Do not re-inline this filter.
+        current_files = discover_corpus_files(src_dir)
         
         # Hash state
         current_state = {f: hash_file(os.path.join(src_dir, f)) for f in current_files}
@@ -91,6 +91,31 @@ if __name__ == "__main__":
     state = init_assessment_state(run_id, corpus_manifest_hash)
     save_assessment_state(state, run_id)
 
+    # ---- GATE 1: CORPUS LOCK (deterministic — plain Python, not an agent
+    # task) ----
+    # Doctrinal Annex A Phase 1 requirement: the corpus must not have moved
+    # since it was frozen (sources/corpus_manifest.md, written at the
+    # collection/lock step) before Stage 0 may begin. t_research previously
+    # only asserted a verbatim confirmation string and never actually
+    # checked this — verify_corpus_lock_gate() re-hashes sources/ against
+    # the frozen manifest and this call raises on any drift, so a moved,
+    # added, or edited source file now genuinely blocks the run instead of
+    # being silently accepted.
+    lock = verify_corpus_lock_gate()
+    print(f"Corpus lock: {lock['status']} — {lock['summary']}")
+    if not lock["is_valid"]:
+        raise RuntimeError(
+            f"Corpus lock verification FAILED: {lock['summary']} "
+            f"Stage 0 NOT started. Re-freeze the corpus or restore the "
+            f"drifted file(s) before re-running. "
+            f"Run audit trail: {run_output_dir(run_id)}/assessment_state.json"
+        )
+    # NOTE: this does not yet write the lock result into assessment_state.json
+    # the way the Stage 2 gate does (commit_stage_output/set_stage_status) —
+    # I haven't seen src/state.py or src/schemas.py in this session and don't
+    # want to guess at stage-name validation. Share those two files and I'll
+    # wire it in with the same two-step commit/promote pattern used below.
+
     print("Reading assessment brief...")
     with open("collection/brief.md") as f:
         brief_text = f.read()
@@ -103,22 +128,20 @@ if __name__ == "__main__":
         # Touch the file so the tool doesn't throw a FileNotFoundError if read early
         open(scratch_path, 'a').close() 
 
-    # Read and assemble corpus chunks
+    # Read and assemble corpus chunks — discover_corpus_files is the exact
+    # same file set snapshot_corpus() just hashed above, so every file in
+    # the frozen manifest is guaranteed to enter analysis (previously .pdf/
+    # .json were hashed here but silently never read).
     print("Assembling corpus from chunks...")
     src = "sources"
-    files = sorted(
-        f for f in os.listdir(src)
-        if f.endswith((".md", ".txt"))
-        and not f.startswith("_")
-        and f != "corpus_manifest.md"
-    )
-    
+    files = discover_corpus_files(src)
+
     CHUNK = 60000
     chunks = []
     current = []
     current_len = 0
     for fn in files:
-        content = f"\n===== {fn} =====\n" + open(os.path.join(src, fn)).read()
+        content = f"\n===== {fn} =====\n" + read_corpus_file(os.path.join(src, fn))
         if current_len + len(content) > CHUNK and current:
             chunks.append("".join(current))
             current, current_len = [], 0
@@ -166,13 +189,61 @@ if __name__ == "__main__":
         "corpus_version": c_version,
     })
 
+    # ---- ATTRIBUTION-BOUNDARY CHECK (deterministic, warn-only) ----
+    # Item 7: replaces trusting the "ATTRIBUTION DISCIPLINE" prompt text
+    # alone. Checks every named person/unit/component mentioned in the
+    # Stage 0 + Stage 1 prose against the scratchpad (the documented
+    # boundary) and, as a fallback, the raw locked corpus. High-confidence
+    # findings (rank+name, ordinal+unit) are the enforcement signal;
+    # bare-phrase findings are reported but not counted against is_clean
+    # (see the false-positive calibration note in tools.py). This is
+    # warn-only, not a RuntimeError, because unlike the corpus-lock and
+    # Stage 2 gates, regex-based entity extraction has a real residual
+    # false-positive rate even after tiering — flip the `if not attr["...` block
+    # below to `raise RuntimeError(...)` if you want it to hard-block instead.
+    prose = ""
+    for p in ("outputs/stage0.md", "outputs/stage1.md"):
+        if os.path.exists(p):
+            prose += open(p).read() + "\n"
+    scratch_text = open(scratch_path).read() if os.path.exists(scratch_path) else ""
+    corpus_text = ""
+    if os.path.exists("corpus-index/corpus_chunks.json"):
+        corpus_text = "\n".join(json.load(open("corpus-index/corpus_chunks.json"))["chunks"])
+
+    attr = check_attribution_boundary(prose, scratch_text, corpus_text)
+    with open("outputs/attribution_check.md", "w") as f:
+        f.write("# Attribution Boundary Check (Stage 0 + Stage 1)\n\n")
+        f.write(f"Entities checked: {attr['checked']}\n\n")
+        f.write("## High-confidence (rank+name / ordinal+unit) — drives verdict\n")
+        f.write(f"- Traceable: {attr['high_confidence']['traceable']}\n")
+        f.write(f"- Extraction gap (in corpus, missed by scratchpad): "
+                f"{attr['high_confidence']['extraction_gap']}\n")
+        f.write(f"- **UNTRACEABLE (possible fabrication): "
+                f"{attr['high_confidence']['untraceable']}**\n\n")
+        f.write("## Advisory (bare capitalized phrase) — review only, not enforced\n")
+        f.write(f"- Traceable: {attr['advisory']['traceable']}\n")
+        f.write(f"- Extraction gap: {attr['advisory']['extraction_gap']}\n")
+        f.write(f"- Untraceable: {attr['advisory']['untraceable']}\n")
+
+    if attr["is_clean"]:
+        print(f"Attribution check: CLEAN — {attr['checked']} entities checked, "
+              f"none untraceable at high confidence.")
+    else:
+        print(f"Attribution check: FLAGGED — possible fabrication, human review "
+              f"required: {attr['high_confidence']['untraceable']}. "
+              f"See outputs/attribution_check.md. (Not blocking this run — see "
+              f"comment above this block to make it a hard gate.)")
+
     # ---- COMMIT PRE-CREW STAGE OUTPUTS TO ASSESSMENT STATE ----
     # pre_crew runs Stage 0, Stage 1, and Stage 2 sequentially inside one
     # kickoff() with no per-task hook exposed, so all three are committed
     # here, after the crew finishes, from whatever artifacts exist on disk.
-    # Stage 0/1 land as PENDING (no deterministic gate for them yet — that's
-    # item 4); Stage 2 is committed PENDING here and promoted to PASS/FAIL
-    # immediately below, once verify_stage2_vectors actually runs.
+    # Stage 0/1 land as PENDING — the attribution-boundary check above is
+    # deterministic but warn-only (not a PASS/FAIL gate the way Stage 2's
+    # verify_stage2_vectors is), so it doesn't change commit status here;
+    # its verdict lives in outputs/attribution_check.md instead. Stage 2 is
+    # committed PENDING here and promoted to PASS/FAIL immediately below,
+    # once verify_stage2_vectors actually runs.
     for stage_name, artifact_path in (
         ("stage0", "outputs/stage0_output.json"),
         ("stage1", "outputs/stage1_output.json"),
@@ -229,10 +300,52 @@ if __name__ == "__main__":
         "corpus_version": c_version,
     })
 
+    # ---- ITEM 8: PHASE 0 SAFETY GATE COMPLIANCE CHECK (deterministic, HARD
+    # BLOCK) ----
+    # Unlike the attribution check (warn-only, item 7), this is a hard gate:
+    # a missing safety-review section on a payload with a real physical/
+    # destructive effect is a compliance failure, not an analytical nicety.
+    # IMPORTANT CAVEAT: t_stage3 and t_stage4 both already ran their
+    # human_input=True approval INSIDE post_crew.kickoff() above, so this
+    # check fires AFTER a human has already approved the mission plan
+    # content — it cannot intercept that approval. What it CAN do is refuse
+    # to let the run complete/stamp the plan as final if the safety gate is
+    # missing, which still surfaces the compliance gap immediately rather
+    # than silently shipping a Category 2/3 mission plan with no safety
+    # section. If you want this enforced *before* the human sees Stage 4 at
+    # all, that requires splitting post_crew at the Stage 3/Stage 4 boundary
+    # the same way pre_crew/post_crew are already split around the Stage 2
+    # gate — a bigger structural change I didn't make unprompted; say the
+    # word and I will.
+    stage3_text = open("outputs/stage3.md").read() if os.path.exists("outputs/stage3.md") else ""
+    stage4_text = (open("outputs/stage4_mission_plan.md").read()
+                   if os.path.exists("outputs/stage4_mission_plan.md") else "")
+    safety = check_phase0_safety_gate(stage3_text, stage4_text)
+    with open("outputs/phase0_safety_check.md", "w") as f:
+        f.write("# Phase 0 Safety Gate Compliance Check\n\n")
+        f.write(f"Category 2/3 payload detected: {safety['category_2_3_detected']}\n")
+        f.write(f"Matched terms: {safety['matched_terms']}\n")
+        f.write(f"Phase 0 Safety Gate section present: {safety['phase0_gate_present']}\n\n")
+        f.write(f"STATUS: {'COMPLIANT' if safety['is_compliant'] else 'NON-COMPLIANT'}\n")
+        f.write(safety["summary"] + "\n")
+    print(f"Phase 0 Safety Gate check: "
+          f"{'COMPLIANT' if safety['is_compliant'] else 'NON-COMPLIANT'} — {safety['summary']}")
+    if not safety["is_compliant"]:
+        raise RuntimeError(
+            f"Phase 0 Safety Gate compliance FAILED: {safety['summary']} "
+            f"See outputs/phase0_safety_check.md. Mission plan NOT finalized — "
+            f"revise Stage 4 to add the required safety section (or an explicit "
+            f"'NO CATEGORY 2/3 PAYLOADS' statement if this is a false positive) "
+            f"and re-run. Run audit trail: {run_output_dir(run_id)}/assessment_state.json"
+        )
+
     # ---- COMMIT POST-CREW STAGE OUTPUT TO ASSESSMENT STATE ----
-    # Stage 3 (t_stage3) is the payload-design gate; no structured schema or
-    # deterministic verifier exists for it yet (that's item 4's scope), so
-    # it lands as PENDING against its prose artifact, same as Stage 0/1.
+    # Stage 3 (t_stage3) is the payload-design gate; no structured schema
+    # exists for it yet, so it lands as PENDING against its prose artifact,
+    # same as Stage 0/1. (The Phase 0 safety check above does deterministically
+    # verify one specific cross-cutting property of Stage 3+4 together —
+    # category/safety-gate correlation — but that's not the same as a full
+    # structural verifier the way Stage 2 has one.)
     if os.path.exists("outputs/stage3.md"):
         commit_stage_output(state, "stage3", "outputs/stage3.md", status=StageStatus.PENDING)
     state.current_stage = "complete"

@@ -192,34 +192,214 @@ class KCAGMinCutTool(BaseTool):
  
 kcag_min_cut = KCAGMinCutTool()
 
-@tool("verify_corpus_lock")
-def verify_corpus_lock(_: str = "") -> str:
-    """Gate 1: re-hash sources/ against the frozen manifest. Returns PASS or a
-    HALT report. This is a deterministic check, not a description task."""
-    import os, re, json, hashlib
-    src, manifest = "sources", "sources/corpus_manifest.md"
+# ============================================================================
+#  CORPUS FILE DISCOVERY — single source of truth
+#  Used identically by corpus hashing/versioning (snapshot_corpus, crew.py)
+#  AND by chunk assembly for LLM analysis (crew.py). A file that gets
+#  fingerprinted into the manifest is now guaranteed to also enter analysis,
+#  and vice versa — the old .md/.txt/.pdf/.json vs .md/.txt split is gone.
+# ============================================================================
+CORPUS_EXTENSIONS = (".md", ".txt", ".pdf", ".json")
 
-    def inventory(s):
-        return sorted(f for f in os.listdir(s)
-                      if f.endswith((".md", ".txt", ".json", ".pdf"))
-                      and not f.startswith("_") and f != "corpus_manifest.md")
+def discover_corpus_files(src_dir="sources"):
+    """Return the sorted list of corpus source filenames in src_dir.
+    Do not duplicate this filter anywhere else — import this function."""
+    return sorted(
+        f for f in os.listdir(src_dir)
+        if f.endswith(CORPUS_EXTENSIONS)
+        and not f.startswith("_")
+        and f != "corpus_manifest.md"
+    )
 
-    frozen = json.loads(re.search(r'```json\s*(\{.*\})\s*```',
-                  open(manifest).read(), re.S).group(1))
-    frozen_map = {e["file"]: e["sha256"] for e in frozen["files"]}
+def read_corpus_file(path: str) -> str:
+    """Return the textual content of one corpus source file for chunk
+    assembly. .md/.txt/.json are read as plain text. .pdf is extracted via
+    pypdf. Raises — does NOT silently skip — if pypdf is missing, because a
+    missing extractor is a setup error, not a reason to hash a file that
+    then never gets read (that silent mismatch was the original bug)."""
+    if path.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+        except ImportError as e:
+            raise RuntimeError(
+                f"{path} is a PDF source but pypdf is not installed "
+                f"(`pip install pypdf`). Refusing to silently exclude a "
+                f"hashed corpus file from analysis."
+            ) from e
+        reader = PdfReader(path)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    return open(path, encoding="utf-8").read()
+
+
+# ============================================================================
+#  DETERMINISTIC CORPUS LOCK GATE  (plain Python — NOT a CrewAI tool)
+#  Called directly from crew.py before pre_crew.kickoff(). Same contract
+#  shape as verify_stage2_vectors: {"is_valid": bool, ...}. crew.py raises
+#  on is_valid=False and refuses to start Stage 0 — the doctrinal Gate 1
+#  check can no longer be satisfied by an agent reciting a verbatim string.
+# ============================================================================
+def verify_corpus_lock_gate(src: str = "sources",
+                            manifest_path: str = "sources/corpus_manifest.md") -> dict:
+    """Re-hash sources/ (via discover_corpus_files) against the frozen
+    manifest written at corpus-lock time. Fails closed: a missing manifest,
+    an unparsable manifest, or any missing/added/changed file all return
+    is_valid=False — there is no path that defaults to PASS."""
+    import re, hashlib
+
+    result = {"is_valid": False, "status": "FAIL", "summary": "",
+              "missing": [], "added": [], "changed": []}
+
+    if not os.path.exists(manifest_path):
+        result["summary"] = (f"{manifest_path} not found — corpus has not been "
+                              f"locked yet. Run the collection/lock step before Stage 0.")
+        return result
+
+    m = re.search(r'```json\s*(\{.*\})\s*```', open(manifest_path).read(), re.S)
+    if not m:
+        result["summary"] = f"{manifest_path} has no embedded JSON block — cannot verify."
+        return result
+
+    try:
+        frozen = json.loads(m.group(1))
+        frozen_map = {e["file"]: e["sha256"] for e in frozen["files"]}
+    except (json.JSONDecodeError, KeyError) as e:
+        result["summary"] = f"{manifest_path} JSON block malformed ({e})."
+        return result
+
     current = {}
-    for fn in inventory(src):
+    for fn in discover_corpus_files(src):
         with open(os.path.join(src, fn), "rb") as fh:
             current[fn] = hashlib.sha256(fh.read()).hexdigest()
 
-    missing = sorted(set(frozen_map) - set(current))
-    added   = sorted(set(current) - set(frozen_map))
-    changed = sorted(f for f in (set(frozen_map) & set(current))
-                     if frozen_map[f] != current[f])
-    if missing or added or changed:
-        return (f"CORPUS LOCK VIOLATION — HALT.\n"
-                f"missing: {missing}\nadded: {added}\nchanged: {changed}")
-    return f"CORPUS LOCK VERIFIED: {len(current)} files match frozen manifest."
+    result["missing"] = sorted(set(frozen_map) - set(current))
+    result["added"]   = sorted(set(current) - set(frozen_map))
+    result["changed"] = sorted(f for f in (set(frozen_map) & set(current))
+                                if frozen_map[f] != current[f])
+
+    if result["missing"] or result["added"] or result["changed"]:
+        result["summary"] = (f"CORPUS LOCK VIOLATION — missing: {result['missing']}, "
+                              f"added: {result['added']}, changed: {result['changed']}")
+        return result
+
+    result["is_valid"] = True
+    result["status"] = "PASS"
+    result["summary"] = f"CORPUS LOCK VERIFIED: {len(current)} files match frozen manifest."
+    return result
+
+
+# ============================================================================
+#  ATTRIBUTION-BOUNDARY CHECK  (plain Python — NOT a CrewAI tool)
+#  Called directly from crew.py after Stage 0/1 prose is written. Same
+#  reasoning as the corpus lock and Stage 2 gates: whether a named entity
+#  traces to the scratchpad is a mechanical text-membership question, not
+#  something to trust an agent's self-report on ("ATTRIBUTION DISCIPLINE"
+#  in the task prompt was necessary but not sufficient — see stage0/stage1's
+#  "MG Patrick Ellis" / "Shane Taylor" fabrication history).
+#
+#  This is regex-based candidate-entity extraction, not real NER, so it is
+#  split into two confidence tiers:
+#    - RANK_NAME / UNIT_DESIGNATION: a military rank abbreviation or an
+#      ordinal+unit-noun phrase almost never precedes generic doctrinal
+#      vocabulary. These drive the hard "untraceable" verdict.
+#    - BARE_PHRASE: any other 2-4 word Title Case sequence. This also
+#      catches real fabricated program/vendor names, but calibration
+#      against pure-doctrine text (zero real entities) still produced
+#      false positives on terms like "Common Operating Picture" —
+#      reported as advisory only, never drives is_clean.
+#  If you want the advisory tier to also block, that's a one-line change
+#  in check_attribution_boundary's is_clean calculation — I left it
+#  warn-only given the tier's real false-positive rate, but the mechanism
+#  to escalate it is already there.
+# ============================================================================
+RANKS = {
+    "GEN", "LTG", "MG", "BG", "COL", "LTC", "MAJ", "CPT", "LT", "2LT", "1LT",
+    "CSM", "SGM", "1SG", "MSG", "SFC", "SSG", "SGT", "CPL", "SPC", "PFC", "PVT",
+}
+UNIT_WORDS = {"division", "brigade", "battalion", "regiment", "corps",
+              "squadron", "company", "platoon", "task force"}
+
+# Phrases that are legitimately Title Case in IW/military prose but are
+# framework/document scaffolding, not named entities — excluded so the
+# report isn't flooded with structural noise.
+ATTRIBUTION_GENERIC_PHRASES = {
+    "reverse ipb", "stage 0", "stage 1", "stage 2", "stage 3", "stage 4",
+    "annex a", "annex b", "annex c", "united states", "not applicable",
+}
+
+_ATTR_WORD = r"[A-Z][a-z]+(?:['\-][A-Z][a-z]+)?"
+_ATTR_PATTERNS = [
+    ("RANK_NAME", re.compile(
+        rf"\b((?:{'|'.join(RANKS)})\s+{_ATTR_WORD}(?:\s+{_ATTR_WORD}){{0,2}})")),
+    ("UNIT_DESIGNATION", re.compile(
+        rf"\b(\d+(?:st|nd|rd|th)(?:\s+{_ATTR_WORD}){{0,3}}\s+"
+        rf"(?:{'|'.join(w.title() for w in UNIT_WORDS)}))\b", re.I)),
+    ("BARE_PHRASE", re.compile(rf"\b({_ATTR_WORD}(?:\s+{_ATTR_WORD}){{1,3}})")),
+]
+
+def extract_attribution_candidates(text: str) -> dict:
+    """Return {span: tier} for candidate named entities in text, after
+    subsumption filtering (a shorter span fully inside a longer one is
+    dropped — 'Patrick Ellis' inside 'MG Patrick Ellis' is one finding,
+    not two). tier is one of RANK_NAME / UNIT_DESIGNATION / BARE_PHRASE;
+    the first two are high-confidence, the third is advisory (see
+    check_attribution_boundary)."""
+    HIGH_CONF = {"RANK_NAME", "UNIT_DESIGNATION"}
+    found = {}
+    for tier, pat in _ATTR_PATTERNS:
+        for m in pat.finditer(text):
+            span = (m.group(1) if m.groups() else m.group(0)).strip()
+            key = span.lower()
+            if key in ATTRIBUTION_GENERIC_PHRASES:
+                continue
+            is_new_high_conf = tier in HIGH_CONF
+            if key not in found or (is_new_high_conf and found[key][1] not in HIGH_CONF):
+                found[key] = (span, tier)
+
+    ordered = sorted(found.values(), key=lambda x: len(x[0]), reverse=True)
+    kept = []
+    for span, tier in ordered:
+        if not any(span.lower() in longer.lower() and span != longer for longer, _ in kept):
+            kept.append((span, tier))
+    return dict(kept)
+
+def check_attribution_boundary(text: str, scratch_text: str, corpus_text: str = "") -> dict:
+    """Extract candidate named entities from `text` and classify each
+    against `scratch_text` (the documented attribution boundary per the
+    task prompts) and, as a fallback, `corpus_text` (the raw locked corpus).
+
+    Three-tier verdict per entity, mirroring the confidence-tier pattern
+    already used elsewhere in this pipeline (CONFIRMED/PLAUSIBLE/GAP style):
+      TRACEABLE       — found in the scratchpad. Fine.
+      EXTRACTION_GAP   — not in the scratchpad, but present in the raw
+                         corpus. The scratchpad extraction missed it; not
+                         fabricated, but Stage 0/1 should not have used it
+                         without re-extracting.
+      UNTRACEABLE      — not in the scratchpad or the raw corpus. Possible
+                         fabrication — this is what a hallucinated
+                         "MG Patrick Ellis" looks like.
+    """
+    candidates = extract_attribution_candidates(text)
+    scratch_low = scratch_text.lower()
+    corpus_low = (corpus_text or "").lower()
+
+    result = {
+        "checked": len(candidates),
+        "high_confidence": {"traceable": [], "extraction_gap": [], "untraceable": []},
+        "advisory": {"traceable": [], "extraction_gap": [], "untraceable": []},
+    }
+    for span, tier in candidates.items():
+        bucket = "high_confidence" if tier in ("RANK_NAME", "UNIT_DESIGNATION") else "advisory"
+        e = span.lower()
+        if e in scratch_low:
+            result[bucket]["traceable"].append(span)
+        elif corpus_low and e in corpus_low:
+            result[bucket]["extraction_gap"].append(span)
+        else:
+            result[bucket]["untraceable"].append(span)
+
+    result["is_clean"] = len(result["high_confidence"]["untraceable"]) == 0
+    return result
+
 
 @tool("read_corpus_chunk")
 def read_corpus_chunk(chunk_index: str = "0") -> str:
@@ -527,6 +707,78 @@ def verify_stage2_vectors(vectors_path: str = "outputs/stage2_vectors.json",
                              f"Annex B blocked.")
     return result
 
+
+# ============================================================================
+#  PHASE 0 SAFETY GATE COMPLIANCE CHECK  (plain Python — NOT a CrewAI tool)
+#  Called from crew.py after post_crew.kickoff() completes. Unlike the
+#  attribution-boundary check (item 7), this IS a hard gate: a missing
+#  safety-review section on a payload with a real physical/destructive
+#  effect is a safety compliance failure, not an analytical nicety, so this
+#  errs toward over-detecting kinetic payloads rather than under-detecting
+#  them. See the crew.py wiring for the important caveat that this runs
+#  AFTER t_stage4's human_input approval already happened inside kickoff()
+#  — it is a post-hoc compliance check, not a pre-approval gate.
+# ============================================================================
+KINETIC_CATEGORY_MARKERS = [
+    r"degradation\s*&?\s*destruction",
+    r"physical\s+behavior\s+alteration",
+    r"\bcategory\s*[:\s]*2\b",
+    r"\bcategory\s*[:\s]*3\b",
+]
+KINETIC_KEYWORD_MARKERS = [
+    r"\bkinetic\b", r"\blive[\s-]fire\b", r"\bphysical[\s-]layer\b",
+    r"\brange safety\b", r"\bactuator\b", r"\bfires?\s+(?:effect|solution)\b",
+]
+SAFETY_GATE_MARKERS = [
+    r"phase\s*0.{0,60}safety",
+    r"safety\s*gate",
+    r"\brso\b|\brange safety officer\b",
+    r"abort\s+(?:criteria|circuit|authority|trigger)",
+]
+NO_GATE_NEEDED_MARKER = r"no\s+category\s*2\s*/?\s*3\s+payloads?"
+
+def check_phase0_safety_gate(stage3_text: str, stage4_text: str) -> dict:
+    """Checks whether any Category 2 (Degradation & Destruction) or
+    Category 3 (Physical Behavior Alteration) payload in Stage 3 output is
+    matched by a Phase 0 Safety Gate section in the Stage 4 mission plan.
+    Requires an explicit 'no Category 2/3 payloads' statement to treat the
+    gate as not-applicable — silence is never treated as compliant."""
+    s3, s4 = stage3_text or "", stage4_text or ""
+
+    matched = [m.group(0) for pat in KINETIC_CATEGORY_MARKERS + KINETIC_KEYWORD_MARKERS
+               for m in [re.search(pat, s3, re.I)] if m]
+    category_2_3_detected = len(matched) > 0
+
+    gate_present = any(re.search(pat, s4, re.I) for pat in SAFETY_GATE_MARKERS)
+    explicit_not_needed = bool(re.search(NO_GATE_NEEDED_MARKER, s4, re.I))
+
+    if not category_2_3_detected:
+        is_compliant, summary = True, (
+            "No Category 2/3 (kinetic/destructive) payload detected in Stage 3 — "
+            "Phase 0 Safety Gate not required.")
+    elif explicit_not_needed:
+        # Checked BEFORE gate_present: the override phrase itself contains
+        # "phase 0 ... safety gate", which would otherwise false-positive
+        # match SAFETY_GATE_MARKERS and get misattributed as a real gate
+        # section rather than recognized as the explicit override it is.
+        is_compliant, summary = True, (
+            "Stage 4 explicitly states no Category 2/3 payloads apply — accepted, but "
+            "flagged for human review since Stage 3 language suggested otherwise.")
+    elif gate_present:
+        is_compliant, summary = True, (
+            f"Category 2/3 payload detected ({matched[:3]}) and a Phase 0 Safety Gate "
+            f"section was found in the Stage 4 mission plan.")
+    else:
+        is_compliant, summary = False, (
+            f"COMPLIANCE GAP: Category 2/3 payload detected in Stage 3 ({matched[:3]}) "
+            f"but no Phase 0 Safety Gate section (and no explicit not-needed statement) "
+            f"found in the Stage 4 mission plan.")
+
+    return {"category_2_3_detected": category_2_3_detected, "matched_terms": matched,
+            "phase0_gate_present": gate_present, "is_compliant": is_compliant,
+            "summary": summary}
+
+
 @tool("write_stage2_vectors")
 def write_stage2_vectors(vectors_json: str) -> str:
     """Validate and write the Stage 2 structured edge list to
@@ -789,229 +1041,304 @@ def verify_technique_ids(stage_output: str) -> str:
 
 # --- Annex C: pgmpy five-layer BBN threat inference ---
 @tool("bbn_threat_score")
-def bbn_threat_score(cpd_config_json: str = "") -> str:
+def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_priors.json") -> str:
     """Construct an evidence-driven Bayesian threat model, run inference, and
     return a threat score, kill-chain phase estimate, and a CPD audit log.
- 
+
     Unlike a flat risk-propagation model, this ingests Annex B KCAG priors and
     real conditional structure so the score reflects the computed attack graph,
     not a default constant.
- 
-    Input JSON (all keys optional; sensible NGC2 defaults applied):
+
+    STRUCTURAL CPD VALUES (how nodes relate to each other -- e.g. phishing
+    rate by adversary capability, kill-chain phase base rates, defensive/
+    geopolitical multipliers) are NOT embedded in this function. They are
+    read from `priors_path` (default config/bbn_priors.json), each with a
+    documented source. This tool refuses to run -- returns an ERROR string,
+    does not fall back to a hardcoded default -- if that file is missing, is
+    malformed, or is missing any required prior. See bbn_priors.json itself
+    for the full schema and honest provenance notes on every value (most are
+    inherited analyst-judgment template defaults, not empirically fit --
+    review before scored use).
+
+    PER-ASSESSMENT INPUTS are required in cpd_config_json with no silent
+    defaults -- this also fails closed if any are missing:
       {
-        "kcag_report_path": "outputs/kcag_report.json",   // Annex B handoff
+        "kcag_report_path": "outputs/kcag_report.json",   // optional, this default path is a file-location convention, not an analytical prior
         "adversary": {
-            "capability_prior": [0.0, 0.05, 0.95],        // [hacktivist,criminal,nation-state]
-            "tempo": "HIGH"                                // LOW|MEDIUM|HIGH
+            "capability_prior": [0.0, 0.05, 0.95],        // REQUIRED: [hacktivist,criminal,nation-state]
+            "tempo": "HIGH"                                // REQUIRED: LOW|MEDIUM|HIGH
         },
-        "defensive_posture": {                             // true=control active
+        "defensive_posture": {                             // REQUIRED: true=control active
             "mfa": true, "edr": false, "segmentation": false,
             "integrity_monitor": false, "email_filtering": true
         },
-        "geopolitical_trigger_prior": 0.55,
-        "evidence": {                                      // observed indicators
+        "geopolitical_trigger_prior": 0.55,                // REQUIRED
+        "evidence": {                                      // optional -- absence is a legitimate "no observations yet" baseline, not a hidden prior
             "GeopoliticalTrigger": 1, "AdversaryCapability": 2,
             "PhishingAttempt": 1, "ScanningDetected": 1, "AuthAnomaly": 1
         }
       }
- 
+    outputs/kcag_report.json is also required (Annex B must run before Annex C)
+    -- this fails closed rather than substituting a fallback objective prior.
+
     Returns a human-readable report plus writes outputs/bbn_report.json.
     """
     from pgmpy.models import DiscreteBayesianNetwork
     from pgmpy.factors.discrete import TabularCPD
     from pgmpy.inference import VariableElimination
- 
+
     PHASE_LABELS = {0: "RECON", 1: "INITIAL ACCESS", 2: "LATERAL / PIVOT", 3: "OBJECTIVE"}
     THRESHOLDS = [(0.20, "LOW"), (0.50, "ELEVATED"), (0.75, "HIGH"), (1.01, "CRITICAL")]
     AUDIT = []
- 
+
     def log(node, value, source):
         AUDIT.append({"node": node, "value": value, "source": source})
         return value
- 
+
     def level(score):
         for t, lbl in THRESHOLDS:
             if score < t:
                 return lbl
         return "CRITICAL"
- 
-    # ---- Parse config (never silently fall back to a magic number) ----------
+
+    # ---- Load structural priors file (fail closed -- no embedded defaults) --
+    if not os.path.exists(priors_path):
+        return (f"ERROR: {priors_path} not found. Refusing to run with embedded "
+                f"default CPD values. Create {priors_path} with sourced priors "
+                f"(see this tool's docstring for the schema) before calling "
+                f"bbn_threat_score.")
+    try:
+        priors = json.load(open(priors_path))["priors"]
+    except (json.JSONDecodeError, KeyError) as e:
+        return f"ERROR: {priors_path} malformed or missing 'priors' key ({e}). Refusing to run."
+
+    def prior(*path):
+        """Walk a dotted path into the priors dict. Fails closed with a specific
+        missing-key message instead of raising a raw KeyError or defaulting."""
+        node = priors
+        for i, key in enumerate(path):
+            if not isinstance(node, dict) or key not in node:
+                raise LookupError(f"required prior '{'.'.join(path[:i+1])}' missing from {priors_path}")
+            node = node[key]
+        if not (isinstance(node, dict) and "value" in node):
+            raise LookupError(f"prior '{'.'.join(path)}' in {priors_path} is missing its 'value' field")
+        return node["value"], node.get("source", "(no source field in priors file)")
+
+    # ---- Parse per-run config -- REQUIRED, no silent defaults ---------------
     cfg = {}
     if cpd_config_json and cpd_config_json.strip():
         try:
             cfg = json.loads(cpd_config_json)
         except json.JSONDecodeError as e:
             return f"ERROR: cpd_config_json is not valid JSON ({e}). Refusing to run on undefined input."
- 
+
     adversary = cfg.get("adversary", {})
-    cap_prior = adversary.get("capability_prior", [0.0, 0.05, 0.95])  # PRC default
-    tempo = adversary.get("tempo", "HIGH")
-    posture = cfg.get("defensive_posture",
-                      {"mfa": True, "edr": False, "segmentation": False,
-                       "integrity_monitor": False, "email_filtering": True})
-    geo_prior = float(cfg.get("geopolitical_trigger_prior", 0.55))
-    evidence = cfg.get("evidence", {})
- 
-    # ---- Ingest Annex B KCAG priors (the whole point of the handoff) --------
+    missing = [f"adversary.{k}" for k in ("capability_prior", "tempo") if k not in adversary]
+    missing += [k for k in ("defensive_posture", "geopolitical_trigger_prior") if k not in cfg]
+    if missing:
+        return (f"ERROR: cpd_config_json is missing required field(s): {missing}. "
+                f"These vary per assessment and are never silently assumed — supply "
+                f"them explicitly. See this tool's docstring for the expected shape.")
+
+    cap_prior = adversary["capability_prior"]
+    tempo = adversary["tempo"]
+    if tempo not in ("LOW", "MEDIUM", "HIGH"):
+        return f"ERROR: adversary.tempo must be one of LOW/MEDIUM/HIGH, got {tempo!r}."
+    posture = cfg["defensive_posture"]
+    geo_prior = float(cfg["geopolitical_trigger_prior"])
+    evidence = cfg.get("evidence", {})  # absent evidence = legitimate baseline state, not a hidden prior
+
+    # ---- Ingest Annex B KCAG priors -- REQUIRED, fail closed -----------------
     kcag_path = cfg.get("kcag_report_path", "outputs/kcag_report.json")
-    p_objective_base = 0.32  # fallback if no KCAG report present
-    kcag_note = "KCAG report not found — using fallback objective prior 0.32"
-    if os.path.exists(kcag_path):
-        try:
-            kcag = json.load(open(kcag_path))
-            objs = kcag.get("objective_results", {})
-            if objs:
-                p_objective_base = max(
-                    (o.get("top_path_prob", 0) for o in objs.values()), default=0.32)
-                kcag_note = f"KCAG max objective path probability = {p_objective_base:.4f}"
-        except Exception as e:
-            kcag_note = f"KCAG report present but unreadable ({e}) — using fallback 0.32"
-    log("KCAG.p_objective_base", p_objective_base, kcag_note)
- 
-    # ---- Defensive multiplier: more controls -> harder to advance -----------
-    active = sum(1 for v in posture.values() if v)
-    total = max(1, len(posture))
-    dm = max(0.30, 1.0 - (active / total) * 0.70)
-    log("DefensiveMultiplier", round(dm, 4),
-        f"{active}/{total} controls active")
- 
-    # ---- Build the DAG ------------------------------------------------------
-    # Layer 1 priors -> Layer 2 observables -> Layer 3 phase -> Layer 5 outcome
-    model = DiscreteBayesianNetwork([
-        ("AdversaryCapability", "PhishingAttempt"),
-        ("OperationalTempo", "ScanningDetected"),
-        ("AdversaryCapability", "KillChainPhase"),
-        ("PhishingAttempt", "KillChainPhase"),
-        ("ScanningDetected", "KillChainPhase"),
-        ("AuthAnomaly", "KillChainPhase"),
-        ("KillChainPhase", "IWEffectAchieved"),
-        ("DefensivePosture", "IWEffectAchieved"),
-        ("GeopoliticalTrigger", "IWEffectAchieved"),
-    ])
- 
-    cpds = []
- 
-    # AdversaryCapability (root, 3 states)
-    cap = [max(0.001, p) for p in cap_prior]
-    s = sum(cap); cap = [p / s for p in cap]
-    cpds.append(TabularCPD("AdversaryCapability", 3, [[cap[0]], [cap[1]], [cap[2]]]))
-    log("AdversaryCapability", cap, "adversary.capability_prior")
- 
-    # OperationalTempo (root, 3 states)
-    tempo_dist = {"LOW": [0.6, 0.3, 0.1], "MEDIUM": [0.2, 0.6, 0.2],
-                  "HIGH": [0.1, 0.2, 0.7]}.get(tempo, [0.1, 0.2, 0.7])
-    cpds.append(TabularCPD("OperationalTempo", 3, [[p] for p in tempo_dist]))
-    log("OperationalTempo", tempo_dist, f"adversary.tempo={tempo}")
- 
-    # PhishingAttempt | AdversaryCapability  (real conditional rows)
-    cpds.append(TabularCPD(
-        "PhishingAttempt", 2,
-        [[0.90, 0.50, 0.15],   # P(no phish) | hacktivist, criminal, nation-state
-         [0.10, 0.50, 0.85]],  # nation-state phishing is high (APT hallmark)
-        evidence=["AdversaryCapability"], evidence_card=[3]))
-    log("PhishingAttempt|cap", [[0.90, 0.50, 0.15], [0.10, 0.50, 0.85]],
-        "APT spear-phishing base rates")
- 
-    # ScanningDetected | OperationalTempo
-    cpds.append(TabularCPD(
-        "ScanningDetected", 2,
-        [[0.95, 0.65, 0.25],
-         [0.05, 0.35, 0.75]],
-        evidence=["OperationalTempo"], evidence_card=[3]))
-    log("ScanningDetected|tempo", [[0.95, 0.65, 0.25], [0.05, 0.35, 0.75]],
-        "tempo-driven recon activity")
- 
-    # AuthAnomaly (root observable)
-    cpds.append(TabularCPD("AuthAnomaly", 2, [[0.82], [0.18]]))
-    log("AuthAnomaly", [0.82, 0.18], "credential-reuse base rate")
- 
-    # GeopoliticalTrigger (root)
-    cpds.append(TabularCPD("GeopoliticalTrigger", 2,
-                           [[1 - geo_prior], [geo_prior]]))
-    log("GeopoliticalTrigger", [1 - geo_prior, geo_prior],
-        "geopolitical_trigger_prior")
- 
-    # DefensivePosture (root, 3 states weak/moderate/strong from active count)
-    frac = active / total
-    dp = [max(0.05, 1 - frac), 0.0, max(0.05, frac)]
-    dp[1] = max(0.0, 1 - dp[0] - dp[2]); s = sum(dp); dp = [p / s for p in dp]
-    cpds.append(TabularCPD("DefensivePosture", 3, [[dp[0]], [dp[1]], [dp[2]]]))
-    log("DefensivePosture", dp, f"{active}/{total} controls active")
- 
-    # KillChainPhase | cap(3) x phish(2) x scan(2) x auth(2) = 24 cols, 4 states
-    def phase_probs(cap_i, phish, scan, auth):
-        if cap_i == 2:    base = [0.25, 0.32, 0.28, 0.15]   # nation-state long-dwell
-        elif cap_i == 1:  base = [0.45, 0.30, 0.18, 0.07]
-        else:             base = [0.65, 0.25, 0.08, 0.02]
-        if phish: base[0] -= 0.10; base[1] += 0.10
-        if scan:  base[0] -= 0.08; base[1] += 0.08
-        if auth:  base[1] -= 0.12; base[2] += 0.12          # auth anomaly => lateral
-        base[2] *= dm
-        base[3] *= dm * p_objective_base                     # KCAG-anchored
-        base = [max(0.001, b) for b in base]
-        t = sum(base)
-        return [b / t for b in base]
- 
-    rows = [[], [], [], []]
-    for ci in range(3):
-        for ph in range(2):
-            for sc in range(2):
-                for au in range(2):
-                    pr = phase_probs(ci, ph, sc, au)
-                    for k in range(4):
-                        rows[k].append(pr[k])
-    cpds.append(TabularCPD(
-        "KillChainPhase", 4, rows,
-        evidence=["AdversaryCapability", "PhishingAttempt",
-                  "ScanningDetected", "AuthAnomaly"],
-        evidence_card=[3, 2, 2, 2]))
-    log("KillChainPhase", "computed", "nation-state base + evidence updates + KCAG anchor")
- 
-    # IWEffectAchieved | phase(4) x posture(3) x geo(2) = 24 cols, 2 states
-    PHASE_BASE = [0.005,
-                  log("IWEffect|InitAccess", 0.08, "early-access ceiling"),
-                  log("IWEffect|Lateral", 0.40, "KCAG lateral path rates"),
-                  log("IWEffect|Objective",
-                      round(min(0.85, p_objective_base * 2.2), 4),
-                      "KCAG objective prob x convergence factor")]
- 
-    def iw_probs(phase, dposture, geo):
-        p = PHASE_BASE[phase]
-        if dposture == 2:   p *= 0.25      # strong defense
-        elif dposture == 1: p *= 0.55      # moderate
-        if geo:             p = min(0.99, p * 1.45)
-        p = min(0.999, max(0.001, p))
-        return [1 - p, p]
- 
-    no_, yes_ = [], []
-    for ph in range(4):
-        for dpz in range(3):
-            for g in range(2):
-                a, b = iw_probs(ph, dpz, g)
-                no_.append(a); yes_.append(b)
-    cpds.append(TabularCPD(
-        "IWEffectAchieved", 2, [no_, yes_],
-        evidence=["KillChainPhase", "DefensivePosture", "GeopoliticalTrigger"],
-        evidence_card=[4, 3, 2]))
-    log("IWEffectAchieved", "computed", "phase x posture x geopolitical")
- 
+    if not os.path.exists(kcag_path):
+        return (f"ERROR: {kcag_path} not found. Annex B must run before Annex C — "
+                f"refusing to substitute a fallback objective-path prior. Run "
+                f"kcag_min_cut first.")
+    try:
+        kcag = json.load(open(kcag_path))
+    except json.JSONDecodeError as e:
+        return f"ERROR: {kcag_path} malformed ({e}). Refusing to run."
+    objs = kcag.get("objective_results", {})
+    if not objs:
+        return f"ERROR: {kcag_path} has no objective_results — Annex B did not complete successfully."
+    p_objective_base = max(o.get("top_path_prob", 0) for o in objs.values())
+    log("KCAG.p_objective_base", p_objective_base,
+        f"{kcag_path} objective_results (max top_path_prob)")
+
+    try:
+        # ---- Defensive multiplier --------------------------------------------
+        dm_floor, dm_floor_src = prior("defensive_multiplier_floor")
+        dm_scale, dm_scale_src = prior("defensive_multiplier_scale")
+        active = sum(1 for v in posture.values() if v)
+        total = max(1, len(posture))
+        dm = max(dm_floor, 1.0 - (active / total) * dm_scale)
+        log("DefensiveMultiplier", round(dm, 4),
+            f"{active}/{total} controls active; floor={dm_floor} ({dm_floor_src}); "
+            f"scale={dm_scale} ({dm_scale_src})")
+
+        # ---- Build the DAG -----------------------------------------------------
+        # Layer 1 priors -> Layer 2 observables -> Layer 3 phase -> Layer 5 outcome
+        model = DiscreteBayesianNetwork([
+            ("AdversaryCapability", "PhishingAttempt"),
+            ("OperationalTempo", "ScanningDetected"),
+            ("AdversaryCapability", "KillChainPhase"),
+            ("PhishingAttempt", "KillChainPhase"),
+            ("ScanningDetected", "KillChainPhase"),
+            ("AuthAnomaly", "KillChainPhase"),
+            ("KillChainPhase", "IWEffectAchieved"),
+            ("DefensivePosture", "IWEffectAchieved"),
+            ("GeopoliticalTrigger", "IWEffectAchieved"),
+        ])
+
+        cpds = []
+
+        # AdversaryCapability (root, 3 states) -- analyst-supplied, required
+        cap = [max(0.001, p) for p in cap_prior]
+        s = sum(cap); cap = [p / s for p in cap]
+        cpds.append(TabularCPD("AdversaryCapability", 3, [[cap[0]], [cap[1]], [cap[2]]]))
+        log("AdversaryCapability", cap, "adversary.capability_prior (analyst-supplied, required)")
+
+        # OperationalTempo (root, 3 states) -- distribution from priors file
+        tempo_dist, tempo_src = prior("operational_tempo_distribution", tempo)
+        cpds.append(TabularCPD("OperationalTempo", 3, [[p] for p in tempo_dist]))
+        log("OperationalTempo", tempo_dist, f"adversary.tempo={tempo}; {tempo_src}")
+
+        # PhishingAttempt | AdversaryCapability -- from priors file
+        phish_cpd, phish_src = prior("phishing_given_capability")
+        cpds.append(TabularCPD(
+            "PhishingAttempt", 2, phish_cpd,
+            evidence=["AdversaryCapability"], evidence_card=[3]))
+        log("PhishingAttempt|cap", phish_cpd, phish_src)
+
+        # ScanningDetected | OperationalTempo -- from priors file
+        scan_cpd, scan_src = prior("scanning_given_tempo")
+        cpds.append(TabularCPD(
+            "ScanningDetected", 2, scan_cpd,
+            evidence=["OperationalTempo"], evidence_card=[3]))
+        log("ScanningDetected|tempo", scan_cpd, scan_src)
+
+        # AuthAnomaly (root observable) -- from priors file
+        auth_root, auth_src = prior("auth_anomaly_root")
+        cpds.append(TabularCPD("AuthAnomaly", 2, [[auth_root[0]], [auth_root[1]]]))
+        log("AuthAnomaly", auth_root, auth_src)
+
+        # GeopoliticalTrigger (root) -- analyst-supplied, required
+        cpds.append(TabularCPD("GeopoliticalTrigger", 2,
+                               [[1 - geo_prior], [geo_prior]]))
+        log("GeopoliticalTrigger", [1 - geo_prior, geo_prior],
+            "geopolitical_trigger_prior (analyst-supplied, required)")
+
+        # DefensivePosture (root, 3 states weak/moderate/strong from active count)
+        dp_floor, dp_floor_src = prior("defensive_posture_floor")
+        frac = active / total
+        dp = [max(dp_floor, 1 - frac), 0.0, max(dp_floor, frac)]
+        dp[1] = max(0.0, 1 - dp[0] - dp[2]); s = sum(dp); dp = [p / s for p in dp]
+        cpds.append(TabularCPD("DefensivePosture", 3, [[dp[0]], [dp[1]], [dp[2]]]))
+        log("DefensivePosture", dp, f"{active}/{total} controls active; floor={dp_floor} ({dp_floor_src})")
+
+        # KillChainPhase | cap(3) x phish(2) x scan(2) x auth(2) = 24 cols, 4 states
+        kcp_base = {
+            2: prior("killchain_phase_base", "nation_state"),
+            1: prior("killchain_phase_base", "criminal"),
+            0: prior("killchain_phase_base", "hacktivist"),
+        }
+        delta_phish, delta_phish_src = prior("killchain_phase_evidence_delta_phishing")
+        delta_scan, delta_scan_src = prior("killchain_phase_evidence_delta_scanning")
+        delta_auth, delta_auth_src = prior("killchain_phase_evidence_delta_auth_anomaly")
+
+        def phase_probs(cap_i, phish, scan, auth):
+            base = list(kcp_base[cap_i][0])
+            if phish:
+                base = [b + d for b, d in zip(base, delta_phish)]
+            if scan:
+                base = [b + d for b, d in zip(base, delta_scan)]
+            if auth:
+                base = [b + d for b, d in zip(base, delta_auth)]   # auth anomaly => lateral
+            base[2] *= dm
+            base[3] *= dm * p_objective_base                        # KCAG-anchored
+            base = [max(0.001, b) for b in base]
+            t = sum(base)
+            return [b / t for b in base]
+
+        rows = [[], [], [], []]
+        for ci in range(3):
+            for ph in range(2):
+                for sc in range(2):
+                    for au in range(2):
+                        pr = phase_probs(ci, ph, sc, au)
+                        for k in range(4):
+                            rows[k].append(pr[k])
+        cpds.append(TabularCPD(
+            "KillChainPhase", 4, rows,
+            evidence=["AdversaryCapability", "PhishingAttempt",
+                      "ScanningDetected", "AuthAnomaly"],
+            evidence_card=[3, 2, 2, 2]))
+        log("KillChainPhase", "computed",
+            f"base rates: nation_state=({kcp_base[2][1]}), criminal=({kcp_base[1][1]}), "
+            f"hacktivist=({kcp_base[0][1]}); deltas: phishing=({delta_phish_src}), "
+            f"scanning=({delta_scan_src}), auth_anomaly=({delta_auth_src}); KCAG-anchored")
+
+        # IWEffectAchieved | phase(4) x posture(3) x geo(2) = 24 cols, 2 states
+        recon_base, recon_src = prior("iw_effect_phase_base_recon")
+        ia_base, ia_src = prior("iw_effect_phase_base_initial_access")
+        lat_base, lat_src = prior("iw_effect_phase_base_lateral")
+        conv_factor, conv_src = prior("iw_effect_objective_convergence_factor")
+        obj_cap, obj_cap_src = prior("iw_effect_objective_cap")
+        strong_mult, strong_src = prior("iw_effect_posture_multiplier_strong")
+        mod_mult, mod_src = prior("iw_effect_posture_multiplier_moderate")
+        geo_mult, geo_mult_src = prior("iw_effect_geo_multiplier")
+        geo_cap, geo_cap_src = prior("iw_effect_geo_cap")
+
+        obj_base = round(min(obj_cap, p_objective_base * conv_factor), 4)
+        PHASE_BASE = [
+            log("IWEffect|Recon", recon_base, recon_src),
+            log("IWEffect|InitAccess", ia_base, ia_src),
+            log("IWEffect|Lateral", lat_base, lat_src),
+            log("IWEffect|Objective", obj_base, f"{conv_src} capped by ({obj_cap_src})"),
+        ]
+
+        def iw_probs(phase, dposture, geo):
+            p = PHASE_BASE[phase]
+            if dposture == 2:   p *= strong_mult    # strong defense
+            elif dposture == 1: p *= mod_mult        # moderate
+            if geo:              p = min(geo_cap, p * geo_mult)
+            p = min(0.999, max(0.001, p))
+            return [1 - p, p]
+
+        no_, yes_ = [], []
+        for ph in range(4):
+            for dpz in range(3):
+                for g in range(2):
+                    a, b = iw_probs(ph, dpz, g)
+                    no_.append(a); yes_.append(b)
+        cpds.append(TabularCPD(
+            "IWEffectAchieved", 2, [no_, yes_],
+            evidence=["KillChainPhase", "DefensivePosture", "GeopoliticalTrigger"],
+            evidence_card=[4, 3, 2]))
+        log("IWEffectAchieved", "computed",
+            f"phase x posture ({strong_src}; {mod_src}) x geopolitical "
+            f"({geo_mult_src}; capped {geo_cap_src})")
+
+    except LookupError as e:
+        return f"ERROR: {e}. Refusing to run with an incomplete priors file."
+
     model.add_cpds(*cpds)
     if not model.check_model():
         return "ERROR: BBN failed validation (cyclic or malformed CPDs)."
- 
+
     infer = VariableElimination(model)
- 
+
     # ---- Filter evidence to valid nodes/states ------------------------------
     valid_nodes = set(model.nodes())
     ev = {k: int(v) for k, v in evidence.items() if k in valid_nodes}
- 
+
     score = float(infer.query(["IWEffectAchieved"], evidence=ev).values[1])
     phase_dist = infer.query(["KillChainPhase"], evidence=ev).values
     phase_idx = int(phase_dist.argmax())
- 
+
     # ---- Baseline (no evidence) for delta ----------------------------------
     base_score = float(infer.query(["IWEffectAchieved"]).values[1])
- 
+
     report = {
         "threat_score": round(score, 4),
         "threat_level": level(score),
@@ -1023,12 +1350,13 @@ def bbn_threat_score(cpd_config_json: str = "") -> str:
         "evidence_applied": ev,
         "kcag_objective_prior": round(p_objective_base, 4),
         "defensive_multiplier": round(dm, 4),
+        "priors_file": priors_path,
         "cpd_audit_log": AUDIT,
     }
     os.makedirs("outputs", exist_ok=True)
     with open("outputs/bbn_report.json", "w") as f:
         json.dump(report, f, indent=2)
- 
+
     lines = [
         "=== ANNEX C: BBN THREAT ASSESSMENT ===",
         f"Threat Score:  {score:.4f}  ({level(score)})",
@@ -1038,10 +1366,12 @@ def bbn_threat_score(cpd_config_json: str = "") -> str:
         "Phase distribution:",
         *[f"  {PHASE_LABELS[i]:16s} {float(phase_dist[i]):.4f}" for i in range(4)],
         f"Evidence applied: {ev or '(none — baseline)'}",
+        f"Priors file: {priors_path}",
         f"CPD audit entries: {len(AUDIT)} (full log in outputs/bbn_report.json)",
         "STATUS: SUCCESS",
     ]
     return "\n".join(lines)
+
 
 
 # --- write_stage0_output / write_stage1_output: schema-validated Stage 0/1 artifacts ---

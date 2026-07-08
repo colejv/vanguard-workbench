@@ -1042,4 +1042,190 @@ def bbn_threat_score(cpd_config_json: str = "") -> str:
         "STATUS: SUCCESS",
     ]
     return "\n".join(lines)
- 
+
+
+# --- write_stage0_output / write_stage1_output: schema-validated Stage 0/1 artifacts ---
+# Same contract as write_stage2_vectors: REJECTED (nothing written) or WRITTEN
+# (with a short summary). Validation here delegates to the Pydantic models in
+# src/schemas.py rather than hand-rolled checks, since those are the actual
+# source of truth for the shape.
+
+@tool("write_stage0_output")
+def write_stage0_output(stage0_json: str) -> str:
+    """Validate and write the Stage 0 Reverse IPB signatures to
+    outputs/stage0_output.json for downstream (Stage 1 attribution, gate)
+    consumption. The prose narrative still goes to outputs/stage0.md via
+    output_file; this is the structured, machine-checkable counterpart.
+
+    Input: a JSON object with 'signatures': a list of
+      {signature_id, category, description, confidence, deceive_candidate, is_gap}
+      category in {technical, procedural, cognitive, social_personnel}
+      confidence in {HIGH, MEDIUM, LOW}
+
+    Rejects malformed input (bad enum values, missing fields, duplicate
+    signature_ids) so downstream stages never consume a broken artifact.
+
+    Rejects more than MAX_SIGNATURES entries. This is a defense-in-depth
+    ceiling, not the primary fix for truncated-JSON tool calls — if the
+    agent's model truncates output before this tool ever sees valid JSON,
+    that's a generation-length problem the task prompt must address (curate
+    a top-N list) rather than something this tool can catch after the fact.
+    This cap exists to stop an agent that ignores that prompt guidance from
+    silently writing an oversized artifact that risks the same truncation
+    failure on a future run or a smaller local model.
+    """
+    import json, os
+    from pydantic import ValidationError
+    from src.schemas import Stage0Output
+
+    MAX_SIGNATURES = 25  # generous ceiling above the requested top-15 curation target
+
+    try:
+        data = json.loads(stage0_json)
+    except json.JSONDecodeError as e:
+        return f"REJECTED: input is not valid JSON ({e}). Nothing written."
+
+    try:
+        parsed = Stage0Output.model_validate(data)
+    except ValidationError as e:
+        return f"REJECTED: Stage 0 output failed schema validation. Nothing written.\n{e}"
+
+    if len(parsed.signatures) > MAX_SIGNATURES:
+        return (f"REJECTED: {len(parsed.signatures)} signatures exceeds the {MAX_SIGNATURES} "
+                f"ceiling. Curate to the most analytically significant ~15 signatures rather "
+                f"than transcribing every scratchpad entry — long JSON payloads risk truncation "
+                f"during generation. Nothing written.")
+
+    ids = [s.signature_id for s in parsed.signatures]
+    dupes = {i for i in ids if ids.count(i) > 1}
+    if dupes:
+        return f"REJECTED: duplicate signature_id(s) {sorted(dupes)}. Nothing written."
+
+    os.makedirs("outputs", exist_ok=True)
+    with open("outputs/stage0_output.json", "w") as f:
+        f.write(parsed.model_dump_json(indent=2))
+
+    return (f"WRITTEN: outputs/stage0_output.json | "
+            f"{len(parsed.signatures)} signature(s), {parsed.gap_count} flagged [GAP]. "
+            f"Stage 1 may now build on this signature set.")
+
+
+@tool("write_stage1_output")
+def write_stage1_output(stage1_json: str) -> str:
+    """Validate and write the Stage 1 three-layer decomposition to
+    outputs/stage1_output.json for Stage 2 (attribution check) consumption.
+    The prose narrative still goes to outputs/stage1.md via output_file;
+    this is the structured, machine-checkable counterpart.
+
+    Input: a JSON object with 'technical_nodes', 'procedural_nodes',
+      'cognitive_nodes' (lists), and 'trust_boundaries' (list).
+      technical_nodes[] / procedural_nodes[]:
+        {component_id, layer, name, asset_control_levels, information_flows,
+         downstream_dependencies, is_gap}
+        layer must match the list it's in (technical nodes cannot claim
+        layer='procedural' or 'cognitive', and vice versa).
+      cognitive_nodes[]:
+        {component_id, hierarchy_stage, feeds, corrupts, downstream_effect,
+         detection_probability, is_center_of_gravity, is_gap}
+        hierarchy_stage in {Data, Information, Knowledge, Understanding,
+        Decision, Behavior}
+        is_center_of_gravity is an ADVISORY flag marking the analyst's
+        candidate touchpoint within this layer only. It is NOT the doctrinal
+        COG (JP 5-0 / ADP 3-0 defines COG as domain-agnostic, not restricted
+        to the cognitive layer) and NOT the graph-theoretic COG that Annex B
+        computes from min-cut + betweenness over the full attack graph — that
+        COG may land on a Technical or Procedural node instead. This tool
+        never rejects based on how many (or how few) cognitive nodes carry
+        this flag.
+      trust_boundaries[]: {boundary_id, from_component, to_component, description}
+
+    Rejects malformed input, duplicate component_ids across all three
+    layers, and a technical/procedural node's layer not matching the list
+    it was submitted in. Does NOT verify attribution to Stage 0 (that is
+    the agent's responsibility per the task's attribution discipline) —
+    this tool only enforces structural correctness.
+    """
+    import json, os
+    from pydantic import ValidationError
+    from src.schemas import Stage1Output, DecompositionLayer
+
+    try:
+        data = json.loads(stage1_json)
+    except json.JSONDecodeError as e:
+        return f"REJECTED: input is not valid JSON ({e}). Nothing written."
+
+    # Pre-check layer-vs-list placement before full model validation, since
+    # this is a cross-field consistency rule the model alone can't express
+    # (each node knows its own layer, but not which list it arrived in).
+    placement_errors = []
+    for n in data.get("technical_nodes", []) or []:
+        if isinstance(n, dict) and n.get("layer") not in (None, "technical"):
+            placement_errors.append(
+                f"technical_nodes contains component '{n.get('component_id')}' "
+                f"with layer='{n.get('layer')}' (expected 'technical')")
+    for n in data.get("procedural_nodes", []) or []:
+        if isinstance(n, dict) and n.get("layer") not in (None, "procedural"):
+            placement_errors.append(
+                f"procedural_nodes contains component '{n.get('component_id')}' "
+                f"with layer='{n.get('layer')}' (expected 'procedural')")
+    if placement_errors:
+        return ("REJECTED: node(s) placed in the wrong layer list. Nothing written:\n  - "
+                + "\n  - ".join(placement_errors))
+
+    try:
+        parsed = Stage1Output.model_validate(data)
+    except ValidationError as e:
+        return f"REJECTED: Stage 1 output failed schema validation. Nothing written.\n{e}"
+
+    # Defense-in-depth ceiling against oversized single-tool-call JSON —
+    # same rationale as write_stage0_output's MAX_SIGNATURES: this doesn't
+    # fix truncated generation (that's a task-prompt curation problem), it
+    # stops an agent that ignores curation guidance from writing an artifact
+    # that risks truncation on a future run or a smaller local model.
+    MAX_TOTAL_NODES = 40
+    total_nodes = (len(parsed.technical_nodes) + len(parsed.procedural_nodes)
+                   + len(parsed.cognitive_nodes))
+    if total_nodes > MAX_TOTAL_NODES:
+        return (f"REJECTED: {total_nodes} total nodes across all layers exceeds the "
+                f"{MAX_TOTAL_NODES} ceiling. Curate to the most architecturally significant "
+                f"components rather than transcribing every scratchpad entry — long JSON "
+                f"payloads risk truncation during generation. Nothing written.")
+
+    all_ids = (
+        [n.component_id for n in parsed.technical_nodes]
+        + [n.component_id for n in parsed.procedural_nodes]
+        + [n.component_id for n in parsed.cognitive_nodes]
+    )
+    dupes = {i for i in all_ids if all_ids.count(i) > 1}
+    if dupes:
+        return f"REJECTED: duplicate component_id(s) {sorted(dupes)} across layers. Nothing written."
+
+    # NOTE ON is_center_of_gravity: this flags an analyst's candidate touchpoint
+    # within the Layer 3 (cognitive) decomposition — it is NOT the doctrinal
+    # Center of Gravity (JP 5-0 / ADP 3-0: domain-agnostic source of power,
+    # not restricted to the cognitive layer) and NOT the graph-theoretic COG
+    # that Annex B actually computes from min-cut size + betweenness
+    # centrality over the full attack graph. A Technical- or Procedural-layer
+    # node can be the true COG (e.g. Lockheed Lightning's CDL_WRITE, min-cut=1,
+    # ~5.5x betweenness). Enforcing exactly one flagged cognitive node here
+    # would reject structurally and doctrinally valid Stage 1 output, so this
+    # is advisory only — never blocks the write.
+    cog_flagged = parsed.flagged_cognitive_touchpoints()
+    if len(cog_flagged) == 0:
+        cog_note = "(none flagged — cognitive-layer candidate touchpoint not identified; the actual COG is determined graph-theoretically in Annex B and may sit in any layer)"
+    elif len(cog_flagged) == 1:
+        cog_note = cog_flagged[0].component_id
+    else:
+        cog_note = f"multiple flagged {[n.component_id for n in cog_flagged]} — advisory only, not rejected"
+
+    os.makedirs("outputs", exist_ok=True)
+    with open("outputs/stage1_output.json", "w") as f:
+        f.write(parsed.model_dump_json(indent=2))
+
+    return (f"WRITTEN: outputs/stage1_output.json | "
+            f"{len(parsed.technical_nodes)} technical, {len(parsed.procedural_nodes)} procedural, "
+            f"{len(parsed.cognitive_nodes)} cognitive node(s), {len(parsed.trust_boundaries)} trust "
+            f"boundary(ies), {parsed.gap_count} flagged [GAP]. "
+            f"Cognitive-layer candidate touchpoint: {cog_note}. "
+            f"(Note: the graph-theoretic COG is computed by Annex B, not fixed here.) "
+            f"Stage 2 may now build on this node inventory.")

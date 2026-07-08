@@ -32,6 +32,22 @@ decomposer = Agent(
     allow_delegation=False,
     verbose=True,
     tools=[read_corpus_chunk, extract_to_scratch, read_scratch],
+    # cache=False: write_stage0_output/write_stage1_output validate structured
+    # JSON and can legitimately fail on a first attempt (oversized/malformed
+    # payload). With the default cache=True, a failed call can be replayed
+    # from cache on retry instead of the model regenerating fresh args,
+    # which stalls the agent on the same broken JSON until it gives up and
+    # falls back to a prose-only final answer. Disabling cache ensures every
+    # retry actually re-invokes the tool with the model's latest output.
+    cache=False,
+    # max_iter raised from the CrewAI default (20) — Stage 0/1 tasks now
+    # involve read_scratch + a validated structured-JSON write that can take
+    # several corrective attempts against a local model; the default ceiling
+    # was reached before the model's JSON converged (observed: agent fell
+    # back to text-only output after ~8 tool attempts well under 20 calls,
+    # since each failed attempt + reasoning step consumes multiple
+    # iterations toward the same budget).
+    max_iter=40,
 )
 
 mapper = Agent(

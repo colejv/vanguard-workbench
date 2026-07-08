@@ -2,7 +2,8 @@ from crewai import Task
 from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
 from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
-                       extract_to_scratch, read_scratch, write_stage2_vectors)
+                       extract_to_scratch, read_scratch, write_stage2_vectors,
+                       write_stage0_output, write_stage1_output)
 
 # Gate 1: corpus lock confirmation (human authorizes before analysis)
 t_research = Task(
@@ -29,15 +30,43 @@ t_synthesize_stage0 = Task(
         "3. ATTRIBUTION DISCIPLINE: every named person, unit, vendor, or component "
         "you assert MUST trace to a finding in the scratchpad. Do NOT introduce any "
         "entity that is not in the extracted corpus. If you cannot trace it, omit it.\n"
-        "Flag missing elements with [GAP]."
+        "Flag missing elements with [GAP].\n\n"
+        "CRITICAL INSTRUCTION — STRUCTURED SIGNATURE LIST (REQUIRED FOR STAGE 1):\n"
+        "After writing the prose Reverse IPB, you MUST call `write_stage0_output` exactly "
+        "once with a JSON object encoding your signatures. Stage 1 reads this file to trace "
+        "attribution; without it Stage 1 cannot verify its node inventory.\n\n"
+        "SIZE DISCIPLINE — this JSON is generated in a single tool call and WILL be truncated "
+        "and rejected if too large:\n"
+        "  - Select at most 15 signatures total for this structured list — the ones with the "
+        "greatest analytic significance (highest confidence, clearest DECEIVE-candidate value, "
+        "or most central to the SUT). The full prose Reverse IPB in your written output may "
+        "still discuss more findings; the structured list is a curated top-15, not an exhaustive "
+        "transcription.\n"
+        "  - Keep each description to ONE short phrase (under ~12 words). Do not restate "
+        "background context already covered in the prose narrative — the description field is "
+        "an index label, not a summary paragraph.\n"
+        "  - If the scratchpad has more than 15 candidate signatures, prioritize by category "
+        "coverage (include at least one technical, one procedural, and one cognitive signature "
+        "if the scratchpad supports it) and by DECEIVE-candidate relevance.\n\n"
+        "JSON shape and field rules:\n"
+        "  - JSON shape: {\"signatures\": [...]}\n"
+        "  - Every signature has: signature_id (e.g. S-T-01, S-P-03, S-C-02 — prefix matches "
+        "category: T=technical, P=procedural, C=cognitive, SP=social_personnel), "
+        "category (technical|procedural|cognitive|social_personnel), description, "
+        "confidence (HIGH|MEDIUM|LOW), deceive_candidate (true|false).\n"
+        "  - Set is_gap=true for any [GAP] placeholder entries instead of inventing a signature_id "
+        "for something you could not trace to the scratchpad.\n"
+        "  - signature_id must be unique across the whole list."
     ),
     expected_output=(
         "Stage 0 Reverse IPB: technical, procedural, cognitive, and social/personnel "
         "signatures, each with a confidence rating and DECEIVE-candidate flag. "
-        "Every named entity traceable to the scratchpad."
+        "Every named entity traceable to the scratchpad. "
+        "AND confirmation that a curated top-15 structured signature list was written to "
+        "outputs/stage0_output.json via the write_stage0_output tool."
     ),
     agent=decomposer,
-    tools=[read_scratch],
+    tools=[read_scratch, write_stage0_output],
     output_file="outputs/stage0.md",
 )
 
@@ -56,22 +85,65 @@ t_stage1 = Task(
         "LAYER 3 — COGNITIVE: apply the ADP 3-13 cognitive hierarchy "
         "(Data -> Information -> Knowledge -> Understanding -> Decision -> Behavior). "
         "For each stage: what feeds it, what corrupts it, the downstream effect, and "
-        "detection probability. Identify the cognitive Center of Gravity (C-C-NN).\n\n"
+        "detection probability. Optionally flag any standout candidate touchpoint(s) "
+        "within this layer (C-C-NN) — note this is advisory only: per JP 5-0/ADP 3-0, "
+        "Center of Gravity is domain-agnostic, and the operational COG is computed "
+        "graph-theoretically in Annex B (min-cut + betweenness) and may fall on a "
+        "Technical or Procedural node instead.\n\n"
         "Also produce a TRUST BOUNDARY inventory: each boundary between components "
         "where the adversary can traverse a trust relationship.\n\n"
         "ATTRIBUTION DISCIPLINE: every node id must correspond to a Stage 0 signature "
         "or a scratchpad finding. Do not invent components.\n\n"
-        "Flag missing elements with [GAP]."
+        "Flag missing elements with [GAP].\n\n"
+        "CRITICAL INSTRUCTION — STRUCTURED NODE INVENTORY (REQUIRED FOR STAGE 2):\n"
+        "After writing the prose decomposition, you MUST call `write_stage1_output` exactly "
+        "once with a JSON object encoding all three layers. Stage 2 reads this file to verify "
+        "every attack-graph node traces to a real Stage 1 component; without it Stage 2 cannot "
+        "be checked.\n\n"
+        "SIZE DISCIPLINE — this JSON is generated in a single tool call and WILL be truncated "
+        "and rejected if too large:\n"
+        "  - Cap each layer at roughly 8-10 of the most architecturally significant components "
+        "(not every item from the scratchpad) — technical components that are real attack "
+        "surface, procedural elements with real exploitable timing/process gaps, cognitive "
+        "stages with a real corruption path. Aim for a total around 25-30 nodes across all "
+        "three layers combined, not 40+.\n"
+        "  - Keep information_flows, feeds, corrupts, and downstream_effect to ONE short phrase "
+        "each (under ~10 words) — these are index labels for Stage 2 to reference, not summary "
+        "paragraphs. Save fuller explanation for the prose decomposition.\n"
+        "  - Cap trust_boundaries at roughly 5-8 entries — the boundaries with the clearest "
+        "adversary-traversable trust relationship, not every possible pairing.\n\n"
+        "JSON shape and field rules:\n"
+        "  - JSON shape: {\"technical_nodes\": [...], \"procedural_nodes\": [...], "
+        "\"cognitive_nodes\": [...], \"trust_boundaries\": [...]}\n"
+        "  - technical_nodes / procedural_nodes entries: component_id (C-T-NN / C-P-NN), "
+        "layer (\"technical\" or \"procedural\" — MUST match the list you put it in), name, "
+        "asset_control_levels (list), information_flows, downstream_dependencies (list).\n"
+        "  - cognitive_nodes entries: component_id (C-C-NN), hierarchy_stage (one of Data, "
+        "Information, Knowledge, Understanding, Decision, Behavior), feeds, corrupts, "
+        "downstream_effect, detection_probability (HIGH|MEDIUM|LOW), is_center_of_gravity "
+        "(true for any cognitive node you consider a candidate touchpoint worth flagging "
+        "within this layer — NOTE: this is advisory and layer-scoped only. Per JP 5-0/ADP 3-0, "
+        "COG is domain-agnostic and is not necessarily cognitive; the operational COG is "
+        "computed graph-theoretically in Annex B from min-cut size and betweenness centrality "
+        "over the full attack graph, and may land on a Technical or Procedural node instead — "
+        "e.g. a C2 chokepoint. Do not force a flag here if no cognitive node is a standout; "
+        "zero flagged is a valid and often correct outcome).\n"
+        "  - trust_boundaries entries: boundary_id (TB-NN), from_component, to_component, "
+        "description.\n"
+        "  - component_id must be unique across all three layers combined.\n"
+        "  - Set is_gap=true for [GAP] placeholder entries instead of inventing a component_id."
     ),
     expected_output=(
         "Three-layer decomposition (Technical / Procedural / Cognitive) with a "
         "structured node inventory (component_id, layer, asset_control_levels, "
         "information_flows, downstream_dependencies) and a trust-boundary inventory. "
-        "This node inventory is the required input to Annex B (Stage 2 edge list)."
+        "This node inventory is the required input to Annex B (Stage 2 edge list). "
+        "AND confirmation that a curated structured node inventory (~25-30 nodes total) was "
+        "written to outputs/stage1_output.json via the write_stage1_output tool."
     ),
     agent=decomposer,
     context=[t_synthesize_stage0],
-    tools=[read_scratch],
+    tools=[read_scratch, write_stage1_output],
     output_file="outputs/stage1.md",
 )
 

@@ -2,6 +2,15 @@ from crewai import LLM
 
 # Ollama exposes an OpenAI-compatible endpoint at /v1
 OLLAMA_BASE = "http://localhost:11434/v1"
+# Ollama's native endpoint (no /v1). Used for reason_llm below because
+# Gemma4's tool-call parsing is currently broken specifically on the /v1
+# OpenAI-compat path (open Ollama issues #15241, #15539, #15288 — the model
+# generates a correct tool call, but the /v1 layer's parser fails to
+# extract it into tool_calls and the JSON leaks into plain content instead,
+# which is exactly what we observed: valid JSON landing in the agent's
+# Final Answer instead of a successful write_stage0_output/write_stage1_output
+# call). The native endpoint avoids that translation layer entirely.
+OLLAMA_NATIVE = "http://localhost:11434"
 
 # Light edge model for extraction/decomposition. Gemma 4 sampling defaults.
 light_llm = LLM(
@@ -11,11 +20,25 @@ light_llm = LLM(
     top_p=0.95
 )
 
-# 12B (MLX) for reasoning, coding/agentic, and tool execution.
+# 27B Qwen3.6 (dense) for reasoning, coding/agentic, and tool execution.
+# Replaces gemma4:12b-mlx here specifically because this is the model used
+# by every tool-calling agent (decomposer, mapper, modeler, red_team_lead,
+# verifier) — the role most exposed to the Gemma4/v1 tool-parsing bug.
+# Qwen3 has Hermes-style tool use trained directly into its chat template
+# (not bolted on via a parser), which has a materially more mature/stable
+# track record for tool calling through Ollama than Gemma4 currently does.
+#
+# enable_thinking=False: Qwen3.6 reasons by default before responding: this
+# can interfere with clean tool-call extraction (documented quirk — thinking
+# content competing with the tool-call channel), so it's disabled for the
+# tool-calling role. Passed via extra_body, LiteLLM's passthrough for
+# provider-specific chat_template_kwargs.
+#
 # Lower temperature for the deterministic structured-output / tool stages.
 reason_llm = LLM(
-    model="ollama/gemma4:12b-mlx", 
-    base_url=OLLAMA_BASE,
-    temperature=0.1,  
-    top_p=0.95
+    model="ollama/qwen3.6:27b",
+    base_url=OLLAMA_NATIVE,
+    temperature=0.1,
+    top_p=0.95,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
 )

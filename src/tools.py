@@ -5,6 +5,7 @@ import networkx as nx
 import json
 import re
 import os
+import math
 
 from src import run_context
 
@@ -25,22 +26,19 @@ class KCAGSchema(BaseModel):
     )
  
 # 1. Move the dictionary OUTSIDE the class
-# difficulty -> base traversal probability
-DIFF_PROB = {'LOW': 0.8, 'MEDIUM': 0.5, 'HIGH': 0.2}
+# difficulty -> configured heuristic traversal score (NOT a calibrated
+# probability -- see TRAVERSAL_SCORE_BY_DIFFICULTY's own note below).
+TRAVERSAL_SCORE_BY_DIFFICULTY = {'LOW': 0.8, 'MEDIUM': 0.5, 'HIGH': 0.2}
 
 class KCAGMinCutTool(BaseTool):
     name: str = Field(default="kcag_min_cut")
     description: str = Field(
-        default="Read the Stage 2 edge list from disk, build the KCAG DiGraph, "
-                "compute betweenness, run minimum node cut against EVERY goal, "
-                "rank paths by traversal probability, and write kcag_report.json "
-                "for Annex C ingestion. Topology comes from the Stage 2 artifact, "
-                "not from agent input."
+        default="Read the validated Stage 2 graph, compute minimum cuts "
+                "and betweenness, rank candidate paths using configured "
+                "heuristic traversal scores, and write kcag_report.json. "
+                "The traversal scores are not calibrated probabilities."
     )
     args_schema: Type[BaseModel] = KCAGSchema
- 
-    # difficulty -> base traversal probability
-    # DIFF_PROB = {"LOW": 0.80, "MEDIUM": 0.50, "HIGH": 0.20}
  
     def _run(self, stage2_vectors_path: Optional[str] = None) -> str:
         # ---- 1. Load topology from the artifact (deterministic) -------------
@@ -70,11 +68,15 @@ class KCAGMinCutTool(BaseTool):
             tgt = e["target"] if isinstance(e, dict) else getattr(e, "target")
             diff = (e.get("difficulty", "MEDIUM") if isinstance(e, dict)
                     else getattr(e, "difficulty", "MEDIUM")).upper()
-            prob = DIFF_PROB.get(diff, 0.50)
+            # validate_kcag() already rejects invalid difficulty values
+            # upstream in the real pipeline, so this fallback should almost
+            # never be reached there -- it remains as defense in depth for
+            # any direct call to this tool that bypasses that gate.
+            traversal_score = TRAVERSAL_SCORE_BY_DIFFICULTY.get(diff, 0.50)
             G.add_edge(src, tgt,
                        technique=(e.get("technique", "") if isinstance(e, dict) else ""),
                        difficulty=diff,
-                       probability=prob,
+                       traversal_score=traversal_score,
                        effect=(e.get("effect") if isinstance(e, dict) else None),
                        vec=(e.get("vec", "") if isinstance(e, dict) else ""))
  
@@ -99,12 +101,17 @@ class KCAGMinCutTool(BaseTool):
             return "ERROR: No goal node (node_type='goal') found."
         src = "ADV_START"
  
-        # ---- 3. Path probability helper -------------------------------------
-        def path_prob(path):
-            p = 1.0
+        # ---- 3. Path score helper --------------------------------------------
+        # "traversal_score", not "difficulty_score" -- lower difficulty
+        # produces a HIGHER value under this model, so "difficulty_score"
+        # would read backwards. This is a configured heuristic for relative
+        # ranking, not an empirically calibrated probability -- see
+        # TRAVERSAL_SCORE_BY_DIFFICULTY and the scoring_model block below.
+        def path_score(path):
+            s = 1.0
             for i in range(len(path) - 1):
-                p *= G[path[i]][path[i + 1]]["probability"]
-            return round(p, 5)
+                s *= G[path[i]][path[i + 1]]["traversal_score"]
+            return round(s, 5)
  
         # ---- 4. Min cut against EVERY goal; aggregate shared chokepoints ----
         objective_results = {}
@@ -112,11 +119,11 @@ class KCAGMinCutTool(BaseTool):
         all_paths_flat = []
         for goal in goals:
             if not nx.has_path(G, src, goal):
-                objective_results[goal] = {"top_path": [], "top_path_prob": 0,
+                objective_results[goal] = {"top_path": [], "top_path_score": 0,
                                            "min_cut": [], "min_cut_size": 0, "path_count": 0}
                 continue
             paths = list(nx.all_simple_paths(G, src, goal, cutoff=8))
-            ranked = sorted(paths, key=path_prob, reverse=True)
+            ranked = sorted(paths, key=path_score, reverse=True)
             try:
                 cut = nx.minimum_node_cut(G, src, goal)
             except Exception:
@@ -126,13 +133,13 @@ class KCAGMinCutTool(BaseTool):
             top = ranked[0] if ranked else []
             objective_results[goal] = {
                 "top_path": top,
-                "top_path_prob": path_prob(top) if top else 0,
+                "top_path_score": path_score(top) if top else 0,
                 "min_cut": sorted(cut),
                 "min_cut_size": len(cut),
                 "path_count": len(paths),
             }
             for pth in ranked[:10]:
-                all_paths_flat.append({"path": pth, "probability": path_prob(pth), "objective": goal})
+                all_paths_flat.append({"path": pth, "score": path_score(pth), "objective": goal})
  
         # ---- 5. Betweenness: UNWEIGHTED for chokepoint structure ------------
         # (weight in networkx = distance; using criticality as weight inverts
@@ -159,12 +166,28 @@ class KCAGMinCutTool(BaseTool):
         else:
             dominant_node, dominant_count = (None, 0)
  
-        # ---- 7. Highest-RISK priority path (highest probability, not lowest cost)
-        all_paths_flat.sort(key=lambda x: x["probability"], reverse=True)
+        # ---- 7. Highest-RISK priority path (highest score, not lowest cost)
+        all_paths_flat.sort(key=lambda x: x["score"], reverse=True)
         priority_path = all_paths_flat[0] if all_paths_flat else None
  
         # ---- 8. Emit kcag_report.json for Annex C ---------------------------
+        # schema_version 2: score-terminology migration. New reports never
+        # emit "top_path_prob" or "probability" -- see
+        # extract_kcag_objective_score() for the backward-compatible reader
+        # that still accepts pre-migration reports on resume. Old reports on
+        # disk are never rewritten in place; their hashes and audit history
+        # stay intact.
         report = {
+            "schema_version": 2,
+            "scoring_model": {
+                "name": "configured_multiplicative_traversal_score",
+                "version": 1,
+                "semantics": "heuristic_relative_ranking",
+                "calibrated_probability": False,
+                "range": [0.0, 1.0],
+                "aggregation": "product",
+                "score_by_difficulty": TRAVERSAL_SCORE_BY_DIFFICULTY,
+            },
             "graph_stats": {"nodes": G.number_of_nodes(),
                             "edges": G.number_of_edges(),
                             "objectives": len(goals)},
@@ -201,8 +224,10 @@ class KCAGMinCutTool(BaseTool):
             f"Top betweenness: {bc_line}",
         ]
         if priority_path:
-            lines.append(f"Priority path (highest probability P={priority_path['probability']}):")
+            lines.append(f"Priority path (highest heuristic traversal score S={priority_path['score']}):")
             lines.append(f"  {' -> '.join(priority_path['path'])}  [{priority_path['objective']}]")
+        lines.append("Score semantics: configured heuristic for relative ranking; "
+                      "not an empirically calibrated probability.")
         lines.append(f"Report written: {kcag_report_path}")
         lines.append("STATUS: SUCCESS")
         return "\n".join(lines)
@@ -1518,15 +1543,103 @@ def verify_technique_ids(stage_output: str) -> str:
 
 # --- Annex B: KCAG minimum node cut over the real DAG ---
 
+# ============================================================================
+#  BACKWARD-COMPATIBLE KCAG SCORE READER
+#  Reads either schema_version 2 reports (top_path_score) or legacy,
+#  pre-migration reports (top_path_prob) -- needed because a resumed run
+#  may skip Annex B entirely (it already completed under old code) while
+#  Annex C still needs to run. Legacy values retain their original
+#  numerical meaning; they are read as heuristic traversal scores, not
+#  probabilities, same as current-schema values. Old kcag_report.json
+#  files on disk are never rewritten -- their hashes and audit history
+#  stay intact regardless of which schema version produced them.
+# ============================================================================
+
+
+def _validate_kcag_score(value, *, objective_id, field):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"KCAG objective '{objective_id}' field '{field}' must be numeric.")
+    score = float(value)
+    if not math.isfinite(score):
+        raise ValueError(f"KCAG objective '{objective_id}' field '{field}' must be finite.")
+    if not 0.0 <= score <= 1.0:
+        raise ValueError(f"KCAG objective '{objective_id}' field '{field}' must be between 0 and 1.")
+    return score
+
+
+def extract_kcag_objective_score(kcag_report: dict) -> dict:
+    """Return the maximum KCAG objective traversal score.
+
+    Supports:
+    - schema v2: top_path_score
+    - legacy schema: top_path_prob
+
+    Legacy values retain their original numerical meaning but are
+    interpreted as heuristic traversal scores, not probabilities.
+
+    Fails closed (raises ValueError) on: missing/empty objective_results,
+    a non-object objective entry, an objective with neither field present,
+    a non-numeric/non-finite/out-of-range value in either field, or
+    conflicting current+legacy values for the same objective -- silently
+    preferring one would let a corrupted transitional artifact pass.
+    """
+    objectives = kcag_report.get("objective_results")
+    if not isinstance(objectives, dict) or not objectives:
+        raise ValueError("KCAG report has no non-empty objective_results.")
+
+    values = []
+    used_legacy = False
+
+    for objective_id, result in objectives.items():
+        if not isinstance(result, dict):
+            raise ValueError(f"KCAG objective '{objective_id}' must be an object.")
+
+        has_current = "top_path_score" in result
+        has_legacy = "top_path_prob" in result
+
+        if not has_current and not has_legacy:
+            raise ValueError(
+                f"KCAG objective '{objective_id}' has neither 'top_path_score' "
+                "nor legacy 'top_path_prob'."
+            )
+
+        current = (_validate_kcag_score(result["top_path_score"], objective_id=objective_id,
+                                        field="top_path_score") if has_current else None)
+        legacy = (_validate_kcag_score(result["top_path_prob"], objective_id=objective_id,
+                                       field="top_path_prob") if has_legacy else None)
+
+        if current is not None and legacy is not None and current != legacy:
+            raise ValueError(
+                f"KCAG objective '{objective_id}' contains conflicting current "
+                "and legacy score values."
+            )
+
+        if current is not None:
+            values.append(current)
+        else:
+            values.append(legacy)
+            used_legacy = True
+
+    return {
+        "score": max(values),
+        "used_legacy_field": used_legacy,
+        "source_field": "top_path_prob" if used_legacy else "top_path_score",
+    }
+
+
 # --- Annex C: pgmpy five-layer BBN threat inference ---
 @tool("bbn_threat_score")
 def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_priors.json") -> str:
     """Construct an evidence-driven Bayesian threat model, run inference, and
     return a threat score, kill-chain phase estimate, and a CPD audit log.
 
-    Unlike a flat risk-propagation model, this ingests Annex B KCAG priors and
-    real conditional structure so the score reflects the computed attack graph,
-    not a default constant.
+    Unlike a flat risk-propagation model, this ingests the Annex B KCAG
+    heuristic objective-traversal score and real conditional structure so
+    the score reflects the computed attack graph, not a default constant.
+    That score is a configured heuristic for relative path ranking, not a
+    Bayesian prior in its own right and not a calibrated probability -- it
+    enters this BBN as a scaling factor on specific CPD values (see the
+    KCAG-anchored lines below), same as the other per-assessment inputs.
 
     STRUCTURAL CPD VALUES (how nodes relate to each other -- e.g. phishing
     rate by adversary capability, kill-chain phase base rates, defensive/
@@ -1628,11 +1741,11 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     geo_prior = float(cfg["geopolitical_trigger_prior"])
     evidence = cfg.get("evidence", {})  # absent evidence = legitimate baseline state, not a hidden prior
 
-    # ---- Ingest Annex B KCAG priors -- REQUIRED, fail closed -----------------
+    # ---- Ingest Annex B KCAG heuristic factor -- REQUIRED, fail closed -------
     kcag_path = cfg.get("kcag_report_path") or run_context.artifact_path("kcag_report.json")
     if not os.path.exists(kcag_path):
         return (f"ERROR: {kcag_path} not found. Annex B must run before Annex C — "
-                f"refusing to substitute a fallback objective-path prior. Run "
+                f"refusing to substitute a fallback objective-path score. Run "
                 f"kcag_min_cut first.")
     try:
         kcag = run_context.read_stamped_json(kcag_path)
@@ -1641,9 +1754,19 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     objs = kcag.get("objective_results", {})
     if not objs:
         return f"ERROR: {kcag_path} has no objective_results — Annex B did not complete successfully."
-    p_objective_base = max(o.get("top_path_prob", 0) for o in objs.values())
-    log("KCAG.p_objective_base", p_objective_base,
-        f"{kcag_path} objective_results (max top_path_prob)")
+    try:
+        kcag_score_result = extract_kcag_objective_score(kcag)
+    except ValueError as exc:
+        return f"ERROR: {kcag_path} has an invalid objective score contract ({exc}). Refusing to run."
+    kcag_objective_score = kcag_score_result["score"]
+    source_field = kcag_score_result["source_field"]
+    log("KCAG.objective_traversal_score", kcag_objective_score,
+        f"{kcag_path} objective_results (maximum {source_field}; configured heuristic, "
+        f"not a calibrated probability)")
+    if kcag_score_result["used_legacy_field"]:
+        log("KCAG.compatibility", "legacy_field_used",
+            "Read legacy top_path_prob as a heuristic traversal score for resume compatibility.")
+
 
     try:
         # ---- Defensive multiplier --------------------------------------------
@@ -1735,7 +1858,7 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
             if auth:
                 base = [b + d for b, d in zip(base, delta_auth)]   # auth anomaly => lateral
             base[2] *= dm
-            base[3] *= dm * p_objective_base                        # KCAG-anchored
+            base[3] *= dm * kcag_objective_score                     # KCAG-anchored
             base = [max(0.001, b) for b in base]
             t = sum(base)
             return [b / t for b in base]
@@ -1769,7 +1892,7 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         geo_mult, geo_mult_src = prior("iw_effect_geo_multiplier")
         geo_cap, geo_cap_src = prior("iw_effect_geo_cap")
 
-        obj_base = round(min(obj_cap, p_objective_base * conv_factor), 4)
+        obj_base = round(min(obj_cap, kcag_objective_score * conv_factor), 4)
         PHASE_BASE = [
             log("IWEffect|Recon", recon_base, recon_src),
             log("IWEffect|InitAccess", ia_base, ia_src),
@@ -1828,7 +1951,8 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         "phase_distribution": {PHASE_LABELS[i]: round(float(phase_dist[i]), 4)
                                for i in range(4)},
         "evidence_applied": ev,
-        "kcag_objective_prior": round(p_objective_base, 4),
+        "kcag_objective_score": round(kcag_objective_score, 4),
+        "kcag_used_legacy_field": kcag_score_result["used_legacy_field"],
         "defensive_multiplier": round(dm, 4),
         "priors_file": priors_path,
         "cpd_audit_log": AUDIT,
@@ -1841,7 +1965,7 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         f"Threat Score:  {score:.4f}  ({level(score)})",
         f"Baseline:      {base_score:.4f}  (delta {score-base_score:+.4f})",
         f"Likely Phase:  {PHASE_LABELS[phase_idx]}",
-        f"KCAG prior:    {p_objective_base:.4f}   Defensive mult: {dm:.3f}",
+        f"KCAG heuristic factor: {kcag_objective_score:.4f}   Defensive mult: {dm:.3f}",
         "Phase distribution:",
         *[f"  {PHASE_LABELS[i]:16s} {float(phase_dist[i]):.4f}" for i in range(4)],
         f"Evidence applied: {ev or '(none — baseline)'}",

@@ -1018,8 +1018,14 @@ annexB_kcag.md
 kcag_report.json
 ```
 
+`kcag_report.json` schema version 2 uses `top_path_score` (per objective) and `score` (per ranked path) — not `top_path_prob` / `probability`, which the schema no longer emits. Each report also carries a `scoring_model` block stating explicitly that these are uncalibrated heuristic values, not probabilities.
+
+The score is calculated by mapping each edge's qualitative difficulty label to a configured traversal value (`TRAVERSAL_SCORE_BY_DIFFICULTY`: LOW→0.8, MEDIUM→0.5, HIGH→0.2) and multiplying those values along each candidate path. It supports relative ranking of candidate paths only.
+
+Reports generated before this terminology migration may still contain the legacy `top_path_prob` field. Vanguard reads that field for resume compatibility (so an interrupted run whose Annex B already completed under old code doesn't need to rerun it) but interprets it as the same heuristic traversal score it always was, never as an empirical probability. Old reports are never rewritten in place — their hashes and audit history stay intact.
+
 > [!IMPORTANT]
-> The current KCAG path values are heuristic traversal scores based on fixed difficulty mappings.
+> The KCAG path values are heuristic traversal scores based on fixed difficulty mappings.
 >
 > They are useful for relative ranking but are not empirically calibrated real-world probabilities.
 
@@ -1041,6 +1047,8 @@ Outputs:
 annexC_bbn.md
 bbn_report.json
 ```
+
+Annex C consumes the maximum KCAG objective traversal score as a heuristic scaling factor in the fixed BBN — read via `extract_kcag_objective_score()`, which accepts either the current `top_path_score` field or the legacy `top_path_prob` field and records in the CPD audit log which one it used. The KCAG graph is not converted into the Bayesian network, and the traversal score is not itself a Bayesian prior; it scales specific CPD values the same way the other per-assessment inputs do. A `kcag_report.json` with conflicting current and legacy score values, or a score outside `[0.0, 1.0]`, fails Annex C closed rather than silently picking one.
 
 The BBN refuses to use silent per-assessment defaults for required inputs.
 
@@ -1372,8 +1380,7 @@ Vanguard is an active research prototype.
 
 Current limitations include:
 
-* There is a deterministic KCAG structural gate (`validate_kcag`), but no LLM-driven semantic review of the graph — the Quantitative Threat Modeler executes and interprets the graph, it does not evaluate whether the topology is analytically sound.
-* KCAG traversal values are still labeled as probabilities internally.
+* A read-only Quantitative Threat Modeler review of the KCAG graph exists (`model_assumptions.md`), but its disposition (ACCEPT / ACCEPT WITH CAVEATS / RECOMMEND STAGE 2 REGENERATION) is advisory only — never parsed or acted on programmatically, and never blocks Annex B.
 * The BBN contains analyst-judgment template priors that require case-specific review.
 * BBN sensitivity analysis is not yet implemented.
 * Stage 3 remains a free-form Markdown artifact.
@@ -1689,8 +1696,7 @@ Vanguard Workbench is an advanced research prototype.
 
 The current development priorities are:
 
-* Add LLM-driven semantic KCAG review for the Quantitative Threat Modeler (deterministic structural validation via `validate_kcag` already exists; this would add analytical judgment on top of it — e.g. "is this topology analytically sound," not just "is it well-formed")
-* Rename heuristic KCAG probabilities
+* Make the Quantitative KCAG review's disposition enforceable (a human-approved blocking path when it recommends Stage 2 regeneration, rather than advisory-only)
 * Add BBN validation and sensitivity analysis
 * Convert Stage 3 into structured test-plan drafting
 * Add a general-purpose Stage 3 test-plan structure validator (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria) — separate from the pre-Stage-4 safety-review gate, which only checks Category 2/3 safety fields

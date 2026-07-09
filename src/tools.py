@@ -81,14 +81,23 @@ class KCAGMinCutTool(BaseTool):
         if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
             return "ERROR: Graph is empty after loading artifact."
  
-        # ---- 2. Identify sources and ALL goals ------------------------------
-        sources = [n for n, d in G.in_degree() if d == 0]
+        # ---- 2. Identify the root and ALL goals ------------------------------
+        # Explicit ADV_START, never an order-dependent sources[0] pick.
+        # validate_kcag() already gates this upstream in the real pipeline
+        # (crew.py runs it before Annex B), but this check stays here too
+        # as defense in depth for any direct call that bypasses that gate.
         goals = [n for n, a in G.nodes(data=True) if a.get("type") == "goal"]
-        if not sources:
-            return "ERROR: No source node (in-degree 0) found."
+        if "ADV_START" not in G:
+            return "ERROR: Required KCAG root ADV_START is missing."
+        if G.in_degree("ADV_START") != 0:
+            return "ERROR: ADV_START has incoming edges."
+        unexpected_roots = sorted(n for n, d in G.in_degree() if d == 0 and n != "ADV_START")
+        if unexpected_roots:
+            return (f"ERROR: ADV_START is not the sole KCAG root; "
+                    f"additional roots: {unexpected_roots}.")
         if not goals:
             return "ERROR: No goal node (node_type='goal') found."
-        src = sources[0]
+        src = "ADV_START"
  
         # ---- 3. Path probability helper -------------------------------------
         def path_prob(path):
@@ -984,6 +993,23 @@ def check_phase0_safety_gate(stage3_text: str, stage4_text: str) -> dict:
             "summary": summary}
 
 
+# ============================================================================
+#  SHARED KCAG STRUCTURAL CONSTANTS
+#  Used by both write_stage2_vectors() (shallow, writer-time shape check)
+#  and validate_kcag() (deeper structural gate run later, right before
+#  Annex B). Centralized here so the two checks cannot drift into separate
+#  definitions of what a valid node/edge looks like. Framework technique-ID
+#  formats deliberately do NOT live here -- that remains exclusively
+#  verify_stage2_vectors()'s responsibility.
+# ============================================================================
+KCAG_NODE_TYPES = frozenset({
+    "privilege", "technique", "property", "countermeasure", "goal",
+})
+KCAG_DIFFICULTIES = frozenset({"LOW", "MEDIUM", "HIGH"})
+KCAG_EFFECTS = frozenset({None, "DECEIVE", "DISRUPT", "DEGRADE", "DESTROY"})
+KCAG_VECTOR_ID_PATTERN = re.compile(r"^V-\d{2,}$")
+
+
 @tool("write_stage2_vectors")
 def write_stage2_vectors(vectors_json: str) -> str:
     """Validate and write the Stage 2 structured edge list to
@@ -997,11 +1023,18 @@ def write_stage2_vectors(vectors_json: str) -> str:
 
     Rejects malformed graphs (no goal, no entry node, dangling edges,
     bad enums) so Annex B never runs on a broken topology.
+
+    This is a shallow, writer-time shape check only — it does not enforce
+    that the entry node is specifically ADV_START, that it's the sole
+    root, or that every goal is reachable from it. That deeper structural
+    validation is validate_kcag()'s job, run later as its own gate right
+    before Annex B. Left deliberately unchanged/unexpanded here: the two
+    checks are meant to stay layered, not merged.
     """
     import json, os
 
-    VALID_TYPES = {"privilege", "technique", "property", "countermeasure", "goal"}
-    VALID_DIFF = {"LOW", "MEDIUM", "HIGH"}
+    VALID_TYPES = KCAG_NODE_TYPES
+    VALID_DIFF = KCAG_DIFFICULTIES
 
     try:
         data = json.loads(vectors_json)
@@ -1060,6 +1093,248 @@ def write_stage2_vectors(vectors_json: str) -> str:
     return (f"WRITTEN: {out_path} | "
             f"{len(nodes)} nodes, {len(edges)} edges, {len(goal_nodes)} goal(s), "
             f"entry node(s): {entry_nodes}. Annex B may now build the KCAG.")
+
+
+MAX_REPORTED_KCAG_CYCLES = 20
+
+
+def validate_kcag(vectors_path: Optional[str] = None) -> dict:
+    """Validate the structure of the active run's Stage 2 KCAG artifact.
+
+    Plain Python, not a CrewAI tool — crew.py calls this directly between
+    verify_stage2_vectors() and analysis_crew, the same fail-closed
+    pattern as every other deterministic gate in this pipeline.
+
+    This function does NOT verify framework technique IDs — that remains
+    exclusively verify_stage2_vectors()'s responsibility, kept as a
+    separate, non-overlapping check. This function also does NOT mutate
+    the graph: it reads the original stamped stage2_vectors.json and only
+    ever reports on it. Annex B continues reading that same original
+    artifact; nothing here produces a "validated" replacement file.
+
+    Missing active run propagates RuntimeError uncaught (from
+    run_context.artifact_path()/read_stamped_json() internally) — this is
+    NOT caught and converted into a returned dict, matching the
+    established fail-closed pattern everywhere else in this codebase
+    (write_stage0_output, etc.). A cross-run or cross-corpus artifact
+    raises ValueError from read_stamped_json(), also uncaught here, for
+    the same reason.
+    """
+    import hashlib
+    import itertools
+    from collections import Counter
+    from pathlib import Path
+
+    result = {
+        "is_valid": False,
+        "status": "FAIL",
+        "source_artifact": "",
+        "source_artifact_sha256": None,
+        "node_count": 0,
+        "edge_count": 0,
+        "root": None,
+        "roots": [],
+        "goals": [],
+        "reachable_goals": [],
+        "unreachable_goals": [],
+        "unreachable_nodes": [],
+        "self_loops": [],
+        "cycles": [],
+        "cycles_truncated": False,
+        "dead_end_nodes": [],
+        "countermeasure_warnings": [],
+        "errors": [],
+        "warnings": [],
+        "summary": "",
+    }
+
+    if vectors_path is None:
+        vectors_path = run_context.artifact_path("stage2_vectors.json")
+
+    result["source_artifact"] = vectors_path
+    path = Path(vectors_path)
+
+    if not path.exists():
+        result["errors"].append(f"{vectors_path} does not exist.")
+        result["summary"] = "KCAG validation failed: artifact missing."
+        return result
+
+    result["source_artifact_sha256"] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+    data = run_context.read_stamped_json(vectors_path)
+
+    nodes = data.get("nodes")
+    edges = data.get("edges")
+
+    if not isinstance(nodes, list):
+        result["errors"].append("'nodes' must be a list.")
+    if not isinstance(edges, list):
+        result["errors"].append("'edges' must be a list.")
+
+    if result["errors"]:
+        result["summary"] = "KCAG validation failed: malformed payload."
+        return result
+
+    result["node_count"] = len(nodes)
+    result["edge_count"] = len(edges)
+
+    node_ids = []
+    node_types = {}
+
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            result["errors"].append(f"node[{index}] must be an object.")
+            continue
+
+        node_id = str(node.get("id", "")).strip()
+        if not node_id:
+            result["errors"].append(f"node[{index}] has no valid id.")
+            continue
+
+        node_ids.append(node_id)
+        node_types[node_id] = node.get("node_type")
+
+        if node.get("node_type") not in KCAG_NODE_TYPES:
+            result["errors"].append(
+                f"node '{node_id}' has invalid node_type '{node.get('node_type')}'."
+            )
+
+        criticality = node.get("criticality")
+        if not isinstance(criticality, int) or not 1 <= criticality <= 10:
+            result["errors"].append(f"node '{node_id}' criticality must be an integer 1-10.")
+
+    duplicate_nodes = sorted(nid for nid, count in Counter(node_ids).items() if count > 1)
+    for node_id in duplicate_nodes:
+        result["errors"].append(f"Duplicate node id '{node_id}'.")
+
+    declared_nodes = set(node_ids)
+    edge_pairs = []
+    valid_edges = []
+
+    for index, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            result["errors"].append(f"edge[{index}] must be an object.")
+            continue
+
+        source = str(edge.get("source", "")).strip()
+        target = str(edge.get("target", "")).strip()
+
+        if not source or not target:
+            result["errors"].append(f"edge[{index}] must define source and target.")
+            continue
+
+        if source not in declared_nodes:
+            result["errors"].append(f"edge[{index}] source '{source}' is undeclared.")
+        if target not in declared_nodes:
+            result["errors"].append(f"edge[{index}] target '{target}' is undeclared.")
+
+        if source == target:
+            result["self_loops"].append(source)
+            result["errors"].append(f"edge[{index}] is a self-loop on '{source}'.")
+
+        difficulty = str(edge.get("difficulty", "")).upper()
+        if difficulty not in KCAG_DIFFICULTIES:
+            result["errors"].append(f"edge[{index}] has invalid difficulty '{difficulty}'.")
+
+        effect = edge.get("effect")
+        normalized_effect = effect.upper() if isinstance(effect, str) else effect
+        if normalized_effect not in KCAG_EFFECTS:
+            result["errors"].append(f"edge[{index}] has invalid effect '{effect}'.")
+
+        vector_id = str(edge.get("vec", "")).strip()
+        if not KCAG_VECTOR_ID_PATTERN.fullmatch(vector_id):
+            result["errors"].append(f"edge[{index}] has invalid vec '{vector_id}'.")
+
+        edge_pairs.append((source, target))
+        valid_edges.append(edge)
+
+    duplicate_pairs = sorted(pair for pair, count in Counter(edge_pairs).items() if count > 1)
+    for source, target in duplicate_pairs:
+        result["errors"].append(f"Duplicate directed edge '{source}' -> '{target}'.")
+
+    # Do not build NetworkX topology until raw-reference checks pass --
+    # dangling/malformed references must never reach graph construction.
+    if result["errors"]:
+        result["summary"] = f"KCAG validation failed with {len(result['errors'])} error(s)."
+        return result
+
+    graph = nx.DiGraph()
+    for node in nodes:
+        graph.add_node(node["id"], node_type=node["node_type"], criticality=node["criticality"])
+    for edge in valid_edges:
+        graph.add_edge(edge["source"], edge["target"])
+
+    roots = sorted(node for node, indegree in graph.in_degree() if indegree == 0)
+    result["roots"] = roots
+
+    if "ADV_START" not in graph:
+        result["errors"].append("Required root node ADV_START is missing.")
+    else:
+        result["root"] = "ADV_START"
+        if node_types.get("ADV_START") != "privilege":
+            result["errors"].append("ADV_START must have node_type='privilege'.")
+        if graph.in_degree("ADV_START") != 0:
+            result["errors"].append("ADV_START must have zero incoming edges.")
+
+    if roots != ["ADV_START"]:
+        result["errors"].append(f"ADV_START must be the sole root; roots found: {roots}.")
+
+    goals = sorted(node for node, attrs in graph.nodes(data=True) if attrs.get("node_type") == "goal")
+    result["goals"] = goals
+
+    if not goals:
+        result["errors"].append("At least one goal node is required.")
+
+    for goal in goals:
+        if graph.out_degree(goal) != 0:
+            result["errors"].append(f"Goal '{goal}' must be terminal.")
+
+    if "ADV_START" in graph:
+        reachable = nx.descendants(graph, "ADV_START") | {"ADV_START"}
+        result["unreachable_nodes"] = sorted(set(graph.nodes) - reachable)
+        result["reachable_goals"] = sorted(g for g in goals if g in reachable)
+        result["unreachable_goals"] = sorted(g for g in goals if g not in reachable)
+
+        if result["unreachable_nodes"]:
+            result["errors"].append(f"Nodes unreachable from ADV_START: {result['unreachable_nodes']}.")
+        if result["unreachable_goals"]:
+            result["errors"].append(f"Goals unreachable from ADV_START: {result['unreachable_goals']}.")
+
+    result["dead_end_nodes"] = sorted(
+        node for node in graph.nodes
+        if graph.out_degree(node) == 0 and node_types.get(node) != "goal"
+    )
+    if result["dead_end_nodes"]:
+        result["warnings"].append(f"Non-goal sink nodes found: {result['dead_end_nodes']}.")
+
+    cycle_iterator = nx.simple_cycles(graph)
+    cycles_plus_one = list(itertools.islice(cycle_iterator, MAX_REPORTED_KCAG_CYCLES + 1))
+    result["cycles_truncated"] = len(cycles_plus_one) > MAX_REPORTED_KCAG_CYCLES
+    result["cycles"] = cycles_plus_one[:MAX_REPORTED_KCAG_CYCLES]
+    if result["cycles"]:
+        result["warnings"].append(
+            f"{len(result['cycles'])} directed cycle(s) found"
+            + (" (report truncated)." if result["cycles_truncated"] else ".")
+        )
+
+    goal_set = set(goals)
+    for node, attrs in graph.nodes(data=True):
+        if attrs.get("node_type") != "countermeasure":
+            continue
+        can_reach_goal = any(nx.has_path(graph, node, goal) for goal in goal_set)
+        if graph.out_degree(node) == 0 or not can_reach_goal:
+            warning = f"Countermeasure '{node}' is not positioned on a path that continues to a goal."
+            result["countermeasure_warnings"].append(warning)
+            result["warnings"].append(warning)
+
+    result["is_valid"] = not result["errors"]
+    result["status"] = "PASS" if result["is_valid"] else "FAIL"
+    result["summary"] = (
+        f"KCAG validation {result['status']}: {result['node_count']} nodes, "
+        f"{result['edge_count']} edges, {len(result['goals'])} goals, "
+        f"{len(result['errors'])} errors, {len(result['warnings'])} warnings."
+    )
+    return result
 
 # --- lookup_technique: wire to your indexed MITRE/CAPEC/EMB3D/SPARTA corpus ---
 @tool("lookup_technique")

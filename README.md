@@ -1052,6 +1052,10 @@ Annex C consumes the maximum KCAG objective traversal score as a heuristic scali
 
 The BBN refuses to use silent per-assessment defaults for required inputs.
 
+Both the per-assessment configuration and `config/bbn_priors.json` are validated deterministically (`src/bbn_validation.py`) *before* any pgmpy model is constructed — not just "is this field present," but shape, type, range, and sum: probability vectors must sum to 1.0, CPD matrix columns must sum to 1.0, evidence deltas must sum to 0.0, booleans and numeric strings are rejected as numbers, NaN and infinity are rejected even where Python's own JSON parser would otherwise accept them, and every prior requires nonempty provenance. All 24 derived `KillChainPhase` combinations (3 capability classes × 2 phishing × 2 scanning × 2 auth-anomaly states) are checked before runtime, catching a delta set that's individually well-formed but invalid once combined. `preflight_check.py` calls this exact same validator, so a clean preflight run means Annex C's own gate will also pass, not just preflight's own separate guess.
+
+`adversary.capability_prior` is used exactly as supplied once validated — it is no longer silently floored and renormalized. A valid analyst-supplied zero stays exactly zero.
+
 The priors file currently contains several analyst-judgment template values. These are not empirically calibrated for a specific assessment and must be reviewed before relying on the resulting scores.
 
 A Bayesian result is conditional on:
@@ -1697,7 +1701,7 @@ Vanguard Workbench is an advanced research prototype.
 The current development priorities are:
 
 * Make the Quantitative KCAG review's disposition enforceable (a human-approved blocking path when it recommends Stage 2 regeneration, rather than advisory-only)
-* Add BBN validation and sensitivity analysis
+* Add BBN sensitivity analysis (deterministic numeric validation of per-assessment inputs and priors is already implemented — `src/bbn_validation.py`)
 * Convert Stage 3 into structured test-plan drafting
 * Add a general-purpose Stage 3 test-plan structure validator (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria) — separate from the pre-Stage-4 safety-review gate, which only checks Category 2/3 safety fields
 * Update Purple Team tools to consume run-scoped artifacts directly

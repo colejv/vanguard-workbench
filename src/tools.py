@@ -8,6 +8,11 @@ import os
 import math
 
 from src import run_context
+from src.bbn_validation import (
+    validate_bbn_assessment_config,
+    validate_bbn_priors_document,
+    format_bbn_validation_error,
+)
 
 
 # --- Annex B: KCAG minimum node cut over the real DAG ---
@@ -1653,25 +1658,43 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     review before scored use).
 
     PER-ASSESSMENT INPUTS are required in cpd_config_json with no silent
-    defaults -- this also fails closed if any are missing:
+    defaults -- validated deterministically by
+    src.bbn_validation.validate_bbn_assessment_config() BEFORE any field is
+    read into a calculation (shape, type, range, and probability-sum checks;
+    booleans and numeric strings are rejected as numbers; NaN/infinity are
+    rejected even if the JSON parser itself accepted them). This also fails
+    closed if any required field is missing:
       {
         "kcag_report_path": null,   // optional; omit to auto-resolve to the active run's kcag_report.json
         "adversary": {
-            "capability_prior": [0.0, 0.05, 0.95],        // REQUIRED: [hacktivist,criminal,nation-state]
-            "tempo": "HIGH"                                // REQUIRED: LOW|MEDIUM|HIGH
+            "capability_prior": [0.0, 0.05, 0.95],        // REQUIRED: [hacktivist,criminal,nation-state], must sum to 1.0
+            "tempo": "HIGH"                                // REQUIRED: exactly LOW|MEDIUM|HIGH, case-sensitive
         },
-        "defensive_posture": {                             // REQUIRED: true=control active
+        "defensive_posture": {                             // REQUIRED: exactly these 5 controls, true=active
             "mfa": true, "edr": false, "segmentation": false,
             "integrity_monitor": false, "email_filtering": true
         },
-        "geopolitical_trigger_prior": 0.55,                // REQUIRED
+        "geopolitical_trigger_prior": 0.55,                // REQUIRED: finite, in [0,1]
         "evidence": {                                      // optional -- absence is a legitimate "no observations yet" baseline, not a hidden prior
             "GeopoliticalTrigger": 1, "AdversaryCapability": 2,
             "PhishingAttempt": 1, "ScanningDetected": 1, "AuthAnomaly": 1
         }
       }
+    adversary.capability_prior is used exactly as supplied once validated --
+    it is never floored or renormalized. A valid analyst-supplied zero stays
+    exactly zero.
+
+    config/bbn_priors.json is ALSO validated deterministically before any CPD
+    is constructed from it (validate_bbn_priors_document() -- probability
+    vector and CPD-matrix shape/range/sum, evidence deltas summing to zero,
+    all 24 derived KillChainPhase combinations, cross-field invariants like
+    posture-multiplier ordering and phase-base monotonicity, and nonempty
+    provenance on every prior). preflight_check.py calls this exact same
+    function, so a clean preflight run means this gate will also pass, not
+    just preflight's own separate guess.
+
     outputs/kcag_report.json is also required (Annex B must run before Annex C)
-    -- this fails closed rather than substituting a fallback objective prior.
+    -- this fails closed rather than substituting a fallback objective score.
 
     Returns a human-readable report plus writes bbn_report.json under the
     active run's output directory.
@@ -1694,29 +1717,6 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
                 return lbl
         return "CRITICAL"
 
-    # ---- Load structural priors file (fail closed -- no embedded defaults) --
-    if not os.path.exists(priors_path):
-        return (f"ERROR: {priors_path} not found. Refusing to run with embedded "
-                f"default CPD values. Create {priors_path} with sourced priors "
-                f"(see this tool's docstring for the schema) before calling "
-                f"bbn_threat_score.")
-    try:
-        priors = json.load(open(priors_path))["priors"]
-    except (json.JSONDecodeError, KeyError) as e:
-        return f"ERROR: {priors_path} malformed or missing 'priors' key ({e}). Refusing to run."
-
-    def prior(*path):
-        """Walk a dotted path into the priors dict. Fails closed with a specific
-        missing-key message instead of raising a raw KeyError or defaulting."""
-        node = priors
-        for i, key in enumerate(path):
-            if not isinstance(node, dict) or key not in node:
-                raise LookupError(f"required prior '{'.'.join(path[:i+1])}' missing from {priors_path}")
-            node = node[key]
-        if not (isinstance(node, dict) and "value" in node):
-            raise LookupError(f"prior '{'.'.join(path)}' in {priors_path} is missing its 'value' field")
-        return node["value"], node.get("source", "(no source field in priors file)")
-
     # ---- Parse per-run config -- REQUIRED, no silent defaults ---------------
     cfg = {}
     if cpd_config_json and cpd_config_json.strip():
@@ -1725,21 +1725,61 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         except json.JSONDecodeError as e:
             return f"ERROR: cpd_config_json is not valid JSON ({e}). Refusing to run on undefined input."
 
-    adversary = cfg.get("adversary", {})
-    missing = [f"adversary.{k}" for k in ("capability_prior", "tempo") if k not in adversary]
-    missing += [k for k in ("defensive_posture", "geopolitical_trigger_prior") if k not in cfg]
-    if missing:
-        return (f"ERROR: cpd_config_json is missing required field(s): {missing}. "
-                f"These vary per assessment and are never silently assumed — supply "
-                f"them explicitly. See this tool's docstring for the expected shape.")
+    # ---- Deterministic numeric validation of the per-assessment config,
+    # BEFORE any field is read into a calculation. Same validator preflight
+    # uses -- see src/bbn_validation.py. Booleans, NaN, infinity, wrong-shape
+    # vectors, and unknown/missing fields are all caught here, not as a raw
+    # TypeError/KeyError three steps into CPD construction. ----
+    config_validation = validate_bbn_assessment_config(cfg)
+    if not config_validation["is_valid"]:
+        return format_bbn_validation_error("per-assessment configuration", config_validation)
 
+    adversary = cfg["adversary"]
     cap_prior = adversary["capability_prior"]
     tempo = adversary["tempo"]
-    if tempo not in ("LOW", "MEDIUM", "HIGH"):
-        return f"ERROR: adversary.tempo must be one of LOW/MEDIUM/HIGH, got {tempo!r}."
     posture = cfg["defensive_posture"]
     geo_prior = float(cfg["geopolitical_trigger_prior"])
     evidence = cfg.get("evidence", {})  # absent evidence = legitimate baseline state, not a hidden prior
+
+    # ---- Load structural priors file (fail closed -- no embedded defaults) --
+    if not os.path.exists(priors_path):
+        return (f"ERROR: {priors_path} not found. Refusing to run with embedded "
+                f"default CPD values. Create {priors_path} with sourced priors "
+                f"(see this tool's docstring for the schema) before calling "
+                f"bbn_threat_score.")
+    try:
+        priors_document = json.load(open(priors_path))
+        priors = priors_document["priors"]
+    except (json.JSONDecodeError, KeyError) as e:
+        return f"ERROR: {priors_path} malformed or missing 'priors' key ({e}). Refusing to run."
+
+    # ---- Deterministic numeric validation of the priors document, BEFORE
+    # any CPD is constructed from it. Same validator preflight uses. Catches
+    # malformed shapes, out-of-range/non-finite values, bad CPD column sums,
+    # empty provenance, and cross-field modeling invariants (posture
+    # multiplier ordering, phase-base monotonicity, all 24 derived
+    # KillChainPhase combinations) that the old shallow "is this key
+    # present" check never looked at. ----
+    priors_validation = validate_bbn_priors_document(priors_document)
+    if not priors_validation["is_valid"]:
+        return format_bbn_validation_error(str(priors_path), priors_validation)
+
+    def prior(*path):
+        """Walk a dotted path into the priors dict. The document already
+        passed validate_bbn_priors_document() above, so every required
+        path is guaranteed present and well-shaped here -- this LookupError
+        branch is defense in depth for any prior NOT covered by that
+        validator (e.g. a genuinely new prior added to this function
+        without updating bbn_validation.py's required-field list), not the
+        primary enforcement mechanism anymore."""
+        node = priors
+        for i, key in enumerate(path):
+            if not isinstance(node, dict) or key not in node:
+                raise LookupError(f"required prior '{'.'.join(path[:i+1])}' missing from {priors_path}")
+            node = node[key]
+        if not (isinstance(node, dict) and "value" in node):
+            raise LookupError(f"prior '{'.'.join(path)}' in {priors_path} is missing its 'value' field")
+        return node["value"], node.get("source", "(no source field in priors file)")
 
     # ---- Ingest Annex B KCAG heuristic factor -- REQUIRED, fail closed -------
     kcag_path = cfg.get("kcag_report_path") or run_context.artifact_path("kcag_report.json")
@@ -1795,9 +1835,14 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
 
         cpds = []
 
-        # AdversaryCapability (root, 3 states) -- analyst-supplied, required
-        cap = [max(0.001, p) for p in cap_prior]
-        s = sum(cap); cap = [p / s for p in cap]
+        # AdversaryCapability (root, 3 states) -- analyst-supplied, required.
+        # validate_bbn_assessment_config() above already confirmed this is a
+        # valid 3-element probability distribution (finite, in [0,1], sums to
+        # 1.0 within tolerance) -- no floor/renormalize here. A valid
+        # analyst-supplied zero is meaningful and stays exactly zero; this
+        # function no longer silently modifies an otherwise-valid analyst
+        # distribution.
+        cap = [float(p) for p in cap_prior]
         cpds.append(TabularCPD("AdversaryCapability", 3, [[cap[0]], [cap[1]], [cap[2]]]))
         log("AdversaryCapability", cap, "adversary.capability_prior (analyst-supplied, required)")
 
@@ -1955,6 +2000,23 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         "kcag_used_legacy_field": kcag_score_result["used_legacy_field"],
         "defensive_multiplier": round(dm, 4),
         "priors_file": priors_path,
+        "validation": {
+            "assessment_config": {
+                "status": config_validation["status"],
+                "checked_fields": config_validation["checked_fields"],
+            },
+            "priors": {
+                "status": priors_validation["status"],
+                "checked_fields": priors_validation["checked_fields"],
+                "version": priors_document.get("version"),
+            },
+            # This commit's one deliberate numerical correction: capability_prior
+            # is used exactly as supplied (validated, never floored/renormalized).
+            # Recorded explicitly so a reader auditing this report doesn't have
+            # to know the codebase's history to confirm the value wasn't
+            # silently modified.
+            "silent_normalization": False,
+        },
         "cpd_audit_log": AUDIT,
     }
     bbn_report_path = run_context.artifact_path("bbn_report.json")

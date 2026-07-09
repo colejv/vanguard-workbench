@@ -5,9 +5,11 @@ crew.py, to catch the four things a slow local-Ollama run shouldn't have to
 discover for you:
 
   1. Corpus lock status (sources/corpus_manifest.md vs. actual sources/)
-  2. config/bbn_priors.json completeness (every prior bbn_threat_score
-     actually reads, derived from tools.py itself so this can't drift out
-     of sync with the real function)
+  2. config/bbn_priors.json deterministic numeric validation -- shape,
+     range, probability/delta sums, CPD column sums, provenance, and
+     cross-field modeling invariants, via the SAME validator function
+     bbn_threat_score() itself calls at runtime (src/bbn_validation.py),
+     not a separate presence-only check that could drift out of sync
   3. Whether sources/ contains .pdf files and, if so, whether pypdf is
      installed
   4. A reminder about the one known gap: corpus-lock result isn't yet
@@ -22,7 +24,6 @@ Usage:  python3 preflight_check.py
 Exit code 0 if everything is clear to run, 1 if something needs attention.
 """
 import os
-import re
 import sys
 import json
 
@@ -85,63 +86,45 @@ if verify_corpus_lock_gate is not None:
 
 
 # ---------------------------------------------------------------------------
-# 2. BBN PRIORS COMPLETENESS
+# 2. BBN PRIORS DETERMINISTIC VALIDATION
 # ---------------------------------------------------------------------------
-section("2. config/bbn_priors.json completeness")
+section("2. config/bbn_priors.json deterministic validation")
 
 PRIORS_PATH = "config/bbn_priors.json"
-TOOLS_PATH = "src/tools.py"
 
 if not os.path.exists(PRIORS_PATH):
     fail(f"{PRIORS_PATH} not found. bbn_threat_score will refuse to run "
          f"without it (by design — no embedded fallback).")
-elif not os.path.exists(TOOLS_PATH):
-    warn(f"{TOOLS_PATH} not found from this working directory — can't "
-         f"derive the required-key list. Run from the project root.")
 else:
     try:
         priors_doc = json.load(open(PRIORS_PATH))
-        priors = priors_doc["priors"]
-    except (json.JSONDecodeError, KeyError) as e:
-        fail(f"{PRIORS_PATH} malformed or missing 'priors' key ({e}).")
-        priors = None
+    except json.JSONDecodeError as e:
+        fail(f"{PRIORS_PATH} is not valid JSON ({e}).")
+        priors_doc = None
 
-    if priors is not None:
-        # Derive the required path list from the live function itself, not
-        # a hand-maintained copy, so this check can't silently go stale.
-        src = open(TOOLS_PATH).read()
-        s = src.index('@tool("bbn_threat_score")')
-        e = src.index('\n\n\n# --- write_stage0_output')
-        block = src[s:e]
+    if priors_doc is not None:
+        try:
+            from src.bbn_validation import validate_bbn_priors_document
+        except ImportError as e:
+            fail(f"Could not import validate_bbn_priors_document from "
+                 f"src.bbn_validation ({e}). Run this from the project root "
+                 f"with the same environment crew.py uses.")
+            validate_bbn_priors_document = None
 
-        static_calls = re.findall(r'prior\(((?:"[^"]*"(?:,\s*)?)+)\)', block)
-        paths = [tuple(a.strip().strip('"') for a in c.split(",") if a.strip())
-                 for c in static_calls]
-        # The one dynamic call (tempo is a runtime variable, not a literal):
-        # prior("operational_tempo_distribution", tempo) -- check all three
-        # values it could resolve to at runtime.
-        for t in ("LOW", "MEDIUM", "HIGH"):
-            paths.append(("operational_tempo_distribution", t))
-
-        n_ok, n_missing = 0, 0
-        for path in paths:
-            node = priors
-            found = True
-            for key in path:
-                if not isinstance(node, dict) or key not in node:
-                    found = False
-                    break
-                node = node[key]
-            if found and isinstance(node, dict) and "value" in node:
-                n_ok += 1
+        if validate_bbn_priors_document is not None:
+            # Same function bbn_threat_score() itself calls at runtime -- a
+            # PASS here means the real Annex C gate will also pass on this
+            # file, not just this script's own guess. Deliberately not a
+            # second, independent implementation of "is this prior valid."
+            validation = validate_bbn_priors_document(priors_doc)
+            if validation["is_valid"]:
+                ok(f"{validation['summary']}")
             else:
-                n_missing += 1
-                fail(f"required prior '{'.'.join(path)}' missing or malformed "
-                     f"in {PRIORS_PATH}")
-
-        if n_missing == 0:
-            ok(f"all {n_ok} required priors present (derived live from "
-               f"{TOOLS_PATH}'s actual prior() calls)")
+                fail(f"BBN priors validation: FAIL "
+                     f"({len(validation['errors'])} error(s), "
+                     f"{validation['checked_fields']} field(s) checked)")
+                for error in validation["errors"]:
+                    print(f"         {error['path']}: {error['message']} [{error['code']}]")
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status,
-                        finalize_stage4_state)
+                        finalize_stage4_state, enforce_stage3_safety_gate)
 from src import run_context
 from src.heartbeat import heartbeat
 
@@ -541,18 +541,14 @@ if __name__ == "__main__":
     print(f"Pre-Stage-4 safety gate: "
           f"{'COMPLIANT' if stage3_safety['is_compliant'] else 'NON-COMPLIANT'} — {stage3_safety['summary']}")
 
-    if not stage3_safety["is_compliant"]:
-        set_stage_status(state, "stage3", StageStatus.FAIL)
-        state.current_stage = "stage3"
-        save_assessment_state(state, run_id)
-        raise RuntimeError(
-            f"Stage 3 safety gate FAILED: {stage3_safety['summary']} "
-            f"See {stage3_gate_path}. Stage 4 was not constructed. "
-            f"Run audit trail: {out_dir}/assessment_state.json"
-        )
-
-    set_stage_status(state, "stage3", StageStatus.PASS)
-    save_assessment_state(state, run_id)
+    # enforce_stage3_safety_gate raises RuntimeError (after persisting FAIL
+    # state) on a non-compliant result -- nothing below this call is
+    # reachable on the failure path.
+    enforce_stage3_safety_gate(
+        state, run_id,
+        is_compliant=stage3_safety["is_compliant"],
+        summary=stage3_safety["summary"],
+    )
 
     # ---- BUILD AND RUN STAGE 4 (separate crew, no live context=[t_stage3];
     # stage3_text above is verified, stamped, run-and-corpus-bound content —
@@ -587,13 +583,15 @@ if __name__ == "__main__":
             pass
     run_context.stamp_prose_file(stage4_prose_path)
 
-    # ---- ITEM 8: PHASE 0 SAFETY GATE COMPLIANCE CHECK (deterministic) ----
-    # Stage 3 is now fully finalized and verified BEFORE Stage 4 is ever
-    # constructed — but t_stage4 still has its own human_input=True
-    # approval inside stage4_crew.kickoff() above, so this check still
-    # fires after a human has already approved the mission plan content.
-    # Moving THAT check earlier (a pre-Stage-4 gate on Stage 3 alone,
-    # before stage4_crew is even built) is the next commit, not this one.
+    # ---- FINAL PHASE 0 SAFETY CHECK: DEFENSE IN DEPTH ----
+    # Stage 3 has already passed the deterministic pre-Stage-4 gate above
+    # (enforce_stage3_safety_gate) before Stage 4 was ever constructed.
+    # This second check confirms that the generated Stage 4 mission plan
+    # carries forward the required safety-gate language and does not
+    # contradict the already-approved Stage 3 assessment. It still fires
+    # after t_stage4's own human_input=True approval inside
+    # stage4_crew.kickoff() above, so it cannot intercept THAT approval —
+    # only the pre-Stage-4 gate can do that, and it already ran.
     stage4_text = run_context.read_stamped_prose(stage4_prose_path) if os.path.exists(stage4_prose_path) else ""
     safety = check_phase0_safety_gate(stage3_text, stage4_text)
     phase0_check_path = run_context.artifact_path("phase0_safety_check.md")

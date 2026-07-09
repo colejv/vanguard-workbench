@@ -92,7 +92,11 @@ Annex C — Bayesian threat model
         ↓
 Stage 3 — Human-reviewed test concepts
         ↓
+Deterministic pre-Stage-4 safety gate
+        ↓
 Stage 4 — MDMP-style mission plan
+        ↓
+Final defense-in-depth safety check
         ↓
 Purple Team defensive validation
 ```
@@ -644,9 +648,10 @@ The pipeline will:
 15. Run Annex B KCAG analysis.
 16. Run Annex C Bayesian inference.
 17. Request human review for Stage 3.
-18. Request human review for Stage 4.
-19. Run the deterministic Phase 0 safety-language check.
-20. Preserve the artifacts in the run directory.
+18. Run the deterministic pre-Stage-4 safety gate. Halt before Stage 4 is even constructed if it fails.
+19. Request human review for Stage 4 — only reached if the gate above passed.
+20. Run the final defense-in-depth Phase 0 safety-language check.
+21. Preserve the artifacts in the run directory.
 
 ### Human-input prompts
 
@@ -655,6 +660,8 @@ Vanguard currently requests human input at:
 * Corpus-lock confirmation
 * Stage 3 authorization
 * Stage 4 mission-plan release
+
+Stage 4's prompt is only reached if the deterministic pre-Stage-4 safety gate passed — a Category 2/3 test concept without a complete safety review halts the run before a human ever sees a Stage 4 draft.
 
 Do not approve a stage unless:
 
@@ -688,7 +695,7 @@ Example:
 tail -f outputs/vaf_20260709_143022/heartbeat.log
 ```
 
-The heartbeat indicates whether the pre-analysis or post-analysis crew is still active during long local-model operations.
+The heartbeat log labels each phase by name — `pre_crew` (Stage 0-2), `analysis_crew` (Annex B, Annex C, Stage 3), and `stage4_crew` (Stage 4 alone) — so it indicates which specific crew is still active during long local-model operations, not just "still running somewhere."
 
 ---
 
@@ -767,6 +774,7 @@ outputs/vaf_20260709_143022/
 ├── annexC_bbn.md
 ├── bbn_report.json
 ├── stage3.md
+├── stage3_safety_gate.json
 ├── stage4_mission_plan.md
 └── phase0_safety_check.md
 ```
@@ -999,7 +1007,7 @@ It should not be treated as objective ground truth.
 
 Stage 3 reviews the verified attack vectors and Annex B priority path.
 
-It currently drafts categorized test concepts for human review.
+It drafts categorized test concepts for human review. For any test concept carrying Category 2 (Degradation & Destruction) or Category 3 (Physical Behavior Alteration), Stage 3 is required to include a complete `PRE-STAGE-4 SAFETY REVIEW` section: affected assets, required approving roles, safety authority, abort authority, abort criteria, maximum termination time, rollback procedure, and an explicit release condition. When no Category 2/3 concepts exist, Stage 3 must instead state so explicitly — silence is never treated as compliant.
 
 Output:
 
@@ -1016,6 +1024,18 @@ The human reviewer remains responsible for determining whether each concept is:
 * Safe
 * Within scope
 * Appropriate for the actual system architecture
+
+### Pre-Stage-4 safety gate
+
+Before Stage 4 is even constructed, Vanguard deterministically checks the stamped, verified Stage 3 artifact for the safety-review requirement above.
+
+Output:
+
+```text
+stage3_safety_gate.json
+```
+
+A noncompliant result halts the run immediately. Stage 4 is never built and the Stage 4 human-approval prompt is never reached — this is the actual enforcement point for Stage 3's safety-review requirement, not the final check described below.
 
 ### Stage 4 — MDMP-style mission plan
 
@@ -1035,11 +1055,11 @@ Output:
 stage4_mission_plan.md
 ```
 
-Stage 4 requires human input.
+Stage 4 requires human input. This prompt is only reached if the pre-Stage-4 safety gate above passed.
 
-### Phase 0 safety-language check
+### Final defense-in-depth safety check
 
-After Stage 3 and Stage 4 complete, Vanguard checks whether Category 2 or Category 3 concepts include required Phase 0 safety language.
+After Stage 4 completes, Vanguard runs a second, independent check confirming the generated mission plan carries forward the required Phase 0 safety-gate language and does not contradict the already-approved Stage 3 assessment.
 
 Output:
 
@@ -1050,9 +1070,9 @@ phase0_safety_check.md
 A noncompliant result prevents the run from completing successfully.
 
 > [!WARNING]
-> The current safety check runs after the Stage 3 and Stage 4 human-input prompts.
+> This second check runs after the Stage 4 human-input prompt, so it cannot intercept that approval — it can prevent the run from finalizing, but a human will have already seen and approved the Stage 4 draft by the time it runs.
 >
-> It can prevent finalization, but it does not currently prevent noncompliant content from reaching the Stage 4 review prompt.
+> The pre-Stage-4 gate above is the check that actually runs before that prompt. This one exists as defense in depth: it also catches the case where Stage 3 and Stage 4 directly contradict each other (e.g. Stage 3 declares Category 2/3 concepts but Stage 4 claims none apply).
 
 ---
 
@@ -1293,9 +1313,8 @@ Current limitations include:
 * The BBN contains analyst-judgment template priors that require case-specific review.
 * BBN sensitivity analysis is not yet implemented.
 * Stage 3 remains a free-form Markdown artifact.
-* There is no deterministic Stage 3 test-plan validator.
-* Stage 3 and Stage 4 still run in the same post-analysis CrewAI invocation.
-* The Phase 0 safety-language check runs after the Stage 4 human-input prompt.
+* There is no deterministic Stage 3 test-plan validator for general structure (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria as a whole) — only the pre-Stage-4 safety-review fields are deterministically checked.
+* The final defense-in-depth safety check still runs after the Stage 4 human-input prompt, so it cannot intercept that specific approval (the pre-Stage-4 gate is what actually runs before it, and does intercept).
 * The attribution-boundary check is advisory rather than blocking.
 * The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
 * The Purple Team tools still use flat compatibility paths under `outputs/`.
@@ -1608,8 +1627,7 @@ The current development priorities are:
 * Rename heuristic KCAG probabilities
 * Add BBN validation and sensitivity analysis
 * Convert Stage 3 into structured test-plan drafting
-* Validate Stage 3 before Stage 4
-* Move safety enforcement before Stage 4
+* Add a general-purpose Stage 3 test-plan structure validator (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria) — separate from the pre-Stage-4 safety-review gate, which only checks Category 2/3 safety fields
 * Update Purple Team tools to consume run-scoped artifacts directly
 
 The project's intended direction is:

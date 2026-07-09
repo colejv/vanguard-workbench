@@ -192,3 +192,43 @@ def finalize_stage4_state(
     state.current_stage = "complete"
     save_assessment_state(state, run_id, base)
     return state
+
+
+def enforce_stage3_safety_gate(
+    state: AssessmentState,
+    run_id: str,
+    is_compliant: bool,
+    summary: str,
+    base: str = "outputs",
+) -> AssessmentState:
+    """
+    Single production implementation of the pre-Stage-4 gate's state
+    transition. crew.py and the test suite both call this function
+    directly, same reasoning as finalize_stage4_state: a test that
+    reproduces "mark FAIL and raise" locally instead of calling this
+    function can pass even if crew.py's actual wiring is broken (e.g. if
+    crew.py forgot to check is_compliant before constructing Stage 4 at
+    all — which is exactly the property this gate exists to guarantee).
+
+    Sets current_stage='stage3' on failure specifically, so a rejected
+    run is never indistinguishable from one that stalled at an earlier,
+    unrelated point.
+
+    Mirrors finalize_stage4_state's separation of concerns: this function
+    does NOT call check_stage3_safety_gate itself and does NOT write the
+    gate report artifact — the caller (crew.py) computes is_compliant
+    from that checker and writes the stamped report BEFORE calling this.
+    """
+    if not is_compliant:
+        set_stage_status(state, "stage3", StageStatus.FAIL)
+        state.current_stage = "stage3"
+        save_assessment_state(state, run_id, base)
+        raise RuntimeError(
+            f"Stage 3 safety gate FAILED: {summary} Stage 4 was not "
+            f"constructed. Run audit trail: "
+            f"{run_output_dir(run_id, base)}/assessment_state.json"
+        )
+
+    set_stage_status(state, "stage3", StageStatus.PASS)
+    save_assessment_state(state, run_id, base)
+    return state

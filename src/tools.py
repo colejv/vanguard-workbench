@@ -782,6 +782,28 @@ STAGE3_SAFETY_SECTION = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+_NEXT_MARKDOWN_HEADING = re.compile(r"^#{1,6}\s+.+$", re.MULTILINE)
+
+
+def _extract_stage3_safety_section(text: str):
+    """Return the body of the PRE-STAGE-4 SAFETY REVIEW section only —
+    from right after its heading up to the next markdown heading (or end
+    of document if it's the last section) — or None if the heading isn't
+    present at all. Required-field and no-gate-declaration checks must
+    run against this extracted section, NOT the whole document: without
+    this, field labels that happen to appear anywhere else (e.g. legitimately
+    repeated per-payload, which CRITICAL INSTRUCTION 5 also asks for) would
+    let a document with an incomplete or empty safety-review section pass
+    anyway, exactly as long as the same labels happened to occur elsewhere."""
+    heading = STAGE3_SAFETY_SECTION.search(text)
+    if not heading:
+        return None
+    remainder = text[heading.end():]
+    next_heading = _NEXT_MARKDOWN_HEADING.search(remainder)
+    if next_heading:
+        return remainder[:next_heading.start()].strip()
+    return remainder.strip()
+
 STAGE3_NO_GATE_REQUIRED = "NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED."
 
 STAGE3_REQUIRED_SAFETY_FIELDS = {
@@ -819,20 +841,29 @@ def check_stage3_safety_gate(stage3_text: str) -> dict:
     invalid_fields, explicit_not_required, summary}.
     """
     text = _strip_markdown_emphasis(stage3_text or "")
+    section = _extract_stage3_safety_section(text)
 
-    explicit_not_required = STAGE3_NO_GATE_REQUIRED.lower() in text.lower()
-
+    # Category detection scans the WHOLE document, deliberately NOT scoped
+    # to the safety-review section -- category labels legitimately live in
+    # each payload's own header (e.g. "### RT-001\nCategory: 2"), not in
+    # the aggregate section.
     category_values = STAGE3_CATEGORY_LINE.findall(text)
     category_numbers = set()
     for value in category_values:
         category_numbers.update(int(n) for n in re.findall(r"\b[1-4]\b", value))
     detected = bool(category_numbers & {2, 3})
 
+    # The no-gate override, in contrast, MUST be scoped to the section --
+    # otherwise the sentinel phrase appearing anywhere in the document
+    # (e.g. stray, or copy-pasted into an unrelated payload's notes) would
+    # satisfy compliance even with a missing or empty safety-review section.
+    explicit_not_required = section is not None and STAGE3_NO_GATE_REQUIRED.lower() in section.lower()
+
     result = {
         "is_compliant": False,
         "category_2_3_detected": detected,
         "matched_categories": sorted(category_numbers & {2, 3}),
-        "safety_review_present": bool(STAGE3_SAFETY_SECTION.search(text)),
+        "safety_review_present": section is not None,
         "missing_fields": [],
         "invalid_fields": [],
         "explicit_not_required": explicit_not_required,
@@ -855,14 +886,19 @@ def check_stage3_safety_gate(stage3_text: str) -> dict:
         result["invalid_fields"].append("contradictory_not_required_statement")
         return result
 
-    if not result["safety_review_present"]:
+    if section is None:
         result["summary"] = ("Category 2/3 concepts were detected, but the "
                               "PRE-STAGE-4 SAFETY REVIEW section is missing.")
         return result
 
+    # All required-field checks run against the extracted SECTION only,
+    # never the whole document -- a field label appearing elsewhere (e.g.
+    # legitimately repeated per-payload, which CRITICAL INSTRUCTION 5 also
+    # asks for) must not let an incomplete or near-empty safety-review
+    # section pass just because the same labels happened to occur nearby.
     values = {}
     for field, pattern in STAGE3_REQUIRED_SAFETY_FIELDS.items():
-        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        m = re.search(pattern, section, re.IGNORECASE | re.MULTILINE)
         if not m:
             result["missing_fields"].append(field)
             continue

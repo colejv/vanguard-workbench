@@ -35,7 +35,7 @@ from pathlib import Path
 import pytest
 
 from src import run_context
-from src.tools import check_stage3_safety_gate, check_phase0_safety_gate
+from src.tools import check_stage3_safety_gate, check_phase0_safety_gate, STAGE3_REQUIRED_SAFETY_FIELDS
 
 
 COMPLETE_REVIEW = """
@@ -58,7 +58,7 @@ NO_GATE = "NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED."
 # ---------- check_stage3_safety_gate: reviewer-requested unit tests ----------
 
 def test_no_category_2_3_with_exact_statement_passes():
-    r = check_stage3_safety_gate(f"### RT-001\nCategory: 1\n\n{NO_GATE}")
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 1\n\n## PRE-STAGE-4 SAFETY REVIEW\n{NO_GATE}")
     assert r["is_compliant"] is True
     assert r["category_2_3_detected"] is False
 
@@ -139,8 +139,11 @@ def test_category_2_with_not_required_statement_fails():
 def test_no_gate_sentence_does_not_trigger_category_detection():
     """The sentinel phrase itself contains the literal text 'CATEGORY 2/3'
     -- a naive substring search would false-positive against its own
-    override statement. Must not self-trigger detection."""
-    r = check_stage3_safety_gate(NO_GATE)
+    override statement. Must not self-trigger detection. (Embedded in a
+    properly-sectioned document here, not bare -- the self-triggering
+    concern is exercised regardless of surrounding structure, since
+    category detection scans the whole document either way.)"""
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 1\n\n## PRE-STAGE-4 SAFETY REVIEW\n{NO_GATE}")
     assert r["category_2_3_detected"] is False
     assert r["is_compliant"] is True
 
@@ -189,7 +192,7 @@ def test_gate_report_is_run_stamped(tmp_path):
     out_dir = tmp_path / "outputs" / "test-run"
     run_context.set_active_run("test-run", "sha256:test-corpus", str(out_dir))
 
-    gate_result = check_stage3_safety_gate(f"### RT-001\nCategory: 1\n\n{NO_GATE}")
+    gate_result = check_stage3_safety_gate(f"### RT-001\nCategory: 1\n\n## PRE-STAGE-4 SAFETY REVIEW\n{NO_GATE}")
     gate_path = run_context.artifact_path("stage3_safety_gate.json")
     run_context.write_stamped_json(gate_path, gate_result)
 
@@ -214,6 +217,151 @@ def test_gate_rejects_stage3_from_another_run(tmp_path):
     with pytest.raises(ValueError):
         run_context.read_stamped_json(gate_path)
     run_context.reset_active_run()
+
+
+# ---------- Section-scoping tests (required-field fix) ----------
+
+def test_complete_fields_outside_safety_section_do_not_pass():
+    """The exact adversarial case that motivated this fix: every required
+    field is present in the document, but scattered in an unrelated
+    per-payload block -- only 'Release condition' is actually inside the
+    PRE-STAGE-4 SAFETY REVIEW section. Must fail."""
+    doc = (
+        "### RT-001\n\nCategory: 2\n\n"
+        "Affected assets: System A\n"
+        "Required approving roles: RSO\n"
+        "RSO or domain-equivalent safety authority: Range Safety Officer\n"
+        "Abort authority: Red Team Lead\n"
+        "Abort criteria: Any unexpected effect\n"
+        "Maximum termination time: 15 seconds\n"
+        "Rollback or recovery procedure: Restore baseline\n\n"
+        "## PRE-STAGE-4 SAFETY REVIEW\n\n"
+        "Release condition: Phase 1 may not begin until approved.\n"
+    )
+    r = check_stage3_safety_gate(doc)
+    assert r["is_compliant"] is False
+    assert set(r["missing_fields"]) == {
+        "affected_assets", "approving_roles", "safety_authority",
+        "abort_authority", "abort_criteria", "termination_time", "rollback",
+    }
+
+
+def test_no_gate_statement_outside_safety_section_does_not_pass():
+    """The no-gate sentence appearing outside the section (e.g. stray, or
+    left over from an earlier draft) must not satisfy compliance -- it
+    has to be INSIDE the section, same requirement as CRITICAL
+    INSTRUCTION 5 places on it."""
+    doc = f"### RT-001\nCategory: 1\n\n{NO_GATE}\n\n## PRE-STAGE-4 SAFETY REVIEW\n(empty)\n"
+    r = check_stage3_safety_gate(doc)
+    assert r["is_compliant"] is False
+    assert r["explicit_not_required"] is False
+
+
+def test_empty_safety_section_fails():
+    """The heading exists, but its body is empty -- no fields, no no-gate
+    statement. Must fail with the section correctly detected as present
+    but incomplete, not silently treated as compliant."""
+    doc = "### RT-001\nCategory: 2\n\n## PRE-STAGE-4 SAFETY REVIEW\n"
+    r = check_stage3_safety_gate(doc)
+    assert r["is_compliant"] is False
+    assert r["safety_review_present"] is True
+    assert len(r["missing_fields"]) == len(STAGE3_REQUIRED_SAFETY_FIELDS)
+
+
+def test_complete_safety_section_passes_with_unrelated_fields_elsewhere():
+    """The inverse of the adversarial case: the safety-review section
+    itself is genuinely complete, AND (as CRITICAL INSTRUCTION 5 actually
+    asks for) the same fields are also legitimately repeated per-payload.
+    Duplication elsewhere in the document must not cause a false
+    rejection -- only the section's own content is what's checked."""
+    doc = (
+        "### RT-001\n\nCategory: 2\n"
+        "Affected assets: System A (per-payload copy)\n"
+        "Abort criteria: per-payload copy\n\n"
+        f"{COMPLETE_REVIEW}"
+    )
+    r = check_stage3_safety_gate(doc)
+    assert r["is_compliant"] is True
+
+
+def test_safety_section_stops_at_next_heading():
+    """Content after the NEXT markdown heading must not leak into the
+    extracted section -- otherwise a well-formed section followed by an
+    unrelated later section that happens to contain a no-gate sentence
+    (or stray field labels) could contaminate the check."""
+    doc = (
+        f"### RT-001\nCategory: 2\n\n{COMPLETE_REVIEW}\n"
+        f"## APPENDIX\n{NO_GATE}\nAffected assets: should not count\n"
+    )
+    r = check_stage3_safety_gate(doc)
+    # COMPLETE_REVIEW alone is already fully compliant -- the appendix
+    # content must have no effect on the result either way.
+    assert r["is_compliant"] is True
+    assert r["explicit_not_required"] is False, \
+        "the no-gate sentence in a LATER, unrelated section must not count"
+
+
+# ---------- Orchestration: enforce_stage3_safety_gate (real production function) ----------
+
+from src.schemas import AssessmentState, StageStatus
+from src.state import init_assessment_state, enforce_stage3_safety_gate
+
+
+def test_failed_stage3_gate_marks_stage3_fail(tmp_path):
+    state = init_assessment_state("test_run", "sha256:testhash")
+    base = str(tmp_path / "outputs_base")
+    with pytest.raises(RuntimeError, match="Stage 3 safety gate FAILED"):
+        enforce_stage3_safety_gate(state, "test_run", is_compliant=False,
+                                   summary="missing fields", base=base)
+    assert state.stages["stage3"].status == StageStatus.FAIL
+    assert state.current_stage == "stage3"
+
+
+def test_failed_stage3_gate_leaves_stage4_not_started(tmp_path):
+    """enforce_stage3_safety_gate never touches stage4's own state record
+    -- a Stage 3 gate failure must leave Stage 4 exactly as it started,
+    not implicitly marked anything."""
+    state = init_assessment_state("test_run", "sha256:testhash")
+    base = str(tmp_path / "outputs_base")
+    with pytest.raises(RuntimeError):
+        enforce_stage3_safety_gate(state, "test_run", is_compliant=False,
+                                   summary="missing fields", base=base)
+    assert state.stages["stage4"].status == StageStatus.NOT_STARTED
+
+
+def test_failed_stage3_gate_raises_before_stage4_builder(tmp_path):
+    """Proves the actual ordering property, not just that both events
+    happen to occur: build_stage4_task must never be reached when the
+    gate fails. Uses a mutable flag rather than trusting that 'it raised'
+    implies 'the next line never ran' -- this makes the assertion explicit."""
+    from src.tasks import build_stage4_task
+
+    state = init_assessment_state("test_run", "sha256:testhash")
+    base = str(tmp_path / "outputs_base")
+    stage4_builder_reached = {"value": False}
+
+    try:
+        enforce_stage3_safety_gate(state, "test_run", is_compliant=False,
+                                   summary="missing fields", base=base)
+        stage4_builder_reached["value"] = True
+        build_stage4_task(str(tmp_path), "should never get here")
+    except RuntimeError:
+        pass
+
+    assert stage4_builder_reached["value"] is False, \
+        "code reached the line after enforce_stage3_safety_gate on the failure path"
+
+
+def test_passing_stage3_gate_marks_stage3_pass(tmp_path):
+    state = init_assessment_state("test_run", "sha256:testhash")
+    base = str(tmp_path / "outputs_base")
+    enforce_stage3_safety_gate(state, "test_run", is_compliant=True,
+                               summary="compliant", base=base)
+    assert state.stages["stage3"].status == StageStatus.PASS
+    # A pass must NOT force current_stage to "complete" -- Stage 4 hasn't
+    # run yet at this point in the real pipeline; only finalize_stage4_state
+    # (called later, after stage4_crew finishes) owns that transition.
+    assert state.current_stage != "complete"
 
 
 # ---------- check_phase0_safety_gate: tightened contradiction handling ----------

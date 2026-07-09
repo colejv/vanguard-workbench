@@ -6,8 +6,11 @@ import json
 import re
 import os
 import math
+import hashlib
 
 from src import run_context
+from src.bbn_model import evaluate_bbn_model
+from src.bbn_sensitivity import run_bbn_sensitivity, canonical_json_sha256
 from src.bbn_validation import (
     validate_bbn_assessment_config,
     validate_bbn_priors_document,
@@ -1696,26 +1699,17 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     outputs/kcag_report.json is also required (Annex B must run before Annex C)
     -- this fails closed rather than substituting a fallback objective score.
 
-    Returns a human-readable report plus writes bbn_report.json under the
-    active run's output directory.
+    Returns a human-readable report plus writes bbn_report.json and
+    bbn_sensitivity.json under the active run's output directory. Deterministic
+    one-way sensitivity analysis (src.bbn_sensitivity) runs against the
+    same validated inputs before either artifact is written -- see that
+    module for the method and its documented limitations.
     """
-    from pgmpy.models import DiscreteBayesianNetwork
-    from pgmpy.factors.discrete import TabularCPD
-    from pgmpy.inference import VariableElimination
-
-    PHASE_LABELS = {0: "RECON", 1: "INITIAL ACCESS", 2: "LATERAL / PIVOT", 3: "OBJECTIVE"}
-    THRESHOLDS = [(0.20, "LOW"), (0.50, "ELEVATED"), (0.75, "HIGH"), (1.01, "CRITICAL")]
     AUDIT = []
 
     def log(node, value, source):
         AUDIT.append({"node": node, "value": value, "source": source})
         return value
-
-    def level(score):
-        for t, lbl in THRESHOLDS:
-            if score < t:
-                return lbl
-        return "CRITICAL"
 
     # ---- Parse per-run config -- REQUIRED, no silent defaults ---------------
     cfg = {}
@@ -1734,13 +1728,6 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     if not config_validation["is_valid"]:
         return format_bbn_validation_error("per-assessment configuration", config_validation)
 
-    adversary = cfg["adversary"]
-    cap_prior = adversary["capability_prior"]
-    tempo = adversary["tempo"]
-    posture = cfg["defensive_posture"]
-    geo_prior = float(cfg["geopolitical_trigger_prior"])
-    evidence = cfg.get("evidence", {})  # absent evidence = legitimate baseline state, not a hidden prior
-
     # ---- Load structural priors file (fail closed -- no embedded defaults) --
     if not os.path.exists(priors_path):
         return (f"ERROR: {priors_path} not found. Refusing to run with embedded "
@@ -1749,7 +1736,7 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
                 f"bbn_threat_score.")
     try:
         priors_document = json.load(open(priors_path))
-        priors = priors_document["priors"]
+        priors_document["priors"]  # noqa -- presence check only, see validation below
     except (json.JSONDecodeError, KeyError) as e:
         return f"ERROR: {priors_path} malformed or missing 'priors' key ({e}). Refusing to run."
 
@@ -1763,23 +1750,6 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     priors_validation = validate_bbn_priors_document(priors_document)
     if not priors_validation["is_valid"]:
         return format_bbn_validation_error(str(priors_path), priors_validation)
-
-    def prior(*path):
-        """Walk a dotted path into the priors dict. The document already
-        passed validate_bbn_priors_document() above, so every required
-        path is guaranteed present and well-shaped here -- this LookupError
-        branch is defense in depth for any prior NOT covered by that
-        validator (e.g. a genuinely new prior added to this function
-        without updating bbn_validation.py's required-field list), not the
-        primary enforcement mechanism anymore."""
-        node = priors
-        for i, key in enumerate(path):
-            if not isinstance(node, dict) or key not in node:
-                raise LookupError(f"required prior '{'.'.join(path[:i+1])}' missing from {priors_path}")
-            node = node[key]
-        if not (isinstance(node, dict) and "value" in node):
-            raise LookupError(f"prior '{'.'.join(path)}' in {priors_path} is missing its 'value' field")
-        return node["value"], node.get("source", "(no source field in priors file)")
 
     # ---- Ingest Annex B KCAG heuristic factor -- REQUIRED, fail closed -------
     kcag_path = cfg.get("kcag_report_path") or run_context.artifact_path("kcag_report.json")
@@ -1809,196 +1779,52 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
 
 
     try:
-        # ---- Defensive multiplier --------------------------------------------
-        dm_floor, dm_floor_src = prior("defensive_multiplier_floor")
-        dm_scale, dm_scale_src = prior("defensive_multiplier_scale")
-        active = sum(1 for v in posture.values() if v)
-        total = max(1, len(posture))
-        dm = max(dm_floor, 1.0 - (active / total) * dm_scale)
-        log("DefensiveMultiplier", round(dm, 4),
-            f"{active}/{total} controls active; floor={dm_floor} ({dm_floor_src}); "
-            f"scale={dm_scale} ({dm_scale_src})")
-
-        # ---- Build the DAG -----------------------------------------------------
-        # Layer 1 priors -> Layer 2 observables -> Layer 3 phase -> Layer 5 outcome
-        model = DiscreteBayesianNetwork([
-            ("AdversaryCapability", "PhishingAttempt"),
-            ("OperationalTempo", "ScanningDetected"),
-            ("AdversaryCapability", "KillChainPhase"),
-            ("PhishingAttempt", "KillChainPhase"),
-            ("ScanningDetected", "KillChainPhase"),
-            ("AuthAnomaly", "KillChainPhase"),
-            ("KillChainPhase", "IWEffectAchieved"),
-            ("DefensivePosture", "IWEffectAchieved"),
-            ("GeopoliticalTrigger", "IWEffectAchieved"),
-        ])
-
-        cpds = []
-
-        # AdversaryCapability (root, 3 states) -- analyst-supplied, required.
-        # validate_bbn_assessment_config() above already confirmed this is a
-        # valid 3-element probability distribution (finite, in [0,1], sums to
-        # 1.0 within tolerance) -- no floor/renormalize here. A valid
-        # analyst-supplied zero is meaningful and stays exactly zero; this
-        # function no longer silently modifies an otherwise-valid analyst
-        # distribution.
-        cap = [float(p) for p in cap_prior]
-        cpds.append(TabularCPD("AdversaryCapability", 3, [[cap[0]], [cap[1]], [cap[2]]]))
-        log("AdversaryCapability", cap, "adversary.capability_prior (analyst-supplied, required)")
-
-        # OperationalTempo (root, 3 states) -- distribution from priors file
-        tempo_dist, tempo_src = prior("operational_tempo_distribution", tempo)
-        cpds.append(TabularCPD("OperationalTempo", 3, [[p] for p in tempo_dist]))
-        log("OperationalTempo", tempo_dist, f"adversary.tempo={tempo}; {tempo_src}")
-
-        # PhishingAttempt | AdversaryCapability -- from priors file
-        phish_cpd, phish_src = prior("phishing_given_capability")
-        cpds.append(TabularCPD(
-            "PhishingAttempt", 2, phish_cpd,
-            evidence=["AdversaryCapability"], evidence_card=[3]))
-        log("PhishingAttempt|cap", phish_cpd, phish_src)
-
-        # ScanningDetected | OperationalTempo -- from priors file
-        scan_cpd, scan_src = prior("scanning_given_tempo")
-        cpds.append(TabularCPD(
-            "ScanningDetected", 2, scan_cpd,
-            evidence=["OperationalTempo"], evidence_card=[3]))
-        log("ScanningDetected|tempo", scan_cpd, scan_src)
-
-        # AuthAnomaly (root observable) -- from priors file
-        auth_root, auth_src = prior("auth_anomaly_root")
-        cpds.append(TabularCPD("AuthAnomaly", 2, [[auth_root[0]], [auth_root[1]]]))
-        log("AuthAnomaly", auth_root, auth_src)
-
-        # GeopoliticalTrigger (root) -- analyst-supplied, required
-        cpds.append(TabularCPD("GeopoliticalTrigger", 2,
-                               [[1 - geo_prior], [geo_prior]]))
-        log("GeopoliticalTrigger", [1 - geo_prior, geo_prior],
-            "geopolitical_trigger_prior (analyst-supplied, required)")
-
-        # DefensivePosture (root, 3 states weak/moderate/strong from active count)
-        dp_floor, dp_floor_src = prior("defensive_posture_floor")
-        frac = active / total
-        dp = [max(dp_floor, 1 - frac), 0.0, max(dp_floor, frac)]
-        dp[1] = max(0.0, 1 - dp[0] - dp[2]); s = sum(dp); dp = [p / s for p in dp]
-        cpds.append(TabularCPD("DefensivePosture", 3, [[dp[0]], [dp[1]], [dp[2]]]))
-        log("DefensivePosture", dp, f"{active}/{total} controls active; floor={dp_floor} ({dp_floor_src})")
-
-        # KillChainPhase | cap(3) x phish(2) x scan(2) x auth(2) = 24 cols, 4 states
-        kcp_base = {
-            2: prior("killchain_phase_base", "nation_state"),
-            1: prior("killchain_phase_base", "criminal"),
-            0: prior("killchain_phase_base", "hacktivist"),
-        }
-        delta_phish, delta_phish_src = prior("killchain_phase_evidence_delta_phishing")
-        delta_scan, delta_scan_src = prior("killchain_phase_evidence_delta_scanning")
-        delta_auth, delta_auth_src = prior("killchain_phase_evidence_delta_auth_anomaly")
-
-        def phase_probs(cap_i, phish, scan, auth):
-            base = list(kcp_base[cap_i][0])
-            if phish:
-                base = [b + d for b, d in zip(base, delta_phish)]
-            if scan:
-                base = [b + d for b, d in zip(base, delta_scan)]
-            if auth:
-                base = [b + d for b, d in zip(base, delta_auth)]   # auth anomaly => lateral
-            base[2] *= dm
-            base[3] *= dm * kcag_objective_score                     # KCAG-anchored
-            base = [max(0.001, b) for b in base]
-            t = sum(base)
-            return [b / t for b in base]
-
-        rows = [[], [], [], []]
-        for ci in range(3):
-            for ph in range(2):
-                for sc in range(2):
-                    for au in range(2):
-                        pr = phase_probs(ci, ph, sc, au)
-                        for k in range(4):
-                            rows[k].append(pr[k])
-        cpds.append(TabularCPD(
-            "KillChainPhase", 4, rows,
-            evidence=["AdversaryCapability", "PhishingAttempt",
-                      "ScanningDetected", "AuthAnomaly"],
-            evidence_card=[3, 2, 2, 2]))
-        log("KillChainPhase", "computed",
-            f"base rates: nation_state=({kcp_base[2][1]}), criminal=({kcp_base[1][1]}), "
-            f"hacktivist=({kcp_base[0][1]}); deltas: phishing=({delta_phish_src}), "
-            f"scanning=({delta_scan_src}), auth_anomaly=({delta_auth_src}); KCAG-anchored")
-
-        # IWEffectAchieved | phase(4) x posture(3) x geo(2) = 24 cols, 2 states
-        recon_base, recon_src = prior("iw_effect_phase_base_recon")
-        ia_base, ia_src = prior("iw_effect_phase_base_initial_access")
-        lat_base, lat_src = prior("iw_effect_phase_base_lateral")
-        conv_factor, conv_src = prior("iw_effect_objective_convergence_factor")
-        obj_cap, obj_cap_src = prior("iw_effect_objective_cap")
-        strong_mult, strong_src = prior("iw_effect_posture_multiplier_strong")
-        mod_mult, mod_src = prior("iw_effect_posture_multiplier_moderate")
-        geo_mult, geo_mult_src = prior("iw_effect_geo_multiplier")
-        geo_cap, geo_cap_src = prior("iw_effect_geo_cap")
-
-        obj_base = round(min(obj_cap, kcag_objective_score * conv_factor), 4)
-        PHASE_BASE = [
-            log("IWEffect|Recon", recon_base, recon_src),
-            log("IWEffect|InitAccess", ia_base, ia_src),
-            log("IWEffect|Lateral", lat_base, lat_src),
-            log("IWEffect|Objective", obj_base, f"{conv_src} capped by ({obj_cap_src})"),
-        ]
-
-        def iw_probs(phase, dposture, geo):
-            p = PHASE_BASE[phase]
-            if dposture == 2:   p *= strong_mult    # strong defense
-            elif dposture == 1: p *= mod_mult        # moderate
-            if geo:              p = min(geo_cap, p * geo_mult)
-            p = min(0.999, max(0.001, p))
-            return [1 - p, p]
-
-        no_, yes_ = [], []
-        for ph in range(4):
-            for dpz in range(3):
-                for g in range(2):
-                    a, b = iw_probs(ph, dpz, g)
-                    no_.append(a); yes_.append(b)
-        cpds.append(TabularCPD(
-            "IWEffectAchieved", 2, [no_, yes_],
-            evidence=["KillChainPhase", "DefensivePosture", "GeopoliticalTrigger"],
-            evidence_card=[4, 3, 2]))
-        log("IWEffectAchieved", "computed",
-            f"phase x posture ({strong_src}; {mod_src}) x geopolitical "
-            f"({geo_mult_src}; capped {geo_cap_src})")
-
+        baseline = evaluate_bbn_model(assessment_config=cfg, priors_document=priors_document,
+                                      kcag_objective_score=kcag_objective_score)
     except LookupError as e:
         return f"ERROR: {e}. Refusing to run with an incomplete priors file."
+    except ValueError as e:
+        return f"ERROR: {e}"
 
-    model.add_cpds(*cpds)
-    if not model.check_model():
-        return "ERROR: BBN failed validation (cyclic or malformed CPDs)."
+    # ---- Deterministic one-way sensitivity analysis, entirely in memory --
+    # before either artifact is written -- an unexpected scenario failure
+    # (model construction, check_model(), inference, or a non-finite
+    # result) must never leave a fresh bbn_report.json on disk beside a
+    # missing or partial bbn_sensitivity.json. EXPECTED skips (simplex/
+    # range boundary, evidence masking, failed re-validation of a
+    # perturbed candidate) are recorded as SKIPPED scenarios and do not
+    # affect this status.
+    sensitivity = run_bbn_sensitivity(assessment_config=cfg, priors_document=priors_document,
+                                      kcag_objective_score=kcag_objective_score, baseline=baseline)
+    if sensitivity["status"] != "PASS":
+        failed = [s for s in sensitivity["scenarios"] if s["status"] == "FAIL"]
+        return (f"ERROR: BBN sensitivity analysis reported unexpected scenario failure(s): "
+                f"{[s['scenario_id'] for s in failed]}. First failure: "
+                f"{failed[0]['reason'] if failed else '(no detail)'}. "
+                f"Neither bbn_report.json nor bbn_sensitivity.json was written.")
 
-    infer = VariableElimination(model)
+    # ---- Source identity: canonical hash for the in-memory assessment
+    # config (no fixed byte representation of its own), exact byte hashes
+    # for the two real files on disk -- makes both artifacts auditable and
+    # prevents confusion after inputs change. ----
+    assessment_config_sha256 = canonical_json_sha256(cfg)
+    priors_file_sha256 = "sha256:" + hashlib.sha256(open(priors_path, "rb").read()).hexdigest()
+    kcag_report_sha256 = "sha256:" + hashlib.sha256(open(kcag_path, "rb").read()).hexdigest()
 
-    # ---- Filter evidence to valid nodes/states ------------------------------
-    valid_nodes = set(model.nodes())
-    ev = {k: int(v) for k, v in evidence.items() if k in valid_nodes}
-
-    score = float(infer.query(["IWEffectAchieved"], evidence=ev).values[1])
-    phase_dist = infer.query(["KillChainPhase"], evidence=ev).values
-    phase_idx = int(phase_dist.argmax())
-
-    # ---- Baseline (no evidence) for delta ----------------------------------
-    base_score = float(infer.query(["IWEffectAchieved"]).values[1])
+    cpd_audit_log = AUDIT + baseline.cpd_audit_log
 
     report = {
-        "threat_score": round(score, 4),
-        "threat_level": level(score),
-        "baseline_score": round(base_score, 4),
-        "delta_from_baseline": round(score - base_score, 4),
-        "likely_phase": PHASE_LABELS[phase_idx],
-        "phase_distribution": {PHASE_LABELS[i]: round(float(phase_dist[i]), 4)
-                               for i in range(4)},
-        "evidence_applied": ev,
-        "kcag_objective_score": round(kcag_objective_score, 4),
+        "threat_score": baseline.threat_score,
+        "threat_level": baseline.threat_level,
+        "baseline_score": baseline.baseline_score,
+        "delta_from_baseline": baseline.delta_from_baseline,
+        "likely_phase": baseline.likely_phase,
+        "phase_distribution": {label: baseline.phase_distribution[i]
+                               for i, label in enumerate(["RECON", "INITIAL ACCESS", "LATERAL / PIVOT", "OBJECTIVE"])},
+        "evidence_applied": baseline.evidence_applied,
+        "kcag_objective_score": baseline.kcag_objective_score,
         "kcag_used_legacy_field": kcag_score_result["used_legacy_field"],
-        "defensive_multiplier": round(dm, 4),
+        "defensive_multiplier": baseline.defensive_multiplier,
         "priors_file": priors_path,
         "validation": {
             "assessment_config": {
@@ -2017,22 +1843,60 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
             # silently modified.
             "silent_normalization": False,
         },
-        "cpd_audit_log": AUDIT,
+        "cpd_audit_log": cpd_audit_log,
     }
     bbn_report_path = run_context.artifact_path("bbn_report.json")
+
+    sensitivity_report = dict(sensitivity)
+    sensitivity_report["source_identity"] = {
+        "assessment_config_sha256": assessment_config_sha256,
+        "priors_sha256": priors_file_sha256,
+        "kcag_report_sha256": kcag_report_sha256,
+    }
+    sensitivity_path = run_context.artifact_path("bbn_sensitivity.json")
+
+    # Both succeeded -- write both artifacts. Neither is written until both
+    # are ready, so a run can never end with one fresh artifact beside a
+    # missing or stale one.
     run_context.write_stamped_json(bbn_report_path, report)
+    run_context.write_stamped_json(sensitivity_path, sensitivity_report)
+
+    driver_lines = []
+    for i, d in enumerate(sensitivity["driver_summary"][:5], start=1):
+        driver_lines.append(f"{i}. {d['parameter']} — max |\u0394| {d['maximum_absolute_delta']:.4f}")
+    n_pass = sum(1 for s in sensitivity["scenarios"] if s["status"] == "PASS")
+    n_skip = sum(1 for s in sensitivity["scenarios"] if s["status"] == "SKIPPED")
 
     lines = [
         "=== ANNEX C: BBN THREAT ASSESSMENT ===",
-        f"Threat Score:  {score:.4f}  ({level(score)})",
-        f"Baseline:      {base_score:.4f}  (delta {score-base_score:+.4f})",
-        f"Likely Phase:  {PHASE_LABELS[phase_idx]}",
-        f"KCAG heuristic factor: {kcag_objective_score:.4f}   Defensive mult: {dm:.3f}",
+        f"Threat Score:  {baseline.threat_score:.4f}  ({baseline.threat_level})",
+        f"Baseline:      {baseline.baseline_score:.4f}  (delta {baseline.delta_from_baseline:+.4f})",
+        f"Likely Phase:  {baseline.likely_phase}",
+        f"KCAG heuristic factor: {baseline.kcag_objective_score:.4f}   Defensive mult: {baseline.defensive_multiplier:.3f}",
         "Phase distribution:",
-        *[f"  {PHASE_LABELS[i]:16s} {float(phase_dist[i]):.4f}" for i in range(4)],
-        f"Evidence applied: {ev or '(none — baseline)'}",
+        *[f"  {label:16s} {baseline.phase_distribution[i]:.4f}"
+          for i, label in enumerate(["RECON", "INITIAL ACCESS", "LATERAL / PIVOT", "OBJECTIVE"])],
+        f"Evidence applied: {baseline.evidence_applied or '(none — baseline)'}",
         f"Priors file: {priors_path}",
-        f"CPD audit entries: {len(AUDIT)} (full log in {bbn_report_path})",
+        f"CPD audit entries: {len(cpd_audit_log)} (full log in {bbn_report_path})",
+        "",
+        "=== BBN SENSITIVITY ANALYSIS ===",
+        "Method: deterministic one-way stress scenarios",
+        f"Scenarios executed: {n_pass}",
+        f"Scenarios skipped: {n_skip}",
+        f"Threat score range: {sensitivity['global_summary']['score_minimum']:.4f} \u2013 "
+        f"{sensitivity['global_summary']['score_maximum']:.4f}",
+        f"Baseline threat score: {baseline.threat_score:.4f}",
+        f"Threat classification stable: {'YES' if sensitivity['global_summary']['classification_stable'] else 'NO'}",
+        "",
+        "Top drivers:",
+        *(driver_lines or ["  (no scenarios executed)"]),
+        "",
+        f"Report written: {sensitivity_path}",
+        "",
+        "These are deterministic stress results, not statistical",
+        "confidence intervals or empirical forecasts.",
+        "",
         "STATUS: SUCCESS",
     ]
     return "\n".join(lines)

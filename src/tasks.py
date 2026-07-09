@@ -311,13 +311,28 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
             "scaling factor.\n\n"
             "Report the tool output verbatim: threat score, level, baseline delta, phase "
             "distribution. The BBN is acyclic by construction; if the tool reports a "
-            "validation error, report it verbatim and do not fabricate a score."
+            "validation error, report it verbatim and do not fabricate a score.\n\n"
+            "The tool also runs deterministic one-way sensitivity analysis and reports it "
+            "in the same output, in addition to the baseline result above. After the "
+            "baseline BBN result, report the sensitivity summary exactly as returned by "
+            "the tool. Explain:\n"
+            "  - which inputs produced the largest absolute change;\n"
+            "  - whether the threat-level classification changed;\n"
+            "  - which parameters were masked by supplied evidence;\n"
+            "  - which scenarios were skipped and why;\n"
+            "  - that the results are one-way deterministic stress tests;\n"
+            "  - that interaction effects and statistical uncertainty were not measured.\n"
+            "Do not recalculate or replace the tool's driver ranking, and do not call the "
+            "sensitivity range a confidence interval or infer empirical calibration from "
+            "classification stability."
         ),
         expected_output=(
             "Either a blocking-gap report naming the specific missing input(s) and what "
             "the analyst needs to supply, OR the verbatim BBN threat score, level, phase "
             "distribution, and CPD audit reference — preceded by a short table or list "
-            "showing each per-assessment input's value and source."
+            "showing each per-assessment input's value and source — followed by the "
+            "sensitivity analysis summary (top drivers, classification stability, masked "
+            "and skipped scenarios, and the stated methodological limitations)."
         ),
         agent=modeler,
         context=[] if "t_annexC" in resume_context else [t_annexB],

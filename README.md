@@ -780,6 +780,7 @@ outputs/vaf_20260709_143022/
 ├── kcag_report.json
 ├── annexC_bbn.md
 ├── bbn_report.json
+├── bbn_sensitivity.json
 ├── stage3.md
 ├── stage3_safety_gate.json
 ├── stage4_mission_plan.md
@@ -1046,6 +1047,7 @@ Outputs:
 ```text
 annexC_bbn.md
 bbn_report.json
+bbn_sensitivity.json
 ```
 
 Annex C consumes the maximum KCAG objective traversal score as a heuristic scaling factor in the fixed BBN — read via `extract_kcag_objective_score()`, which accepts either the current `top_path_score` field or the legacy `top_path_prob` field and records in the CPD audit log which one it used. The KCAG graph is not converted into the Bayesian network, and the traversal score is not itself a Bayesian prior; it scales specific CPD values the same way the other per-assessment inputs do. A `kcag_report.json` with conflicting current and legacy score values, or a score outside `[0.0, 1.0]`, fails Annex C closed rather than silently picking one.
@@ -1067,6 +1069,31 @@ A Bayesian result is conditional on:
 * The analyst assumptions
 
 It should not be treated as objective ground truth.
+
+### BBN sensitivity analysis
+
+After the baseline BBN result, Annex C runs deterministic one-way sensitivity analysis: change exactly one input or model parameter, rebuild the complete BBN, run inference with the same evidence as the baseline, compare against the baseline, then restore and move to the next scenario. No Monte Carlo, no random sampling, no Sobol indices, no correlated variation — those require defensible parameter distributions this codebase does not yet have.
+
+Scenarios cover:
+
+* `adversary.capability_prior` — each of the three states (hacktivist/criminal/nation-state) shifted ±10% of the probability simplex, taking or releasing mass proportionally from the other two states
+* `adversary.tempo` — the other two categorical states
+* Each `defensive_posture` control — toggled independently
+* `geopolitical_trigger_prior` and the KCAG objective traversal score — ±0.10, clipped to `[0.0, 1.0]`
+* Twelve scalar model priors (defensive multiplier floor/scale, IW-effect phase bases, the objective convergence factor and cap, posture multipliers, geopolitical multiplier and cap) — perturbed by 10% of their validated range where bounded, or ±10% relative where only a lower bound exists
+
+Observed evidence is held fixed across every scenario — it is not an uncertain prior, and varying it would be a different method (counterfactual-evidence analysis). A scenario is recorded `SKIPPED`, with a stated reason, whenever: a perturbation would cross a simplex or range boundary already at its edge, supplied evidence fixes the node being varied (`AdversaryCapability` masks capability-prior scenarios, `GeopoliticalTrigger` masks geopolitical-prior scenarios), or the perturbed candidate fails the same deterministic validator (`src/bbn_validation.py`) real inputs must pass — the validator is never weakened to let a scenario through. An unexpected failure (model construction, `check_model()`, inference, or a non-finite result) is distinct from an expected skip: it marks the whole sensitivity run `FAIL`, and neither `bbn_report.json` nor `bbn_sensitivity.json` is written for that run.
+
+Output:
+
+```text
+outputs/<run_id>/bbn_sensitivity.json
+```
+
+Scenarios are ranked by parameter using maximum absolute threat-score change, with a deterministic tie-break by parameter name. The report also states whether the qualitative threat-level classification (`LOW`/`ELEVATED`/`HIGH`/`CRITICAL`) stayed stable across every executed scenario — stability here means only that none of these specific deterministic stress tests crossed a classification boundary, not proof of general model robustness. The report records exact source hashes for the assessment configuration, the priors file, and the KCAG report it was computed against, plus the versioned perturbation policy, so a report can always be tied back to the exact inputs that produced it.
+
+> [!IMPORTANT]
+> These are deterministic stress perturbations, not confidence intervals, error margins, standard deviations, or credible intervals. The Quantitative Threat Modeler is instructed to report the tool's own ranking and summary without recalculating or reframing it as a statistical estimate.
 
 ### Quantitative Threat Modeler
 
@@ -1386,7 +1413,7 @@ Current limitations include:
 
 * A read-only Quantitative Threat Modeler review of the KCAG graph exists (`model_assumptions.md`), but its disposition (ACCEPT / ACCEPT WITH CAVEATS / RECOMMEND STAGE 2 REGENERATION) is advisory only — never parsed or acted on programmatically, and never blocks Annex B.
 * The BBN contains analyst-judgment template priors that require case-specific review.
-* BBN sensitivity analysis is not yet implemented.
+* BBN sensitivity analysis is deterministic one-way perturbation only (no Monte Carlo, no joint/correlated scenarios, no CPD-matrix or probability-vector-prior perturbation yet).
 * Stage 3 remains a free-form Markdown artifact.
 * There is no deterministic Stage 3 test-plan validator for general structure (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria as a whole) — only the pre-Stage-4 safety-review fields are deterministically checked.
 * The final defense-in-depth safety check still runs after the Stage 4 human-input prompt, so it cannot intercept that specific approval (the pre-Stage-4 gate is what actually runs before it, and does intercept).
@@ -1701,7 +1728,6 @@ Vanguard Workbench is an advanced research prototype.
 The current development priorities are:
 
 * Make the Quantitative KCAG review's disposition enforceable (a human-approved blocking path when it recommends Stage 2 regeneration, rather than advisory-only)
-* Add BBN sensitivity analysis (deterministic numeric validation of per-assessment inputs and priors is already implemented — `src/bbn_validation.py`)
 * Convert Stage 3 into structured test-plan drafting
 * Add a general-purpose Stage 3 test-plan structure validator (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria) — separate from the pre-Stage-4 safety-review gate, which only checks Category 2/3 safety fields
 * Update Purple Team tools to consume run-scoped artifacts directly

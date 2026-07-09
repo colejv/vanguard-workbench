@@ -1,4 +1,7 @@
 from crewai import Task
+import json
+import os
+from src import run_context
 from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
 from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
@@ -508,3 +511,188 @@ def build_stage4_task(out_dir: str, stage3_content: str) -> Task:
         human_input=True,
         output_file=f"{out_dir}/stage4_mission_plan.md",
     )
+
+
+def build_kcag_review_task(out_dir: str, *, stage2_graph: dict, validation_report: dict) -> Task:
+    """
+    Constructs a READ-ONLY Quantitative Threat Modeler review of the
+    Stage 2 KCAG graph -- analytical coherence, not structural validity
+    (that's validate_kcag()'s job, already done by the time this is
+    called) and not framework-ID correctness (verify_stage2_vectors()'s
+    job). The review is advisory in this version: it cannot mutate the
+    graph, cannot block Annex B, and Annex B never receives it as
+    context, so the reviewer's prose can never influence the
+    deterministic KCAG math.
+
+    stage2_graph and validation_report must be the ALREADY-VERIFIED
+    dicts returned by run_context.read_stamped_json() on the active
+    run's real stage2_vectors.json / kcag_validation.json -- not raw
+    file content, and never data the caller merely believes is current.
+
+    Raises ValueError if either input is empty/falsy, or if the supplied
+    validation_report itself reports is_valid=False -- a review task
+    must never be constructed for a graph that failed deterministic
+    validation; the caller broke the sequencing contract if it gets that
+    far. This is the KCAG-review-specific equivalent of
+    build_stage4_task's "empty Stage 3 content" guard.
+
+    IMPORTANT KNOWN LIMITATION: tools=[] below does NOT actually strip
+    tool access at runtime. CrewAI's own Task model has an unconditional
+    post-construction validator (crewai/task.py, check_tools()) that
+    falls back to the ASSIGNED AGENT's tools whenever a task's own tools
+    list is empty -- "if not self.tools and self.agent and
+    self.agent.tools: self.tools = self.agent.tools". Since modeler owns
+    kcag_min_cut and bbn_threat_score, this task ends up with both
+    available at runtime regardless of the tools=[] passed here,
+    confirmed directly against the installed crewai version. There is no
+    parameter to opt out of that fallback while keeping agent=modeler.
+    "Read-only" is therefore enforced at the PROMPT level only ("Do not
+    perform NetworkX calculations" below) for this task, same as several
+    other behavioral constraints elsewhere in this codebase (e.g. "do
+    not invent priors") -- not a mechanical guarantee. tools=[] is kept
+    here anyway as correct documented intent, in case a future CrewAI
+    version respects it, but should not be read as an actual restriction
+    today.
+    """
+    if not stage2_graph:
+        raise ValueError("KCAG review requires the verified Stage 2 graph.")
+    if not validation_report:
+        raise ValueError("KCAG review requires the deterministic validation report.")
+    if not validation_report.get("is_valid"):
+        raise ValueError(
+            "KCAG review cannot be constructed for a graph that failed "
+            "deterministic validation."
+        )
+
+    graph_json = json.dumps(stage2_graph, indent=2, sort_keys=True)
+    validation_json = json.dumps(validation_report, indent=2, sort_keys=True)
+
+    return Task(
+        description=(
+            "Perform a READ-ONLY quantitative and semantic review of the "
+            "validated Kill Chain Attack Graph below.\n\n"
+            "You must not add, remove, rewrite, repair, or reorder any graph "
+            "node or edge. You must not invent framework identifiers, "
+            "components, probabilities, prerequisites, or evidence.\n\n"
+            "=== VERIFIED STAGE 2 GRAPH ===\n"
+            f"{graph_json}\n"
+            "=== END VERIFIED STAGE 2 GRAPH ===\n\n"
+            "=== DETERMINISTIC KCAG VALIDATION REPORT ===\n"
+            f"{validation_json}\n"
+            "=== END VALIDATION REPORT ===\n\n"
+            "Review the graph for analytical coherence. Examine:\n"
+            "1. Edge direction and prerequisite logic.\n"
+            "2. Whether goals represent meaningful terminal effects.\n"
+            "3. Whether privilege transitions are plausible.\n"
+            "4. Whether countermeasure placement is logically coherent.\n"
+            "5. Whether cycles require explanation or temporal modeling.\n"
+            "6. Whether difficulty labels are consistent with described "
+            "preconditions.\n"
+            "7. Whether effect labels match the described transition.\n"
+            "8. Whether graph branches appear redundant or contradictory.\n"
+            "9. Which conclusions depend on unsupported assumptions.\n"
+            "10. What the graph cannot establish from topology alone.\n\n"
+            "Do not repeat framework-ID verification. That was completed by "
+            "the deterministic Stage 2 verifier.\n\n"
+            "Do not call kcag_min_cut or bbn_threat_score, and do not perform "
+            "or reproduce their NetworkX or Bayesian calculations yourself in "
+            "any form. Annex B performs those calculations using the "
+            "authoritative Stage 2 artifact immediately after this review, "
+            "and this review's disposition does not gate or alter that "
+            "calculation in this version -- your job here is qualitative "
+            "reading of the graph already provided above, nothing "
+            "computational.\n\n"
+            "When a concern exists, cite the exact node IDs, edge endpoints, "
+            "and vector IDs involved. Never describe a concern without "
+            "identifying the affected graph elements.\n\n"
+            "State explicit assumptions and their basis, and state plainly "
+            "what the graph's topology alone cannot establish -- e.g. it "
+            "does not establish real-world empirical attack-success "
+            "probability, and KCAG traversal values are heuristic scores, "
+            "not calibrated probabilities.\n\n"
+            "Use one of these review dispositions, stated exactly:\n"
+            "- ACCEPT\n"
+            "- ACCEPT WITH CAVEATS\n"
+            "- RECOMMEND STAGE 2 REGENERATION\n\n"
+            "The disposition is advisory in this version. It does not mutate "
+            "the graph and does not automatically stop Annex B."
+        ),
+        expected_output=(
+            "A read-only quantitative review saved as model_assumptions.md, "
+            "with a disposition, graph-specific findings citing exact node/"
+            "edge/vector IDs, explicit assumptions, limitations, and "
+            "recommended analyst actions."
+        ),
+        agent=modeler,
+        tools=[],
+        context=[],
+        human_input=False,
+        output_file=f"{out_dir}/model_assumptions.md",
+    )
+
+
+def build_analysis_tasks(
+    *,
+    t_kcag_review=None,
+    t_annexB,
+    t_annexC,
+    t_stage3,
+    annexB_done: bool,
+    annexC_done: bool,
+) -> list:
+    """
+    Pure task-list assembly for analysis_crew -- no I/O, no run_context
+    dependency, so the crew-ordering contract (KCAG review runs before
+    Annex B, both skipped together on resume when Annex B is already
+    done, Annex C and Stage 3 follow their own independent resume rules)
+    is directly testable against real Task objects rather than
+    reproduced separately in a test.
+
+    t_kcag_review is only required (non-None) when annexB_done is False
+    -- crew.py only constructs it in that branch, since building it
+    needs real verified-artifact reads that are wasted work when Annex B
+    won't run this invocation anyway.
+    """
+    tasks = []
+    if not annexB_done:
+        tasks.append(t_kcag_review)
+        tasks.append(t_annexB)
+    if not annexC_done:
+        tasks.append(t_annexC)
+    tasks.append(t_stage3)
+    return tasks
+
+
+def finalize_kcag_review_artifact(review_was_required: bool):
+    """
+    Single production implementation of the KCAG review artifact's
+    fail-closed finalization -- crew.py and the test suite both call this
+    directly, same reasoning as finalize_stage4_state and
+    enforce_stage3_safety_gate: a test that reproduces "check existence,
+    stamp, read" locally instead of calling this function can pass even
+    if crew.py's actual wiring forgot to call it at all.
+
+    review_was_required mirrors whether t_kcag_review was constructed
+    this invocation (i.e. Annex B is about to run) -- when False, this is
+    a no-op, since a skipped-on-resume review has nothing to finalize.
+
+    Enforces the artifact's EXISTENCE and run/corpus IDENTITY only. The
+    review's disposition (ACCEPT / ACCEPT WITH CAVEATS / RECOMMEND STAGE
+    2 REGENERATION) is advisory in this version and is never inspected
+    here -- all three pass this check identically.
+
+    Returns the artifact path when a review was required and finalized,
+    else None. Raises RuntimeError if the artifact is missing.
+    """
+    if not review_was_required:
+        return None
+
+    model_assumptions_path = run_context.artifact_path("model_assumptions.md")
+    if not os.path.exists(model_assumptions_path):
+        raise RuntimeError(
+            "The Quantitative Threat Modeler did not produce "
+            f"{model_assumptions_path}."
+        )
+    run_context.stamp_prose_file(model_assumptions_path)
+    run_context.read_stamped_prose(model_assumptions_path)
+    return model_assumptions_path

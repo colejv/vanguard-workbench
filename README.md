@@ -86,6 +86,10 @@ Stage 2 — Attack-surface mapping
         ↓
 Deterministic framework verification
         ↓
+Deterministic KCAG structural validation
+        ↓
+Read-only quantitative KCAG review
+        ↓
 Annex B — Kill Chain Attack Graph
         ↓
 Annex C — Bayesian threat model
@@ -719,10 +723,11 @@ Vanguard detects completed artifacts and can skip eligible completed work, inclu
 * Stage 0
 * Stage 1
 * Stage 2
+* The quantitative KCAG review (tied to Annex B's own skip decision — see below)
 * Annex B
 * Annex C
 
-Stage 3 and Stage 4 are intentionally executed again because they contain human approval prompts.
+Stage 3 and Stage 4 are intentionally executed again because they contain human approval prompts. The two deterministic Stage 2 gates (framework-ID verification and KCAG structural validation) also always rerun regardless of resume state — they're cheap, and their result depends only on the Stage 2 artifact already on disk.
 
 ### Resume safety
 
@@ -770,6 +775,7 @@ outputs/vaf_20260709_143022/
 ├── stage2_vectors.json
 ├── stage2_verification.md
 ├── kcag_validation.json
+├── model_assumptions.md
 ├── annexB_kcag.md
 ├── kcag_report.json
 ├── annexC_bbn.md
@@ -966,6 +972,33 @@ When structural validation fails:
 * Stage 2 is marked as failed, even if the framework-ID gate above passed.
 * Annex B does not run.
 * Downstream stages are blocked.
+
+### Quantitative KCAG review
+
+After deterministic KCAG validation passes, the Quantitative Threat Modeler performs a read-only semantic review of the graph before Annex B runs.
+
+The distinction from the two deterministic gates above:
+
+```text
+verify_stage2_vectors()   Are the technique IDs real and correctly formatted?
+validate_kcag()           Is the graph structurally well-formed?
+Quantitative KCAG review  Does the graph appear analytically coherent?
+```
+
+A graph can pass both deterministic checks and still be conceptually questionable — an edge pointing in the wrong prerequisite direction, a countermeasure positioned as though it enables an attack, difficulty labels that contradict the described preconditions, and so on. The review examines edge direction, goal semantics, privilege-transition plausibility, countermeasure placement, cycle interpretation, and unsupported assumptions. It cites the specific node IDs, edge endpoints, and vector IDs behind any finding.
+
+The reviewer cannot add, remove, rewrite, or reorder any graph node or edge, does not repeat framework-ID verification, and does not perform or reproduce the NetworkX/Bayesian calculations Annex B performs. It closes with one of three dispositions: `ACCEPT`, `ACCEPT WITH CAVEATS`, or `RECOMMEND STAGE 2 REGENERATION`.
+
+The result is written to:
+
+```text
+outputs/<run_id>/model_assumptions.md
+```
+
+**The review is advisory in this version.** The disposition is not parsed or acted on programmatically — all three outcomes let Annex B proceed identically, using the original, unchanged, deterministically-validated Stage 2 graph. What's enforced is that the artifact exists and is bound to the current run and corpus, not what it concludes. A later commit may add a human-approved blocking disposition once the report format has been exercised against real assessments.
+
+> [!NOTE]
+> This task is assigned to `modeler` (the Quantitative Threat Modeler) with no tools declared, but CrewAI's own `Task` model falls back to an agent's full tool list whenever a task's own tool list is empty. In practice this means the task has `kcag_min_cut` and `bbn_threat_score` technically available at runtime. "Read-only" for this task is a prompt-level instruction ("do not call these tools, do not perform these calculations"), not a mechanical restriction — worth knowing if you're auditing what this agent could theoretically do versus what it's instructed to do.
 
 ### Annex B — Kill Chain Attack Graph
 

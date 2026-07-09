@@ -2,11 +2,13 @@ from crewai import Crew, Process, Task
 import sys, os
 from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
-from src.tasks import build_tasks, build_stage4_task
+from src.tasks import (build_tasks, build_stage4_task, build_kcag_review_task,
+                       build_analysis_tasks, finalize_kcag_review_artifact)
 from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
                        discover_corpus_files, read_corpus_file,
                        check_attribution_boundary, check_phase0_safety_gate,
-                       check_stage3_safety_gate, verify_stage2_vectors)
+                       check_stage3_safety_gate, verify_stage2_vectors,
+                       validate_kcag)
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status,
@@ -439,7 +441,7 @@ if __name__ == "__main__":
     state.current_stage = "stage2"
     save_assessment_state(state, run_id)
 
-    # ---- DETERMINISTIC GATE (plain Python — the actual enforcement point) ----
+    # ---- GATE 1 OF 2: FRAMEWORK-ID VERIFICATION (plain Python) ----
     # No vectors_path passed -- verify_stage2_vectors resolves it via
     # run_context automatically now, same as every other tool.
     verification = verify_stage2_vectors(index_path="corpus-index/technique_index.json")
@@ -455,34 +457,80 @@ if __name__ == "__main__":
             f.write(f"- GAP edge[{ge['edge_index']}] `{ge['technique']}`\n")
     run_context.stamp_prose_file(stage2_verification_path)
 
-    # Register stage2_vectors.json in the audit trail regardless of outcome,
-    # then promote/demote its status from the gate's actual verdict — same
-    # two-step pattern (commit PENDING, then set_stage_status) used above.
+    # Register stage2_vectors.json in the audit trail regardless of outcome.
+    # Stage 2 is deliberately NOT promoted to PASS here anymore -- only
+    # FAIL on this gate's own failure. PASS now requires BOTH this ID gate
+    # AND the structural gate below to succeed; promoting early here (the
+    # previous behavior) meant "Stage 2: PASS" only ever reflected
+    # framework-ID correctness, never graph structure.
     stage2_vectors_path = run_context.artifact_path("stage2_vectors.json")
     if os.path.exists(stage2_vectors_path):
         commit_stage_output(state, "stage2", stage2_vectors_path, status=StageStatus.PENDING)
-    set_stage_status(state, "stage2", StageStatus.PASS if verification["is_valid"] else StageStatus.FAIL)
-    save_assessment_state(state, run_id)
-
     if not verification["is_valid"]:
+        set_stage_status(state, "stage2", StageStatus.FAIL)
+        save_assessment_state(state, run_id)
         raise RuntimeError(
             f"Stage 2 verification FAILED: {verification['summary']} "
             f"See {stage2_verification_path}. Annex B and downstream NOT executed. "
             f"Run audit trail: {out_dir}/assessment_state.json"
         )
+    save_assessment_state(state, run_id)
 
-    # ---- ANALYSIS CREW: Annex B, Annex C, Stage 3 (Stage 4 is now a
-    # separate crew — see below) ----
+    # ---- GATE 2 OF 2: KCAG STRUCTURAL VALIDATION (plain Python) ----
+    # A separate, non-overlapping check from the ID gate above: this one
+    # verifies graph structure and internal consistency (ADV_START is the
+    # sole root, every goal is reachable, no duplicate directed edges,
+    # etc.) and does NOT verify framework technique IDs at all -- that
+    # stays exclusively the ID gate's job. Neither gate mutates
+    # stage2_vectors.json; Annex B always reads the same original stamped
+    # artifact regardless of which gates ran.
+    kcag_validation = validate_kcag()
+    kcag_validation_path = run_context.artifact_path("kcag_validation.json")
+    run_context.write_stamped_json(kcag_validation_path, kcag_validation)
+    print(f"KCAG structural validation: {kcag_validation['status']} — {kcag_validation['summary']}")
+
+    if not kcag_validation["is_valid"]:
+        set_stage_status(state, "stage2", StageStatus.FAIL)
+        save_assessment_state(state, run_id)
+        raise RuntimeError(
+            f"KCAG structural validation FAILED: {kcag_validation['summary']} "
+            f"See {kcag_validation_path}. Annex B and downstream NOT executed. "
+            f"Run audit trail: {out_dir}/assessment_state.json"
+        )
+
+    # Both gates passed.
+    set_stage_status(state, "stage2", StageStatus.PASS)
+    save_assessment_state(state, run_id)
+
+    # ---- ANALYSIS CREW: KCAG review, Annex B, Annex C, Stage 3 (Stage 4
+    # is now a separate crew — see below) ----
     # Stage 3 is never skipped on resume (see detect_resume_progress) --
     # it's a human_input=True gate the analyst re-approves fresh every
     # time, and is very often exactly the stage BEING resumed to (e.g.
     # after correcting its prompt), never one to skip past.
-    analysis_tasks = []
+    #
+    # The KCAG review is tied to Annex B's own resume rule: it only runs
+    # when Annex B is about to run this invocation. Re-reading through
+    # read_stamped_json() here (not reusing the in-memory kcag_validation
+    # dict from the gate above) matches this codebase's established
+    # verify-by-reading-back convention rather than trusting an in-memory
+    # value, even though both would agree in this same process.
+    t_kcag_review = None
     if not annexB_done:
-        analysis_tasks.append(t_annexB)
-    if not annexC_done:
-        analysis_tasks.append(t_annexC)
-    analysis_tasks.append(t_stage3)
+        stage2_graph = run_context.read_stamped_json(stage2_vectors_path)
+        validation_report = run_context.read_stamped_json(kcag_validation_path)
+        t_kcag_review = build_kcag_review_task(
+            out_dir, stage2_graph=stage2_graph, validation_report=validation_report
+        )
+
+    analysis_tasks = build_analysis_tasks(
+        t_kcag_review=t_kcag_review,
+        t_annexB=t_annexB,
+        t_annexC=t_annexC,
+        t_stage3=t_stage3,
+        annexB_done=annexB_done,
+        annexC_done=annexC_done,
+    )
 
     print(f"analysis_crew will run {len(analysis_tasks)} task(s): "
           f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in analysis_tasks]}")
@@ -500,6 +548,13 @@ if __name__ == "__main__":
             "file_count": c_count,
             "corpus_version": c_version,
         })
+
+    # ---- FINALIZE KCAG REVIEW ARTIFACT (advisory; existence enforced,
+    # content is not) ----
+    # See finalize_kcag_review_artifact()'s docstring in tasks.py for why
+    # this is a shared helper rather than inline logic, and for what
+    # exactly is/isn't enforced.
+    finalize_kcag_review_artifact(review_was_required=t_kcag_review is not None)
 
     # ---- VERIFY STAGE 3 BEFORE STAGE 4 CAN EVEN BE CONSTRUCTED ----
     # This is the actual trust boundary the crew split exists to create.

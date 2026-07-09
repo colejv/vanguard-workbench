@@ -94,7 +94,11 @@ Annex B — Kill Chain Attack Graph
         ↓
 Annex C — Bayesian threat model
         ↓
+Deterministic BBN sensitivity analysis
+        ↓
 Stage 3 — Human-reviewed test concepts
+        ↓
+Deterministic structured Stage 3 test-plan validation
         ↓
 Deterministic pre-Stage-4 safety gate
         ↓
@@ -649,13 +653,14 @@ The pipeline will:
 12. Generate Stage 2 attack vectors and graph topology.
 13. Verify Stage 2 framework identifiers.
 14. Halt if Stage 2 verification fails.
-15. Run Annex B KCAG analysis.
-16. Run Annex C Bayesian inference.
+15. Run Annex B KCAG analysis, including deterministic structural validation (`validate_kcag`) and a read-only quantitative review.
+16. Run Annex C Bayesian inference, including deterministic one-way sensitivity analysis.
 17. Request human review for Stage 3.
-18. Run the deterministic pre-Stage-4 safety gate. Halt before Stage 4 is even constructed if it fails.
-19. Request human review for Stage 4 — only reached if the gate above passed.
-20. Run the final defense-in-depth Phase 0 safety-language check.
-21. Preserve the artifacts in the run directory.
+18. Validate the structured Stage 3 test plan against the real Stage 2 graph, KCAG report, and technique index. Halt before the pre-Stage-4 safety gate if it fails.
+19. Run the deterministic pre-Stage-4 safety gate. Halt before Stage 4 is even constructed if it fails.
+20. Request human review for Stage 4 — only reached if the gate above passed.
+21. Run the final defense-in-depth Phase 0 safety-language check.
+22. Preserve the artifacts in the run directory.
 
 ### Human-input prompts
 
@@ -1108,7 +1113,7 @@ The agent also distinguishes deterministic calculations from configured heuristi
 Mathematical consistency does not establish that a model accurately represents the real system. KCAG and BBN results require review by both a quantitative specialist and a system-domain expert.
 
 > [!NOTE]
-> This agent does not yet perform semantic validation of the KCAG graph itself (structural correctness, reachability, cycle detection beyond what NetworkX reports). That capability is planned as a separate, read-only `validate_kcag` addition — see [Current Limitations](#current-limitations).
+> Graph-theoretic structural validation (`validate_kcag` — node/edge integrity, `ADV_START` as sole root, goal reachability, no duplicate edges) and a read-only analytical review by this agent (`model_assumptions.md`, disposition `ACCEPT` / `ACCEPT WITH CAVEATS` / `RECOMMEND STAGE 2 REGENERATION`) both run as part of Annex B, described above. The review's disposition remains advisory only; it is never parsed or acted on programmatically, and never blocks Annex B — see [Current Limitations](#current-limitations).
 
 ### Stage 3 — Human-reviewed test concepts
 
@@ -1348,11 +1353,16 @@ python -c "import src.crew"
 
 The current test suite includes coverage for:
 
-* Pydantic schemas
-* Stage 0 and Stage 1 schemas
-* Assessment state behavior
-* Stage 0 and Stage 1 tools
-* Crew and state integration
+* Pydantic schemas (Stage 0, Stage 1, and the structured Stage 3 test-plan schema)
+* Stage 0 and Stage 1 tools and writer validation
+* Assessment state behavior and crew/state integration
+* The Stage 3 / Stage 4 crew split, including the pre-Stage-4 trust boundary
+* KCAG structural validation (`validate_kcag`), the read-only quantitative review task, and the KCAG probability-to-heuristic-score terminology migration (including legacy-report compatibility)
+* The Quantitative Threat Modeler agent's role and tooling
+* Deterministic numeric validation of BBN per-assessment inputs and priors (`src/bbn_validation.py`), including the pure BBN evaluator (`src/bbn_model.py`)
+* Deterministic BBN sensitivity analysis (`src/bbn_sensitivity.py`) — scenario generation, evidence masking, driver ranking, and fail-closed behavior on an unexpected scenario failure
+* The Stage 3 prose safety gate (`check_stage3_safety_gate`)
+* The structured Stage 3 test-plan writer, deterministic referential validation against the real Stage 2 graph/KCAG report/technique index, and prose/JSON cross-artifact consistency
 
 The live model pipeline is significantly more expensive and less deterministic than the unit tests. Use mocked or fixture-based tests for routine development wherever practical.
 
@@ -1435,7 +1445,6 @@ Current limitations include:
 * A read-only Quantitative Threat Modeler review of the KCAG graph exists (`model_assumptions.md`), but its disposition (ACCEPT / ACCEPT WITH CAVEATS / RECOMMEND STAGE 2 REGENERATION) is advisory only — never parsed or acted on programmatically, and never blocks Annex B.
 * The BBN contains analyst-judgment template priors that require case-specific review.
 * BBN sensitivity analysis is deterministic one-way perturbation only (no Monte Carlo, no joint/correlated scenarios, no CPD-matrix or probability-vector-prior perturbation yet).
-* Stage 3 remains a free-form Markdown artifact.
 * The structured Stage 3 test-plan validator checks referential integrity against the real Stage 2 graph, KCAG report, and technique index, plus internal quality rules (no identical success/abort criteria, no duplicate list entries) — it does not evaluate whether a test concept is itself well-designed, ethically sound, or operationally realistic. That remains the human reviewer's responsibility.
 * The final defense-in-depth safety check still runs after the Stage 4 human-input prompt, so it cannot intercept that specific approval (the pre-Stage-4 gate is what actually runs before it, and does intercept).
 * The attribution-boundary check is advisory rather than blocking.

@@ -508,6 +508,18 @@ if __name__ == "__main__":
     for p in (annexB_prose_path, annexC_prose_path, stage3_prose_path, stage4_prose_path):
         run_context.stamp_prose_file(p)
 
+    # ---- COMMIT STAGE 4 ARTIFACT (PENDING) ----
+    # Committed before the safety check runs, so the artifact's path and
+    # hash are in the audit trail regardless of the compliance outcome —
+    # same "commit PENDING first, promote after" two-step pattern already
+    # used for stage2 around its own deterministic gate.
+    if os.path.exists(stage4_prose_path):
+        commit_stage_output(state, "stage4", stage4_prose_path, status=StageStatus.PENDING)
+        save_assessment_state(state, run_id)
+    else:
+        print(f"WARNING: {stage4_prose_path} not found — stage4 agent may not have "
+              f"completed. assessment_state.json will show stage4 as NOT_STARTED.")
+
     # ---- ITEM 8: PHASE 0 SAFETY GATE COMPLIANCE CHECK (deterministic, HARD
     # BLOCK) ----
     # Unlike the attribution check (warn-only, item 7), this is a hard gate:
@@ -537,6 +549,8 @@ if __name__ == "__main__":
     print(f"Phase 0 Safety Gate check: "
           f"{'COMPLIANT' if safety['is_compliant'] else 'NON-COMPLIANT'} — {safety['summary']}")
     if not safety["is_compliant"]:
+        set_stage_status(state, "stage4", StageStatus.FAIL)
+        save_assessment_state(state, run_id)
         raise RuntimeError(
             f"Phase 0 Safety Gate compliance FAILED: {safety['summary']} "
             f"See {phase0_check_path}. Mission plan NOT finalized — "
@@ -551,6 +565,7 @@ if __name__ == "__main__":
     # same as Stage 0/1.
     if os.path.exists(stage3_prose_path):
         commit_stage_output(state, "stage3", stage3_prose_path, status=StageStatus.PENDING)
+    set_stage_status(state, "stage4", StageStatus.PASS)
     state.current_stage = "complete"
     save_assessment_state(state, run_id)
 

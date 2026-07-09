@@ -29,7 +29,7 @@ class StageStatus(str, Enum):
     FAIL = "FAIL"            # deterministic gate rejected the output
 
 
-STAGE_NAMES = ("stage0", "stage1", "stage2", "stage3")
+STAGE_NAMES = ("stage0", "stage1", "stage2", "stage3", "stage4")
 
 
 # ---------------------------------------------------------------------------

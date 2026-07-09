@@ -173,27 +173,15 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
 ```
 
-### 5. Install the PDF reader
+This installs all required dependencies, including `pypdf` for PDF source ingestion.
 
-The corpus reader currently imports `pypdf`, which is not yet declared directly in `requirements.txt`.
-
-```bash
-python -m pip install pypdf
-```
-
-Verify it:
-
-```bash
-python -c "from pypdf import PdfReader; print('pypdf ready')"
-```
-
-### 6. Create the runtime directories
+### 5. Create the runtime directories
 
 ```bash
 mkdir -p sources outputs corpus-index
 ```
 
-### 7. Verify the Python import path
+### 6. Verify the Python import path
 
 Run this command from the repository root:
 
@@ -1310,7 +1298,6 @@ Current limitations include:
 * The Phase 0 safety-language check runs after the Stage 4 human-input prompt.
 * Stage 4 is not yet included in the assessment-state stage list.
 * The attribution-boundary check is advisory rather than blocking.
-* `pypdf` is used by the code but is not yet declared directly in `requirements.txt`.
 * The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
 * The Purple Team tools still use flat compatibility paths under `outputs/`.
 * The Purple Team compiler retrieves the Atomic Red Team index from the internet.
@@ -1348,7 +1335,6 @@ Reinstall dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
-python -m pip install pypdf
 ```
 
 ### Ollama connection failure
@@ -1396,23 +1382,16 @@ src/purple/sigma_generator.py
 
 The model name must match exactly.
 
-### `pypdf` is not installed
+### PDF source produces no useful text
+
+If a PDF fails to ingest or produces no extractable text, first confirm dependencies are current:
 
 ```bash
-python -m pip install pypdf
-```
-
-Verify:
-
-```bash
+python -m pip install -r requirements.txt
 python -c "from pypdf import PdfReader; print('pypdf ready')"
 ```
 
-### PDF source produces no useful text
-
-The PDF may be image-only or scanned.
-
-Use an approved OCR process before adding it to the corpus, then regenerate the frozen manifest.
+If `pypdf` is present and text extraction still fails, the PDF is most likely image-only or scanned. Use an approved OCR process before adding it to the corpus, then regenerate the frozen manifest.
 
 ### `corpus_manifest.md not found`
 
@@ -1510,7 +1489,7 @@ Do not satisfy the checker by adding keywords without completing the underlying 
 
 ### Purple Team compiler cannot find Stage 4
 
-Copy the selected run’s Stage 4 plan into the current compatibility path:
+Copy the selected run's Stage 4 plan into the current compatibility path:
 
 ```bash
 export VANGUARD_RUN_ID=<run_id>
@@ -1634,8 +1613,7 @@ The current development priorities are:
 * Move safety enforcement before Stage 4
 * Add Stage 4 to assessment-state tracking
 * Update Purple Team tools to consume run-scoped artifacts directly
-* Add `pypdf` to the declared dependencies
 
-The project’s intended direction is:
+The project's intended direction is:
 
 > **Evidence-backed analysis, deterministic calculation, explicit uncertainty, human authorization, and controlled external execution.**

@@ -1003,6 +1003,19 @@ A Bayesian result is conditional on:
 
 It should not be treated as objective ground truth.
 
+### Quantitative Threat Modeler
+
+Annex B and Annex C are both executed by the Quantitative Threat Modeler agent.
+
+The agent runs Vanguard's deterministic KCAG and Bayesian-analysis tools (`kcag_min_cut`, `bbn_threat_score`). It does not author the Stage 2 graph topology, and it may not invent priors, conditional probability values, or observed evidence. Required per-assessment inputs for Annex C (adversary capability, tempo, defensive posture, geopolitical trigger, observed evidence) must trace to an approved assessment input or an explicitly labeled analyst judgment — an untraceable required value is reported as a blocking gap, not filled in with a plausible number.
+
+The agent also distinguishes deterministic calculations from configured heuristic scores. The current KCAG path-ranking value in particular is a configured heuristic (fixed difficulty-to-value mappings multiplied along a path), not a calibrated, empirically-derived probability, even where legacy field names or phrasing elsewhere may still call it one.
+
+Mathematical consistency does not establish that a model accurately represents the real system. KCAG and BBN results require review by both a quantitative specialist and a system-domain expert.
+
+> [!NOTE]
+> This agent does not yet perform semantic validation of the KCAG graph itself (structural correctness, reachability, cycle detection beyond what NetworkX reports). That capability is planned as a separate, read-only `validate_kcag` addition — see [Current Limitations](#current-limitations).
+
 ### Stage 3 — Human-reviewed test concepts
 
 Stage 3 reviews the verified attack vectors and Annex B priority path.
@@ -1306,7 +1319,6 @@ Vanguard is an active research prototype.
 
 Current limitations include:
 
-* The modeler agent is still named `Graph & Probability Modeler`; the planned Quantitative Threat Modeler upgrade is not yet implemented.
 * There is no dedicated semantic KCAG-review task between Stage 2 and Annex B.
 * Annex B currently selects the first zero-indegree graph source rather than strictly requiring `ADV_START`.
 * KCAG traversal values are still labeled as probabilities internally.
@@ -1622,8 +1634,7 @@ Vanguard Workbench is an advanced research prototype.
 
 The current development priorities are:
 
-* Upgrade the modeler into a Quantitative Threat Modeler
-* Add deterministic KCAG semantic validation
+* Add deterministic KCAG semantic validation for the Quantitative Threat Modeler to consume (role upgrade and analytical-discipline prompts already in place; the validator itself is not yet built)
 * Rename heuristic KCAG probabilities
 * Add BBN validation and sensitivity analysis
 * Convert Stage 3 into structured test-plan drafting

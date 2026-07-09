@@ -733,14 +733,16 @@ def verify_stage2_vectors(vectors_path: Optional[str] = None,
 
 # ============================================================================
 #  PHASE 0 SAFETY GATE COMPLIANCE CHECK  (plain Python — NOT a CrewAI tool)
-#  Called from crew.py after post_crew.kickoff() completes. Unlike the
+#  Called from crew.py after stage4_crew.kickoff() completes. Unlike the
 #  attribution-boundary check (item 7), this IS a hard gate: a missing
 #  safety-review section on a payload with a real physical/destructive
 #  effect is a safety compliance failure, not an analytical nicety, so this
 #  errs toward over-detecting kinetic payloads rather than under-detecting
 #  them. See the crew.py wiring for the important caveat that this runs
 #  AFTER t_stage4's human_input approval already happened inside kickoff()
-#  — it is a post-hoc compliance check, not a pre-approval gate.
+#  — it is a post-hoc compliance check, defense in depth alongside the
+#  separate, earlier check_stage3_safety_gate (which DOES run before Stage 4
+#  is even constructed, in the pre-Stage-4 gate — see that function above).
 # ============================================================================
 KINETIC_CATEGORY_MARKERS = [
     r"degradation\s*&?\s*destruction",

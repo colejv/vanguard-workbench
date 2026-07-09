@@ -252,13 +252,23 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
             "can proceed — do not work around it by fabricating a graph.\n\n"
             "After the tool succeeds, report its output verbatim: the dominant min-cut "
             "node, the number of objectives it cuts, the top betweenness node and its "
-            "ratio to the next, and the highest-probability priority path. Do not "
-            "substitute your own analysis for the computed numbers."
+            "ratio to the next, and the highest-scoring priority path. Do not substitute "
+            "your own analysis for the computed numbers.\n\n"
+            "NUMERICAL DISCIPLINE: the path score is a configured heuristic (fixed "
+            "difficulty-to-value mappings multiplied along the path) — it is NOT a "
+            "calibrated probability derived empirically, even where a legacy field "
+            "name or prior report phrasing calls it one. State this distinction "
+            "explicitly rather than letting 'highest' or 'probability'-adjacent "
+            "language imply more statistical confidence than the number supports. "
+            "The result supports relative ranking of candidate paths, not a claim "
+            "about real-world likelihood of success."
         ),
         expected_output=(
             "Verbatim kcag_min_cut tool output: dominant min-cut node (with objectives-cut "
-            "count), top betweenness centrality, and the highest-probability priority path. "
-            "Confirmation that the KCAG report was written for Annex C ingestion."
+            "count), top betweenness centrality, and the highest-scoring priority path — "
+            "plus a brief note naming the path score as a configured heuristic, not a "
+            "calibrated probability. Confirmation that the KCAG report was written for "
+            "Annex C ingestion."
         ),
         agent=modeler,
         context=[] if "t_annexB" in resume_context else [t_stage2],
@@ -278,17 +288,34 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
             "Annex C: construct the evidence-driven BBN, ingest the Annex B KCAG priors, "
             "run inference, and return the threat score, kill-chain phase estimate, and "
             "CPD audit log.\n\n"
-            "Call `bbn_threat_score` with a JSON config containing the adversary profile "
-            "(capability_prior, tempo), defensive_posture, geopolitical_trigger_prior, and "
-            "observed evidence indicators. Every CPD value must come from the config you "
-            "supply — do not rely on the tool to invent priors. Leave kcag_report_path "
-            "unset in your config — the tool automatically ingests the current run's KCAG "
-            "report for the objective-phase prior.\n\n"
+            "INPUT PROVENANCE (required before calling the tool): every per-assessment "
+            "value you supply — adversary.capability_prior, adversary.tempo, "
+            "defensive_posture, geopolitical_trigger_prior, and any observed evidence "
+            "indicators — must trace to approved assessment context (the brief, prior "
+            "stage findings, or explicitly labeled analyst judgment). State the source "
+            "for each one. A value you cannot trace to a real source is a BLOCKING GAP, "
+            "not an invitation to supply a plausible-looking number: report the gap "
+            "explicitly (which field, why it's missing, what the analyst needs to "
+            "provide) and do not call the tool until it's resolved. A schema-valid JSON "
+            "config is not the same as an analytically grounded one.\n\n"
+            "Call `bbn_threat_score` with a JSON config containing the sourced adversary "
+            "profile (capability_prior, tempo), defensive_posture, "
+            "geopolitical_trigger_prior, and observed evidence indicators. Every CPD "
+            "value must come from the config you supply — do not invent one, and do "
+            "not rely on the tool to invent priors either. Leave kcag_report_path "
+            "unset in your config — the tool "
+            "automatically ingests the current run's KCAG report for the objective-phase "
+            "prior.\n\n"
             "Report the tool output verbatim: threat score, level, baseline delta, phase "
             "distribution. The BBN is acyclic by construction; if the tool reports a "
             "validation error, report it verbatim and do not fabricate a score."
         ),
-        expected_output="Verbatim BBN threat score, level, phase distribution, and CPD audit reference.",
+        expected_output=(
+            "Either a blocking-gap report naming the specific missing input(s) and what "
+            "the analyst needs to supply, OR the verbatim BBN threat score, level, phase "
+            "distribution, and CPD audit reference — preceded by a short table or list "
+            "showing each per-assessment input's value and source."
+        ),
         agent=modeler,
         context=[] if "t_annexC" in resume_context else [t_annexB],
         tools=[bbn_threat_score],

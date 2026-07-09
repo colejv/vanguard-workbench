@@ -1,33 +1,43 @@
 """
-Tests for the pre-Stage-4 safety gate (check_stage3_safety_gate) and the
-tightened contradiction handling in check_phase0_safety_gate.
+Tests for the pre-Stage-4 safety gate (check_stage3_safety_gate), the
+section-scoping fix, the tightened contradiction handling in
+check_phase0_safety_gate, and the enforce_stage3_safety_gate orchestration
+helper.
 
-Covers the reviewer's 11 requested checker unit tests, plus 3 additional
-markdown-robustness tests I added after finding that the originally
-proposed CATEGORY_LINE regex silently fails to match real Stage 3 output
-(observed this session: '**Category:** 3, 4', '**Category:** `1, 4`') --
-a bolded field label is the norm for this project's actual LLM output,
-not an edge case, and a regex that only matches unstyled 'Category: 2'
-would be a dangerous false negative for a safety gate. See
-_strip_markdown_emphasis in tools.py.
+Covers the reviewer's 11 originally-requested checker unit tests, plus 3
+markdown-robustness tests added after finding that the originally proposed
+CATEGORY_LINE regex silently fails to match real Stage 3 output (observed
+this session: '**Category:** 3, 4', '**Category:** `1, 4`') -- a bolded
+field label is the norm for this project's actual LLM output, not an edge
+case, and a regex that only matches unstyled 'Category: 2' would be a
+dangerous false negative for a safety gate. See _strip_markdown_emphasis
+in tools.py.
 
-Also covers the two gate-report artifact-boundary tests (stamped,
-run-rejecting) and the check_phase0_safety_gate contradiction fix.
+Also covers: the five section-scoping tests (required fields and the
+no-gate declaration must come from inside the PRE-STAGE-4 SAFETY REVIEW
+section specifically, not anywhere in the document -- a real bug found
+and fixed after a reviewer's adversarial example reproduced it against
+the shipped code); the two gate-report artifact-boundary tests (stamped,
+run-rejecting); the check_phase0_safety_gate contradiction fix and its
+own false-positive regression (Stage 3's own required override sentence
+self-triggering category detection); and four orchestration tests calling
+the real enforce_stage3_safety_gate() and build_stage4_task() functions
+directly, proving that a gate failure raises before build_stage4_task is
+structurally reachable, marks stage3 FAIL, and leaves stage4 untouched at
+NOT_STARTED.
 
-The crew.py-level integration proof -- that stage4_crew is NEVER even
-constructed when this gate fails, and IS constructed and succeeds when it
-passes -- was verified this session via a mocked-kickoff run against the
-real pipeline (4 scenarios: pass-with-no-category, pass-with-category,
-fail-missing-review, fail-incomplete-review; the failure cases assert the
-stage4_crew mock's call flag is never set at all). That isn't packaged as
-a pytest file here since I don't know this repo's fixture/conftest.py
-conventions for a mocked-Crew.kickoff harness at that scale -- happy to
-add it in whatever shape matches tests/ if useful.
-
-I have not seen this project's existing tests/ directory or its fixture
-conventions -- this file uses plain pytest with no external fixtures, so
-it should drop in cleanly, but import paths or naming may need a small
-adjustment to match whatever conventions are already established there.
+Note on scope: the orchestration tests above prove the function-level
+ordering contract (enforce_stage3_safety_gate raises before
+build_stage4_task can run) -- they do not additionally mock
+crewai.Crew.kickoff() to prove the stage4_crew Crew object itself is never
+instantiated in the real pipeline. That fuller mocked-kickoff proof was
+run manually against the real pipeline this session (4 scenarios,
+asserting a call-flag on the stage4_crew mock is never set on failure)
+but isn't packaged as a pytest file here. The function-level proof is the
+one that actually matters for correctness -- crew.py has no code path
+that reaches build_stage4_task without going through
+enforce_stage3_safety_gate first -- but flagging the distinction rather
+than overstating coverage.
 """
 import json
 from pathlib import Path

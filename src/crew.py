@@ -2,7 +2,7 @@ from crewai import Crew, Process, Task
 import sys, os
 from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
-from src.tasks import build_tasks
+from src.tasks import build_tasks, build_stage4_task
 from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
                        discover_corpus_files, read_corpus_file,
                        check_attribution_boundary, check_phase0_safety_gate,
@@ -303,7 +303,6 @@ if __name__ == "__main__":
     t_annexB = tasks["t_annexB"]
     t_annexC = tasks["t_annexC"]
     t_stage3 = tasks["t_stage3"]
-    t_stage4 = tasks["t_stage4"]
 
     chunk_tasks = []
     for i, chunk in enumerate(chunks):
@@ -472,40 +471,88 @@ if __name__ == "__main__":
             f"Run audit trail: {out_dir}/assessment_state.json"
         )
 
-    # ---- CREW 2: Annex B onward (only reached if gate passed) ----
-    # Stage 3/4 are never skipped on resume (see detect_resume_progress) --
-    # both are human_input=True gates the analyst re-approves fresh every
-    # time, and stage3 is very often exactly the stage BEING resumed to
-    # (e.g. after correcting its prompt), never one to skip past.
-    post_tasks = []
+    # ---- ANALYSIS CREW: Annex B, Annex C, Stage 3 (Stage 4 is now a
+    # separate crew — see below) ----
+    # Stage 3 is never skipped on resume (see detect_resume_progress) --
+    # it's a human_input=True gate the analyst re-approves fresh every
+    # time, and is very often exactly the stage BEING resumed to (e.g.
+    # after correcting its prompt), never one to skip past.
+    analysis_tasks = []
     if not annexB_done:
-        post_tasks += [t_annexB]
+        analysis_tasks.append(t_annexB)
     if not annexC_done:
-        post_tasks += [t_annexC]
-    post_tasks += [t_stage3, t_stage4]
+        analysis_tasks.append(t_annexC)
+    analysis_tasks.append(t_stage3)
 
-    print(f"post_crew will run {len(post_tasks)} task(s): "
-          f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in post_tasks]}")
+    print(f"analysis_crew will run {len(analysis_tasks)} task(s): "
+          f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in analysis_tasks]}")
 
-    post_crew = Crew(
-        agents=[modeler, red_team_lead, orchestrator],
-        tasks=post_tasks,
+    analysis_crew = Crew(
+        agents=[modeler, red_team_lead],
+        tasks=analysis_tasks,
         process=Process.sequential,
         verbose=True,
     )
-    post_heartbeat_log = run_context.artifact_path("heartbeat.log")
-    with heartbeat("post_crew", log_path=post_heartbeat_log):
-        result = post_crew.kickoff(inputs={
+    analysis_heartbeat_log = run_context.artifact_path("heartbeat.log")
+    with heartbeat("analysis_crew", log_path=analysis_heartbeat_log):
+        analysis_crew.kickoff(inputs={
+            "sut_brief": brief_text,
+            "file_count": c_count,
+            "corpus_version": c_version,
+        })
+
+    # ---- VERIFY STAGE 3 BEFORE STAGE 4 CAN EVEN BE CONSTRUCTED ----
+    # This is the actual trust boundary the crew split exists to create.
+    # Stage 4 is not merely sequenced after Stage 3 now — there is no code
+    # path from here to a Stage 4 Task object that skips
+    # read_stamped_prose(). Annex B/C get stamped here too since this is
+    # the first point after analysis_crew where their files are final.
+    annexB_prose_path = run_context.artifact_path("annexB_kcag.md")
+    annexC_prose_path = run_context.artifact_path("annexC_bbn.md")
+    stage3_prose_path = run_context.artifact_path("stage3.md")
+
+    if not os.path.exists(stage3_prose_path):
+        state.current_stage = "stage3"
+        set_stage_status(state, "stage3", StageStatus.FAIL)
+        save_assessment_state(state, run_id)
+        raise RuntimeError(
+            f"Stage 3 did not produce {stage3_prose_path} — Stage 4 cannot "
+            f"be constructed. Run audit trail: {out_dir}/assessment_state.json"
+        )
+
+    for p in (annexB_prose_path, annexC_prose_path, stage3_prose_path):
+        run_context.stamp_prose_file(p)
+
+    stage3_text = run_context.read_stamped_prose(stage3_prose_path)
+
+    state.current_stage = "stage3"
+    commit_stage_output(state, "stage3", stage3_prose_path, status=StageStatus.PENDING)
+    save_assessment_state(state, run_id)
+
+    # ---- BUILD AND RUN STAGE 4 (separate crew, no live context=[t_stage3];
+    # stage3_text above is verified, stamped, run-and-corpus-bound content —
+    # see build_stage4_task()'s docstring in tasks.py) ----
+    t_stage4 = build_stage4_task(out_dir, stage3_content=stage3_text)
+
+    stage4_crew = Crew(
+        agents=[red_team_lead],
+        tasks=[t_stage4],
+        process=Process.sequential,
+        verbose=True,
+    )
+    stage4_heartbeat_log = run_context.artifact_path("heartbeat.log")
+    with heartbeat("stage4_crew", log_path=stage4_heartbeat_log):
+        result = stage4_crew.kickoff(inputs={
             "sut_brief": brief_text,
             "file_count": c_count,
             "corpus_version": c_version,
         })
 
     # ---- FINALIZE STAGE 4 CONTENT BEFORE ANY STAMPING/HASHING ----
-    # The corpus-version footer must be appended BEFORE stamp_prose_file and
-    # commit_stage_output run on this file -- committing first and
-    # appending after (the original bug) leaves the recorded hash
-    # describing content that no longer matches what's on disk.
+    # The corpus-version footer must be appended BEFORE stamp_prose_file
+    # and commit_stage_output run on this file -- committing first and
+    # appending after (a prior bug) leaves the recorded hash describing
+    # content that no longer matches what's on disk.
     stage4_prose_path = run_context.artifact_path("stage4_mission_plan.md")
     if os.path.exists(stage4_prose_path):
         try:
@@ -513,25 +560,15 @@ if __name__ == "__main__":
                 f.write(f"\n\n---\n*Analysis grounded in Corpus Version v{c_version} ({c_count} files)*")
         except Exception:
             pass
-
-    # ---- STAMP POST-CREW PROSE ARTIFACTS ----
-    annexB_prose_path = run_context.artifact_path("annexB_kcag.md")
-    annexC_prose_path = run_context.artifact_path("annexC_bbn.md")
-    stage3_prose_path = run_context.artifact_path("stage3.md")
-    for p in (annexB_prose_path, annexC_prose_path, stage3_prose_path, stage4_prose_path):
-        run_context.stamp_prose_file(p)
+    run_context.stamp_prose_file(stage4_prose_path)
 
     # ---- ITEM 8: PHASE 0 SAFETY GATE COMPLIANCE CHECK (deterministic) ----
-    # IMPORTANT CAVEAT: t_stage3 and t_stage4 both already ran their
-    # human_input=True approval INSIDE post_crew.kickoff() above, so this
-    # check fires AFTER a human has already approved the mission plan
-    # content — it cannot intercept that approval. What it CAN do is refuse
-    # to let the run complete/stamp the plan as final if the safety gate is
-    # missing. Splitting post_crew at the Stage 3/Stage 4 boundary (same
-    # pattern as the pre_crew/post_crew split around the Stage 2 gate) would
-    # let this run BEFORE the human sees Stage 4 — a bigger structural
-    # change than run-isolation covers; say the word and I'll do that pass.
-    stage3_text = run_context.read_stamped_prose(stage3_prose_path) if os.path.exists(stage3_prose_path) else ""
+    # Stage 3 is now fully finalized and verified BEFORE Stage 4 is ever
+    # constructed — but t_stage4 still has its own human_input=True
+    # approval inside stage4_crew.kickoff() above, so this check still
+    # fires after a human has already approved the mission plan content.
+    # Moving THAT check earlier (a pre-Stage-4 gate on Stage 3 alone,
+    # before stage4_crew is even built) is the next commit, not this one.
     stage4_text = run_context.read_stamped_prose(stage4_prose_path) if os.path.exists(stage4_prose_path) else ""
     safety = check_phase0_safety_gate(stage3_text, stage4_text)
     phase0_check_path = run_context.artifact_path("phase0_safety_check.md")
@@ -545,16 +582,6 @@ if __name__ == "__main__":
     run_context.stamp_prose_file(phase0_check_path)
     print(f"Phase 0 Safety Gate check: "
           f"{'COMPLIANT' if safety['is_compliant'] else 'NON-COMPLIANT'} — {safety['summary']}")
-
-    # ---- COMMIT STAGE 3 (unconditional of Stage 4's fate) ----
-    # Stage 3 succeeded regardless of what happens to Stage 4 next: its
-    # commit should not depend on Stage 4's outcome. Moved here (was
-    # previously only committed in the success branch, meaning a Stage 4
-    # rejection left Stage 3 uncommitted too, on an artifact that was
-    # never actually in question).
-    if os.path.exists(stage3_prose_path):
-        commit_stage_output(state, "stage3", stage3_prose_path, status=StageStatus.PENDING)
-        save_assessment_state(state, run_id)
 
     # ---- FINALIZE STAGE 4 (single shared implementation — see src/state.py) ----
     finalize_stage4_state(

@@ -7,11 +7,13 @@ from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
 
 
 def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
-    """Construct all eight stage/annex/gate tasks with run-scoped output_file
-    paths. Tasks can't be built at module-import time the way they used to
-    be — out_dir depends on run_id, which doesn't exist until crew.py
-    generates it inside __main__. crew.py calls this once, right after
-    run_context.set_active_run(), and unpacks the returned dict.
+    """Construct the seven pre-Stage-4 stage/annex/gate tasks with run-scoped
+    output_file paths. Stage 4 is built separately by build_stage4_task()
+    below, once Stage 3 has produced verified output — see that function's
+    docstring for why. Tasks can't be built at module-import time the way
+    they used to be — out_dir depends on run_id, which doesn't exist until
+    crew.py generates it inside __main__. crew.py calls this once, right
+    after run_context.set_active_run(), and unpacks the returned dict.
 
     resume_context: optional {"t_stage1": "<stage0 prose text>", ...}. Used
     only when resuming an interrupted run past a stage that already
@@ -371,9 +373,60 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
     )
 
     # Gate 3: final mission-plan release
-    t_stage4 = Task(
+    # t_stage4 is intentionally NOT built here. Stage 4 now runs in its own
+    # crew (stage4_crew, constructed in crew.py) so it can never receive a
+    # live context=[t_stage3] reference -- see build_stage4_task() below,
+    # which requires already-verified Stage 3 text instead.
+
+    return {
+        "t_research": t_research,
+        "t_synthesize_stage0": t_synthesize_stage0,
+        "t_stage1": t_stage1,
+        "t_stage2": t_stage2,
+        "t_annexB": t_annexB,
+        "t_annexC": t_annexC,
+        "t_stage3": t_stage3,
+    }
+
+
+def build_stage4_task(out_dir: str, stage3_content: str) -> Task:
+    """
+    Constructs t_stage4 fresh, from already-verified Stage 3 text -- never
+    via a live CrewAI context=[...] reference. Stage 4 runs in its own
+    crew (stage4_crew), and Stage 3's task object is never part of that
+    crew's task list, so context=[t_stage3] is not just unnecessary here,
+    it would silently do nothing (CrewAI only resolves context from tasks
+    that execute as part of the SAME crew.kickoff() call).
+
+    stage3_content must be the ALREADY-STAMPED-AND-VERIFIED body text --
+    i.e. the return value of run_context.read_stamped_prose() called on
+    the real stage3.md for the active run -- not raw file content, and
+    never text the caller merely believes is trustworthy.
+
+    Raises ValueError on empty/whitespace-only content. This is the
+    load-bearing check the crew split exists to add: Stage 4 is not
+    merely sequenced after Stage 3, it is impossible to construct without
+    real, verified Stage 3 content in hand first.
+    """
+    if not stage3_content or not stage3_content.strip():
+        raise ValueError(
+            "build_stage4_task requires non-empty verified Stage 3 content. "
+            "Stage 3 must be stamped and read via read_stamped_prose() "
+            "before Stage 4 can be constructed."
+        )
+
+    return Task(
         description=(
-            "Draft the Stage 4 MDMP mission plan based on the payloads developed in Stage 3. "
+            "The following Stage 3 artifact was produced for the active "
+            "assessment run and verified through Vanguard's run-identity "
+            "and corpus-identity checks before being provided here — it is "
+            "not live CrewAI task context, but it is the complete, "
+            "unmodified Stage 3 output for this run.\n\n"
+            "=== VERIFIED STAGE 3 ARTIFACT ===\n"
+            f"{stage3_content}\n"
+            "=== END VERIFIED STAGE 3 ARTIFACT ===\n\n"
+            "Draft the Stage 4 MDMP mission plan based on the payloads developed in the "
+            "Stage 3 artifact provided above. "
             "Provide a phased execution timeline. For each phase, explicitly map the planned actions "
             "to the MITRE technique IDs identified previously. "
             "Define explicit OPSEC measures and Blue Team assessment/detection criteria for each test payload "
@@ -398,18 +451,7 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
         ),
         expected_output="MDMP-format red team mission plan with phased ATT&CK mapping and Blue Team assessment criteria.",
         agent=red_team_lead,
-        context=[t_stage3],            # <-- Explicitly feeds the payload taxonomy
-        human_input=True,              # Doctrinal gate: plan release
+        context=[],
+        human_input=True,
         output_file=f"{out_dir}/stage4_mission_plan.md",
     )
-
-    return {
-        "t_research": t_research,
-        "t_synthesize_stage0": t_synthesize_stage0,
-        "t_stage1": t_stage1,
-        "t_stage2": t_stage2,
-        "t_annexB": t_annexB,
-        "t_annexC": t_annexC,
-        "t_stage3": t_stage3,
-        "t_stage4": t_stage4,
-    }

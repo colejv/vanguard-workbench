@@ -10,13 +10,22 @@ they resolve through run_context.artifact_path() and fail closed with
 RuntimeError if no active run has been set, same as every other run-scoped
 tool. tmp_path + monkeypatch still keep everything off the real outputs/
 directory.
+pipeline. Each test initializes an isolated run_context so writes follow
+the same run-scoped, stamped artifact path the real pipeline uses —
+write_stage0_output/write_stage1_output no longer hardcode "outputs/...";
+they resolve through run_context.artifact_path() and fail closed with
+RuntimeError if no active run has been set, same as every other run-scoped
+tool. tmp_path + monkeypatch still keep everything off the real outputs/
+directory.
 """
 
 import json
 from pathlib import Path
+from pathlib import Path
 
 import pytest
 
+from src import run_context
 from src import run_context
 from src.tools import write_stage0_output, write_stage1_output
 
@@ -29,7 +38,31 @@ def _isolated_active_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     Production tools must never fall back to a shared outputs/ directory,
     so tests initialize the same active-run context that crew.py does.
     """
+def _isolated_active_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """
+    Give every test its own run-scoped output directory.
+
+    Production tools must never fall back to a shared outputs/ directory,
+    so tests initialize the same active-run context that crew.py does.
+    """
     monkeypatch.chdir(tmp_path)
+
+    out_dir = tmp_path / "outputs" / "test-run"
+
+    run_context.reset_active_run()
+    run_context.set_active_run(
+        run_id="test-run",
+        corpus_manifest_hash="test-corpus-hash",
+        out_dir=str(out_dir),
+    )
+
+    yield out_dir
+
+    run_context.reset_active_run()
+
+
+def _artifact(filename: str) -> Path:
+    return Path(run_context.artifact_path(filename))
 
     out_dir = tmp_path / "outputs" / "test-run"
 
@@ -61,7 +94,16 @@ def test_write_stage0_output_valid_writes_file():
     stage0_path = _artifact("stage0_output.json")
 
     assert result.startswith(f"WRITTEN: {stage0_path}")
+    stage0_path = _artifact("stage0_output.json")
+
+    assert result.startswith(f"WRITTEN: {stage0_path}")
     assert "1 signature(s)" in result
+    assert stage0_path.exists()
+
+    envelope = json.loads(stage0_path.read_text(encoding="utf-8"))
+    assert envelope["_meta"]["run_id"] == "test-run"
+    assert envelope["_meta"]["corpus_manifest_hash"] == "test-corpus-hash"
+    assert len(envelope["data"]["signatures"]) == 1
     assert stage0_path.exists()
 
     envelope = json.loads(stage0_path.read_text(encoding="utf-8"))
@@ -100,6 +142,7 @@ def test_write_stage0_output_rejects_more_than_max_signatures():
     assert result.startswith("REJECTED:")
     assert "exceeds the 25 ceiling" in result
     assert not _artifact("stage0_output.json").exists()
+    assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_accepts_exactly_max_signatures():
@@ -119,6 +162,7 @@ def test_write_stage0_output_rejects_invalid_json():
     result = write_stage0_output._run(stage0_json="{not json")
     assert result.startswith("REJECTED:")
     assert not _artifact("stage0_output.json").exists()
+    assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_rejects_bad_category():
@@ -128,6 +172,7 @@ def test_write_stage0_output_rejects_bad_category():
     ]}
     result = write_stage0_output._run(stage0_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
+    assert not _artifact("stage0_output.json").exists()
     assert not _artifact("stage0_output.json").exists()
 
 
@@ -151,6 +196,7 @@ def test_write_stage0_output_rejects_duplicate_signature_id():
     assert result.startswith("REJECTED:")
     assert "duplicate signature_id" in result
     assert not _artifact("stage0_output.json").exists()
+    assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_rejects_missing_required_field():
@@ -161,6 +207,19 @@ def test_write_stage0_output_rejects_missing_required_field():
     ]}
     result = write_stage0_output._run(stage0_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
+
+
+def test_write_stage0_output_requires_active_run():
+    """Nobody should be able to 'fix' a future failure here by
+    reintroducing a fallback to a shared, unscoped outputs/ directory --
+    the tool must refuse outright with no active run set."""
+    run_context.reset_active_run()
+    payload = {"signatures": [
+        {"signature_id": "S-T-01", "category": "technical", "description": "x",
+         "confidence": "HIGH", "deceive_candidate": False},
+    ]}
+    with pytest.raises(RuntimeError, match="No active run set"):
+        write_stage0_output._run(stage0_json=json.dumps(payload))
 
 
 def test_write_stage0_output_requires_active_run():
@@ -199,7 +258,16 @@ def test_write_stage1_output_valid_writes_file():
     stage1_path = _artifact("stage1_output.json")
 
     assert result.startswith(f"WRITTEN: {stage1_path}")
+    stage1_path = _artifact("stage1_output.json")
+
+    assert result.startswith(f"WRITTEN: {stage1_path}")
     assert "Cognitive-layer candidate touchpoint: C-C-01" in result
+    assert stage1_path.exists()
+
+    envelope = json.loads(stage1_path.read_text(encoding="utf-8"))
+    assert envelope["_meta"]["run_id"] == "test-run"
+    assert envelope["_meta"]["corpus_manifest_hash"] == "test-corpus-hash"
+    assert len(envelope["data"]["technical_nodes"]) == 1
     assert stage1_path.exists()
 
     envelope = json.loads(stage1_path.read_text(encoding="utf-8"))
@@ -237,6 +305,7 @@ def test_write_stage1_output_rejects_more_than_max_total_nodes():
     result = write_stage1_output._run(stage1_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
     assert "exceeds the 40 ceiling" in result
+    assert not _artifact("stage1_output.json").exists()
     assert not _artifact("stage1_output.json").exists()
 
 
@@ -301,6 +370,7 @@ def test_write_stage1_output_rejects_technical_node_with_wrong_layer():
     assert result.startswith("REJECTED:")
     assert "wrong layer list" in result
     assert not _artifact("stage1_output.json").exists()
+    assert not _artifact("stage1_output.json").exists()
 
 
 def test_write_stage1_output_rejects_procedural_node_with_wrong_layer():
@@ -317,6 +387,7 @@ def test_write_stage1_output_rejects_duplicate_component_id_across_layers():
     result = write_stage1_output._run(stage1_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
     assert "duplicate component_id" in result
+    assert not _artifact("stage1_output.json").exists()
     assert not _artifact("stage1_output.json").exists()
 
 

@@ -3,25 +3,50 @@ Tests for write_stage0_output / write_stage1_output in src/tools.py.
 
 Run with: pytest tests/test_tools_stage01.py -v
 Calls the tools directly via ._run() — no LLM, no CrewAI kickoff, no
-pipeline. Uses tmp_path + monkeypatch to redirect the hardcoded
-"outputs/" writes so tests never touch the real outputs/ directory.
+pipeline. Each test initializes an isolated run_context so writes follow
+the same run-scoped, stamped artifact path the real pipeline uses —
+write_stage0_output/write_stage1_output no longer hardcode "outputs/...";
+they resolve through run_context.artifact_path() and fail closed with
+RuntimeError if no active run has been set, same as every other run-scoped
+tool. tmp_path + monkeypatch still keep everything off the real outputs/
+directory.
 """
 
 import json
-import os
+from pathlib import Path
 
 import pytest
 
+from src import run_context
 from src.tools import write_stage0_output, write_stage1_output
 
 
 @pytest.fixture(autouse=True)
-def _isolate_outputs_dir(tmp_path, monkeypatch):
-    """write_stage0_output / write_stage1_output hardcode 'outputs/...',
-    matching write_stage2_vectors' existing convention. Chdir into a temp
-    dir per test so nothing here ever touches the real outputs/ folder."""
+def _isolated_active_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """
+    Give every test its own run-scoped output directory.
+
+    Production tools must never fall back to a shared outputs/ directory,
+    so tests initialize the same active-run context that crew.py does.
+    """
     monkeypatch.chdir(tmp_path)
-    yield tmp_path
+
+    out_dir = tmp_path / "outputs" / "test-run"
+
+    run_context.reset_active_run()
+    run_context.set_active_run(
+        run_id="test-run",
+        corpus_manifest_hash="test-corpus-hash",
+        out_dir=str(out_dir),
+    )
+
+    yield out_dir
+
+    run_context.reset_active_run()
+
+
+def _artifact(filename: str) -> Path:
+    return Path(run_context.artifact_path(filename))
 
 
 # ---------- write_stage0_output: valid paths ----------
@@ -33,9 +58,16 @@ def test_write_stage0_output_valid_writes_file():
          "confidence": "HIGH", "deceive_candidate": False},
     ]}
     result = write_stage0_output._run(stage0_json=json.dumps(payload))
-    assert result.startswith("WRITTEN: outputs/stage0_output.json")
+    stage0_path = _artifact("stage0_output.json")
+
+    assert result.startswith(f"WRITTEN: {stage0_path}")
     assert "1 signature(s)" in result
-    assert os.path.exists("outputs/stage0_output.json")
+    assert stage0_path.exists()
+
+    envelope = json.loads(stage0_path.read_text(encoding="utf-8"))
+    assert envelope["_meta"]["run_id"] == "test-run"
+    assert envelope["_meta"]["corpus_manifest_hash"] == "test-corpus-hash"
+    assert len(envelope["data"]["signatures"]) == 1
 
 
 def test_write_stage0_output_reports_gap_count():
@@ -67,7 +99,7 @@ def test_write_stage0_output_rejects_more_than_max_signatures():
     result = write_stage0_output._run(stage0_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
     assert "exceeds the 25 ceiling" in result
-    assert not os.path.exists("outputs/stage0_output.json")
+    assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_accepts_exactly_max_signatures():
@@ -86,7 +118,7 @@ def test_write_stage0_output_accepts_exactly_max_signatures():
 def test_write_stage0_output_rejects_invalid_json():
     result = write_stage0_output._run(stage0_json="{not json")
     assert result.startswith("REJECTED:")
-    assert not os.path.exists("outputs/stage0_output.json")
+    assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_rejects_bad_category():
@@ -96,7 +128,7 @@ def test_write_stage0_output_rejects_bad_category():
     ]}
     result = write_stage0_output._run(stage0_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
-    assert not os.path.exists("outputs/stage0_output.json")
+    assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_rejects_bad_confidence():
@@ -118,7 +150,7 @@ def test_write_stage0_output_rejects_duplicate_signature_id():
     result = write_stage0_output._run(stage0_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
     assert "duplicate signature_id" in result
-    assert not os.path.exists("outputs/stage0_output.json")
+    assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_rejects_missing_required_field():
@@ -129,6 +161,19 @@ def test_write_stage0_output_rejects_missing_required_field():
     ]}
     result = write_stage0_output._run(stage0_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
+
+
+def test_write_stage0_output_requires_active_run():
+    """Nobody should be able to 'fix' a future failure here by
+    reintroducing a fallback to a shared, unscoped outputs/ directory --
+    the tool must refuse outright with no active run set."""
+    run_context.reset_active_run()
+    payload = {"signatures": [
+        {"signature_id": "S-T-01", "category": "technical", "description": "x",
+         "confidence": "HIGH", "deceive_candidate": False},
+    ]}
+    with pytest.raises(RuntimeError, match="No active run set"):
+        write_stage0_output._run(stage0_json=json.dumps(payload))
 
 
 # ---------- write_stage1_output: valid paths ----------
@@ -151,9 +196,16 @@ def _valid_stage1_payload(cog=True):
 
 def test_write_stage1_output_valid_writes_file():
     result = write_stage1_output._run(stage1_json=json.dumps(_valid_stage1_payload()))
-    assert result.startswith("WRITTEN: outputs/stage1_output.json")
+    stage1_path = _artifact("stage1_output.json")
+
+    assert result.startswith(f"WRITTEN: {stage1_path}")
     assert "Cognitive-layer candidate touchpoint: C-C-01" in result
-    assert os.path.exists("outputs/stage1_output.json")
+    assert stage1_path.exists()
+
+    envelope = json.loads(stage1_path.read_text(encoding="utf-8"))
+    assert envelope["_meta"]["run_id"] == "test-run"
+    assert envelope["_meta"]["corpus_manifest_hash"] == "test-corpus-hash"
+    assert len(envelope["data"]["technical_nodes"]) == 1
 
 
 def test_write_stage1_output_no_cognitive_nodes_is_valid_with_no_cog():
@@ -185,7 +237,7 @@ def test_write_stage1_output_rejects_more_than_max_total_nodes():
     result = write_stage1_output._run(stage1_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
     assert "exceeds the 40 ceiling" in result
-    assert not os.path.exists("outputs/stage1_output.json")
+    assert not _artifact("stage1_output.json").exists()
 
 
 def test_write_stage1_output_accepts_exactly_max_total_nodes():
@@ -248,7 +300,7 @@ def test_write_stage1_output_rejects_technical_node_with_wrong_layer():
     result = write_stage1_output._run(stage1_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
     assert "wrong layer list" in result
-    assert not os.path.exists("outputs/stage1_output.json")
+    assert not _artifact("stage1_output.json").exists()
 
 
 def test_write_stage1_output_rejects_procedural_node_with_wrong_layer():
@@ -265,7 +317,7 @@ def test_write_stage1_output_rejects_duplicate_component_id_across_layers():
     result = write_stage1_output._run(stage1_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
     assert "duplicate component_id" in result
-    assert not os.path.exists("outputs/stage1_output.json")
+    assert not _artifact("stage1_output.json").exists()
 
 
 def test_write_stage1_output_rejects_bad_hierarchy_stage():
@@ -280,3 +332,12 @@ def test_write_stage1_output_rejects_missing_trust_boundaries_key():
     del payload["trust_boundaries"]
     result = write_stage1_output._run(stage1_json=json.dumps(payload))
     assert result.startswith("REJECTED:")
+
+
+def test_write_stage1_output_requires_active_run():
+    """Same fail-closed contract as Stage 0 -- added for symmetry, not
+    explicitly requested, since the exact same bug shape applies equally
+    to write_stage1_output and there's no reason to leave it uncovered."""
+    run_context.reset_active_run()
+    with pytest.raises(RuntimeError, match="No active run set"):
+        write_stage1_output._run(stage1_json=json.dumps(_valid_stage1_payload()))

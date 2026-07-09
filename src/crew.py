@@ -9,7 +9,8 @@ from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
                        verify_stage2_vectors)
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
-                        save_assessment_state, commit_stage_output, set_stage_status)
+                        save_assessment_state, commit_stage_output, set_stage_status,
+                        finalize_stage4_state)
 from src import run_context
 from src.heartbeat import heartbeat
 
@@ -500,31 +501,27 @@ if __name__ == "__main__":
             "corpus_version": c_version,
         })
 
+    # ---- FINALIZE STAGE 4 CONTENT BEFORE ANY STAMPING/HASHING ----
+    # The corpus-version footer must be appended BEFORE stamp_prose_file and
+    # commit_stage_output run on this file -- committing first and
+    # appending after (the original bug) leaves the recorded hash
+    # describing content that no longer matches what's on disk.
+    stage4_prose_path = run_context.artifact_path("stage4_mission_plan.md")
+    if os.path.exists(stage4_prose_path):
+        try:
+            with open(stage4_prose_path, "a") as f:
+                f.write(f"\n\n---\n*Analysis grounded in Corpus Version v{c_version} ({c_count} files)*")
+        except Exception:
+            pass
+
     # ---- STAMP POST-CREW PROSE ARTIFACTS ----
     annexB_prose_path = run_context.artifact_path("annexB_kcag.md")
     annexC_prose_path = run_context.artifact_path("annexC_bbn.md")
     stage3_prose_path = run_context.artifact_path("stage3.md")
-    stage4_prose_path = run_context.artifact_path("stage4_mission_plan.md")
     for p in (annexB_prose_path, annexC_prose_path, stage3_prose_path, stage4_prose_path):
         run_context.stamp_prose_file(p)
 
-    # ---- COMMIT STAGE 4 ARTIFACT (PENDING) ----
-    # Committed before the safety check runs, so the artifact's path and
-    # hash are in the audit trail regardless of the compliance outcome —
-    # same "commit PENDING first, promote after" two-step pattern already
-    # used for stage2 around its own deterministic gate.
-    if os.path.exists(stage4_prose_path):
-        commit_stage_output(state, "stage4", stage4_prose_path, status=StageStatus.PENDING)
-        save_assessment_state(state, run_id)
-    else:
-        print(f"WARNING: {stage4_prose_path} not found — stage4 agent may not have "
-              f"completed. assessment_state.json will show stage4 as NOT_STARTED.")
-
-    # ---- ITEM 8: PHASE 0 SAFETY GATE COMPLIANCE CHECK (deterministic, HARD
-    # BLOCK) ----
-    # Unlike the attribution check (warn-only, item 7), this is a hard gate:
-    # a missing safety-review section on a payload with a real physical/
-    # destructive effect is a compliance failure, not an analytical nicety.
+    # ---- ITEM 8: PHASE 0 SAFETY GATE COMPLIANCE CHECK (deterministic) ----
     # IMPORTANT CAVEAT: t_stage3 and t_stage4 both already ran their
     # human_input=True approval INSIDE post_crew.kickoff() above, so this
     # check fires AFTER a human has already approved the mission plan
@@ -548,36 +545,24 @@ if __name__ == "__main__":
     run_context.stamp_prose_file(phase0_check_path)
     print(f"Phase 0 Safety Gate check: "
           f"{'COMPLIANT' if safety['is_compliant'] else 'NON-COMPLIANT'} — {safety['summary']}")
-    if not safety["is_compliant"]:
-        set_stage_status(state, "stage4", StageStatus.FAIL)
-        save_assessment_state(state, run_id)
-        raise RuntimeError(
-            f"Phase 0 Safety Gate compliance FAILED: {safety['summary']} "
-            f"See {phase0_check_path}. Mission plan NOT finalized — "
-            f"revise Stage 4 to add the required safety section (or an explicit "
-            f"'NO CATEGORY 2/3 PAYLOADS' statement if this is a false positive) "
-            f"and re-run. Run audit trail: {out_dir}/assessment_state.json"
-        )
 
-    # ---- COMMIT POST-CREW STAGE OUTPUT TO ASSESSMENT STATE ----
-    # Stage 3 (t_stage3) is the payload-design gate; no structured schema
-    # exists for it yet, so it lands as PENDING against its prose artifact,
-    # same as Stage 0/1.
+    # ---- COMMIT STAGE 3 (unconditional of Stage 4's fate) ----
+    # Stage 3 succeeded regardless of what happens to Stage 4 next: its
+    # commit should not depend on Stage 4's outcome. Moved here (was
+    # previously only committed in the success branch, meaning a Stage 4
+    # rejection left Stage 3 uncommitted too, on an artifact that was
+    # never actually in question).
     if os.path.exists(stage3_prose_path):
         commit_stage_output(state, "stage3", stage3_prose_path, status=StageStatus.PENDING)
-    set_stage_status(state, "stage4", StageStatus.PASS)
-    state.current_stage = "complete"
-    save_assessment_state(state, run_id)
+        save_assessment_state(state, run_id)
 
-    # Stamp the final mission plan with the corpus version. This is appended
-    # AFTER the run-isolation header (stamp_prose_file already ran above),
-    # so it doesn't disturb the header regex — read_stamped_prose only
-    # matches at the start of the file.
-    try:
-        with open(stage4_prose_path, "a") as f:
-            f.write(f"\n\n---\n*Analysis grounded in Corpus Version v{c_version} ({c_count} files)*")
-    except Exception:
-        pass
+    # ---- FINALIZE STAGE 4 (single shared implementation — see src/state.py) ----
+    finalize_stage4_state(
+        state, run_id,
+        stage4_path=stage4_prose_path,
+        is_compliant=safety["is_compliant"],
+        safety_summary=safety["summary"],
+    )
 
     print("\n\n=== PIPELINE FINISHED ===")
     print(f"Run audit trail: {out_dir}/assessment_state.json")

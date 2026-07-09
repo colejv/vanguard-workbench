@@ -130,3 +130,65 @@ def append_gap(
     if stage in state.stages:
         state.stages[stage].gap_count += 1
     return state
+
+
+def finalize_stage4_state(
+    state: AssessmentState,
+    run_id: str,
+    stage4_path: str,
+    is_compliant: bool,
+    safety_summary: str = "",
+    base: str = "outputs",
+) -> AssessmentState:
+    """
+    Single production implementation of the Stage 4 finalize transition.
+    crew.py and the test suite both call this function directly, rather
+    than crew.py doing its own inline sequencing and tests reproducing that
+    sequencing separately -- a real bug (a missing mission-plan artifact
+    could still be marked PASS) shipped specifically because the original
+    test verified a hand-written simulation of this logic, not this logic.
+
+    Caller contract: by the time this is called, stage4_path must already
+    be its FINAL, immutable content -- any post-processing (e.g. appending
+    a corpus-version footer) must happen before this call, not after, since
+    the committed hash is only meaningful if nothing modifies the file
+    afterward.
+
+    Sets current_stage='stage4' immediately, before either outcome, so a
+    run that reached Stage 4 and was then rejected is never
+    indistinguishable in the audit trail from one that stalled two stages
+    earlier.
+
+    Fails closed on a missing artifact: refuses to mark stage4 PASS with no
+    file, no hash, no mission plan on disk, regardless of what a safety
+    check computed against empty text. Raises RuntimeError in both failure
+    paths, after persisting the FAIL status -- state is always saved before
+    the exception propagates.
+    """
+    state.current_stage = "stage4"
+
+    if not os.path.exists(stage4_path):
+        set_stage_status(state, "stage4", StageStatus.FAIL)
+        save_assessment_state(state, run_id, base)
+        raise RuntimeError(
+            f"Stage 4 did not produce {stage4_path} — the run cannot be "
+            f"finalized. Run audit trail: "
+            f"{run_output_dir(run_id, base)}/assessment_state.json"
+        )
+
+    commit_stage_output(state, "stage4", stage4_path, status=StageStatus.PENDING)
+    save_assessment_state(state, run_id, base)
+
+    if not is_compliant:
+        set_stage_status(state, "stage4", StageStatus.FAIL)
+        save_assessment_state(state, run_id, base)
+        raise RuntimeError(
+            f"Phase 0 Safety Gate compliance FAILED: {safety_summary} "
+            f"Mission plan NOT finalized. Run audit trail: "
+            f"{run_output_dir(run_id, base)}/assessment_state.json"
+        )
+
+    set_stage_status(state, "stage4", StageStatus.PASS)
+    state.current_stage = "complete"
+    save_assessment_state(state, run_id, base)
+    return state

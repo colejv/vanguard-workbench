@@ -1,37 +1,48 @@
 """
 Stage 4 assessment-state tests.
 
-Covers the six tests requested for Commit 1 (Stage 4 state tracking):
+Covers Commit 1 (Stage 4 state tracking) plus the corrective patch that
+followed real-code review:
+
   - test_assessment_state_contains_stage4
   - test_commit_stage4_output
   - test_stage4_can_transition_pending_to_pass
   - test_stage4_can_transition_pending_to_fail
   - test_run_not_complete_when_stage4_fails
   - test_all_stages_passed_through_stage4
+  - test_missing_stage4_artifact_cannot_pass          (new)
+  - test_finalized_hash_matches_final_file_content     (new)
 
-The first five are direct unit tests against src.schemas / src.state. The
-sixth (test_run_not_complete_when_stage4_fails) is written as a focused
-state-machine test rather than a full crew.py integration test — it
-exercises the exact sequence crew.py performs around the Phase 0 gate
-(commit PENDING -> gate check -> FAIL-before-raise / PASS-before-complete)
-without needing CrewAI or Ollama in the loop. The actual crew.py code path
-was additionally verified this session via a mocked-kickoff run against
-both a compliant and non-compliant Stage 4, confirmed directly against a
-real written assessment_state.json for each -- see the session notes if a
-true CrewAI-level integration test needs to be added to this suite later;
-that needs conftest.py fixtures matching whatever pattern the rest of
-tests/ already uses, which I have not seen.
+test_run_not_complete_when_stage4_fails previously reproduced the intended
+state-machine transition locally with a hand-written `is_compliant`
+branch, rather than calling the actual production code. That's exactly
+why it didn't catch two real bugs that shipped in crew.py: a hash
+committed before a corpus-version footer was appended afterward (so the
+recorded hash didn't match the final file), and a missing mission-plan
+artifact that could still be marked PASS if the safety check happened to
+return compliant against empty text. Both tests below now call
+finalize_stage4_state() directly -- the same function crew.py calls -- so
+a regression in the production code path fails these tests, not just a
+simulation of it.
 
 I have not seen this project's existing tests/ directory or its fixture
 conventions -- this file uses plain pytest with no external fixtures, so
 it should drop in cleanly, but import paths or naming may need a small
 adjustment to match whatever conventions are already established there.
 """
+import hashlib
 import os
+
 import pytest
 
 from src.schemas import AssessmentState, StageStatus, STAGE_NAMES
-from src.state import init_assessment_state, commit_stage_output, set_stage_status
+from src.state import (
+    init_assessment_state,
+    commit_stage_output,
+    set_stage_status,
+    finalize_stage4_state,
+    run_output_dir,
+)
 
 
 @pytest.fixture
@@ -41,6 +52,16 @@ def fake_artifact(tmp_path):
     p = tmp_path / "stage4_mission_plan.md"
     p.write_text("# STAGE 4: MDMP MISSION PLAN\n\nPhase 1: ...\n")
     return str(p)
+
+
+@pytest.fixture
+def run_base(tmp_path):
+    """Isolated outputs/ base directory per test, so save_assessment_state
+    calls inside finalize_stage4_state don't collide across tests or touch
+    a real outputs/ directory."""
+    base = tmp_path / "outputs_base"
+    base.mkdir()
+    return str(base)
 
 
 def test_assessment_state_contains_stage4():
@@ -77,8 +98,6 @@ def test_stage4_can_transition_pending_to_pass(fake_artifact):
 
     set_stage_status(state, "stage4", StageStatus.PASS)
     assert state.stages["stage4"].status == StageStatus.PASS
-    # Path and hash must survive the status transition -- set_stage_status
-    # promotes status only, it must not re-hash or discard prior commit data.
     assert state.stages["stage4"].output_path == fake_artifact
     assert state.stages["stage4"].output_hash is not None
 
@@ -89,52 +108,102 @@ def test_stage4_can_transition_pending_to_fail(fake_artifact):
 
     set_stage_status(state, "stage4", StageStatus.FAIL)
     assert state.stages["stage4"].status == StageStatus.FAIL
-    # A FAIL is not a missing artifact -- the mission plan was real and
-    # non-compliant, not absent. Hash/path must still be preserved so the
-    # audit trail can show exactly what was rejected.
     assert state.stages["stage4"].output_path == fake_artifact
     assert state.stages["stage4"].output_hash is not None
 
 
-def test_run_not_complete_when_stage4_fails(fake_artifact):
-    """Exercises the exact sequence crew.py performs around the Phase 0
-    gate: commit PENDING, then on gate failure set FAIL BEFORE raising and
-    never advance current_stage to 'complete'. On success, set PASS before
-    marking complete. This is the state-machine contract Commit 1 exists
-    to enforce -- a failed safety gate must never look like a finished run."""
-    # ---- Failure path ----
+def test_run_not_complete_when_stage4_fails(fake_artifact, run_base):
+    """Calls the REAL finalize_stage4_state() -- the same function crew.py
+    calls -- for both the failure and success branches, rather than
+    reproducing the transition logic locally. A non-compliant result must
+    raise, leave stage4=FAIL, and current_stage must land on 'stage4' (not
+    'stage2', and never 'complete') so a rejected run is never
+    indistinguishable from one that stalled two stages earlier."""
     state = init_assessment_state("test_run", "sha256:testhash")
-    commit_stage_output(state, "stage4", fake_artifact, status=StageStatus.PENDING)
-    state.current_stage = "stage2"  # matches crew.py's last real checkpoint before this point
+    state.current_stage = "stage2"  # simulates wherever pre_crew last left it
 
-    is_compliant = False  # simulates check_phase0_safety_gate() rejecting the plan
-    if not is_compliant:
-        set_stage_status(state, "stage4", StageStatus.FAIL)
-        # crew.py raises RuntimeError here -- current_stage is deliberately
-        # never touched again, so it stays at its last real checkpoint,
-        # never "complete".
-    else:
-        set_stage_status(state, "stage4", StageStatus.PASS)
-        state.current_stage = "complete"
+    with pytest.raises(RuntimeError, match="Phase 0 Safety Gate"):
+        finalize_stage4_state(
+            state, "test_run",
+            stage4_path=fake_artifact,
+            is_compliant=False,
+            safety_summary="COMPLIANCE GAP: simulated failure",
+            base=run_base,
+        )
 
     assert state.stages["stage4"].status == StageStatus.FAIL
+    assert state.current_stage == "stage4"
     assert state.current_stage != "complete"
-    assert state.current_stage == "stage2"
 
-    # ---- Success path, same sequence, opposite branch ----
+    # ---- Success path, same real function, opposite branch ----
     state2 = init_assessment_state("test_run_2", "sha256:testhash")
-    commit_stage_output(state2, "stage4", fake_artifact, status=StageStatus.PENDING)
     state2.current_stage = "stage2"
 
-    is_compliant = True
-    if not is_compliant:
-        set_stage_status(state2, "stage4", StageStatus.FAIL)
-    else:
-        set_stage_status(state2, "stage4", StageStatus.PASS)
-        state2.current_stage = "complete"
-
+    finalize_stage4_state(
+        state2, "test_run_2",
+        stage4_path=fake_artifact,
+        is_compliant=True,
+        safety_summary="",
+        base=run_base,
+    )
     assert state2.stages["stage4"].status == StageStatus.PASS
     assert state2.current_stage == "complete"
+
+
+def test_missing_stage4_artifact_cannot_pass(run_base):
+    """The exact bug this patch closes: a missing stage4_mission_plan.md
+    must never be marked PASS, regardless of what a safety check computed
+    (a check against empty/absent text could trivially return compliant if
+    Stage 3 had no Category 2/3 payloads at all). finalize_stage4_state
+    must check file existence BEFORE looking at is_compliant at all."""
+    state = init_assessment_state("test_run", "sha256:testhash")
+    nonexistent_path = os.path.join(run_base, "does_not_exist_stage4.md")
+    assert not os.path.exists(nonexistent_path)
+
+    # is_compliant=True on purpose -- proves the missing-file check takes
+    # priority over compliance, not just that failing compliance also fails.
+    with pytest.raises(RuntimeError, match="did not produce"):
+        finalize_stage4_state(
+            state, "test_run",
+            stage4_path=nonexistent_path,
+            is_compliant=True,
+            safety_summary="",
+            base=run_base,
+        )
+
+    assert state.stages["stage4"].status == StageStatus.FAIL
+    assert state.stages["stage4"].output_hash is None
+    assert state.stages["stage4"].output_path is None
+    assert state.current_stage == "stage4"
+    assert state.current_stage != "complete"
+
+
+def test_finalized_hash_matches_final_file_content(tmp_path, run_base):
+    """Regression test for the stale-hash bug: if a file is modified AFTER
+    finalize_stage4_state commits it, the stored hash and the actual file
+    diverge -- so the caller contract is that stage4_path must already
+    contain its FINAL content before this function is ever called. This
+    test proves finalize_stage4_state itself is trustworthy (hashes
+    exactly what's on disk at call time); crew.py's own responsibility to
+    call it only after all file modifications is enforced by the ordering
+    fix in crew.py, not by this function, and is covered by the
+    integration-level check performed against the real pipeline this
+    session (recomputing SHA-256 from the actual final file and comparing
+    to assessment_state.json's stored hash)."""
+    p = tmp_path / "stage4_mission_plan.md"
+    p.write_text("# STAGE 4\n\nPhase 1: ...\n\n---\n*Analysis grounded in Corpus Version v1 (3 files)*")
+    final_content_hash = "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest()
+
+    state = init_assessment_state("test_run", "sha256:testhash")
+    finalize_stage4_state(
+        state, "test_run",
+        stage4_path=str(p),
+        is_compliant=True,
+        safety_summary="",
+        base=run_base,
+    )
+
+    assert state.stages["stage4"].output_hash == final_content_hash
 
 
 def test_all_stages_passed_through_stage4(fake_artifact):
@@ -146,13 +215,11 @@ def test_all_stages_passed_through_stage4(fake_artifact):
 
     for name in ("stage0", "stage1", "stage2", "stage3"):
         state.stages[name].status = StageStatus.PASS
-    # stage4 still NOT_STARTED at this point
     assert state.all_stages_passed("stage4") is False
 
     commit_stage_output(state, "stage4", fake_artifact, status=StageStatus.PENDING)
     set_stage_status(state, "stage4", StageStatus.PASS)
     assert state.all_stages_passed("stage4") is True
 
-    # A single upstream regression should also correctly fail the check
     state.stages["stage2"].status = StageStatus.FAIL
     assert state.all_stages_passed("stage4") is False

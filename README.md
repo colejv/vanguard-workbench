@@ -1296,7 +1296,6 @@ Current limitations include:
 * There is no deterministic Stage 3 test-plan validator.
 * Stage 3 and Stage 4 still run in the same post-analysis CrewAI invocation.
 * The Phase 0 safety-language check runs after the Stage 4 human-input prompt.
-* Stage 4 is not yet included in the assessment-state stage list.
 * The attribution-boundary check is advisory rather than blocking.
 * The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
 * The Purple Team tools still use flat compatibility paths under `outputs/`.
@@ -1611,7 +1610,6 @@ The current development priorities are:
 * Convert Stage 3 into structured test-plan drafting
 * Validate Stage 3 before Stage 4
 * Move safety enforcement before Stage 4
-* Add Stage 4 to assessment-state tracking
 * Update Purple Team tools to consume run-scoped artifacts directly
 
 The project's intended direction is:

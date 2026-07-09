@@ -760,6 +760,136 @@ SAFETY_GATE_MARKERS = [
 ]
 NO_GATE_NEEDED_MARKER = r"no\s+category\s*2\s*/?\s*3\s+payloads?"
 
+
+def _strip_markdown_emphasis(text: str) -> str:
+    """Strip **bold**, *italic*, and `code` markers before running any
+    field/category-line regex against LLM-generated prose. Real Stage 3
+    output routinely bolds field labels (observed in this project's own
+    transcripts: '**Category:** 3, 4', '**Category:** `1, 4`'), and a
+    regex that only matches unstyled 'Category: 3, 4' would silently fail
+    to detect a real Category 2/3 declaration — a dangerous false
+    negative for a safety gate, not a cosmetic miss."""
+    return re.sub(r"[*_`]+", "", text)
+
+
+STAGE3_CATEGORY_LINE = re.compile(
+    r"^\s*(?:[-+]\s*)?category\s*:\s*([^\n]+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+STAGE3_SAFETY_SECTION = re.compile(
+    r"^#{1,6}\s+PRE-STAGE-4 SAFETY REVIEW\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+STAGE3_NO_GATE_REQUIRED = "NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED."
+
+STAGE3_REQUIRED_SAFETY_FIELDS = {
+    "affected_assets": r"^\s*(?:[-+]\s*)?affected assets\s*:\s*(.+)$",
+    "approving_roles": r"^\s*(?:[-+]\s*)?required approving roles\s*:\s*(.+)$",
+    "safety_authority": r"^\s*(?:[-+]\s*)?(?:rso or domain-equivalent safety authority|safety authority)\s*:\s*(.+)$",
+    "abort_authority": r"^\s*(?:[-+]\s*)?abort authority\s*:\s*(.+)$",
+    "abort_criteria": r"^\s*(?:[-+]\s*)?abort criteria\s*:\s*(.+)$",
+    "termination_time": r"^\s*(?:[-+]\s*)?maximum termination time\s*:\s*(.+)$",
+    "rollback": r"^\s*(?:[-+]\s*)?(?:rollback or recovery procedure|rollback procedure)\s*:\s*(.+)$",
+    "release_condition": r"^\s*(?:[-+]\s*)?release condition\s*:\s*(.+)$",
+}
+
+STAGE3_INVALID_VALUES = {
+    "", "tbd", "unknown", "n/a", "none", "not determined", "to be determined",
+}
+
+
+def check_stage3_safety_gate(stage3_text: str) -> dict:
+    """Deterministic pre-Stage-4 gate: verifies that any Category 2/3 test
+    concept in Stage 3 is accompanied by a complete PRE-STAGE-4 SAFETY
+    REVIEW section, BEFORE Stage 4 is ever constructed. Plain Python, not
+    a CrewAI tool — crew.py calls this directly between analysis_crew and
+    stage4_crew, the same fail-closed pattern verify_stage2_vectors uses
+    between pre_crew and post_crew.
+
+    Detection is markdown-emphasis-agnostic (see _strip_markdown_emphasis)
+    and only matches structured 'Label: value' lines — never a bare
+    substring search for 'Category 2'/'Category 3', which the
+    no-gate-required sentence itself would false-positive against (it
+    contains the literal text 'CATEGORY 2/3').
+
+    Result contract: {is_compliant, category_2_3_detected,
+    matched_categories, safety_review_present, missing_fields,
+    invalid_fields, explicit_not_required, summary}.
+    """
+    text = _strip_markdown_emphasis(stage3_text or "")
+
+    explicit_not_required = STAGE3_NO_GATE_REQUIRED.lower() in text.lower()
+
+    category_values = STAGE3_CATEGORY_LINE.findall(text)
+    category_numbers = set()
+    for value in category_values:
+        category_numbers.update(int(n) for n in re.findall(r"\b[1-4]\b", value))
+    detected = bool(category_numbers & {2, 3})
+
+    result = {
+        "is_compliant": False,
+        "category_2_3_detected": detected,
+        "matched_categories": sorted(category_numbers & {2, 3}),
+        "safety_review_present": bool(STAGE3_SAFETY_SECTION.search(text)),
+        "missing_fields": [],
+        "invalid_fields": [],
+        "explicit_not_required": explicit_not_required,
+        "summary": "",
+    }
+
+    if not detected:
+        if explicit_not_required:
+            result["is_compliant"] = True
+            result["summary"] = ("No Category 2/3 concepts were declared and the required "
+                                  "not-applicable statement is present.")
+        else:
+            result["summary"] = ("No Category 2/3 concepts were detected, but the required "
+                                  "explicit not-applicable statement is missing.")
+        return result
+
+    if explicit_not_required:
+        result["summary"] = ("Stage 3 declares Category 2/3 concepts but also states that "
+                              "the safety gate is not required — contradictory, not compliant.")
+        result["invalid_fields"].append("contradictory_not_required_statement")
+        return result
+
+    if not result["safety_review_present"]:
+        result["summary"] = ("Category 2/3 concepts were detected, but the "
+                              "PRE-STAGE-4 SAFETY REVIEW section is missing.")
+        return result
+
+    values = {}
+    for field, pattern in STAGE3_REQUIRED_SAFETY_FIELDS.items():
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if not m:
+            result["missing_fields"].append(field)
+            continue
+        value = m.group(1).strip()
+        values[field] = value
+        if value.lower() in STAGE3_INVALID_VALUES:
+            result["invalid_fields"].append(field)
+
+    release_condition = values.get("release_condition", "").lower()
+    if release_condition and not any(
+        phrase in release_condition for phrase in ("may not begin", "must not begin", "shall not begin")
+    ):
+        result["invalid_fields"].append("release_condition")
+
+    result["is_compliant"] = not result["missing_fields"] and not result["invalid_fields"]
+
+    if result["is_compliant"]:
+        result["summary"] = ("Category 2/3 concepts are present and the required pre-Stage-4 "
+                              "safety controls are documented.")
+    else:
+        result["summary"] = (f"Category 2/3 concepts are present, but required safety controls "
+                              f"are incomplete. Missing={result['missing_fields']}; "
+                              f"invalid={result['invalid_fields']}.")
+
+    return result
+
+
 def check_phase0_safety_gate(stage3_text: str, stage4_text: str) -> dict:
     """Checks whether any Category 2 (Degradation & Destruction) or
     Category 3 (Physical Behavior Alteration) payload in Stage 3 output is
@@ -768,8 +898,20 @@ def check_phase0_safety_gate(stage3_text: str, stage4_text: str) -> dict:
     gate as not-applicable — silence is never treated as compliant."""
     s3, s4 = stage3_text or "", stage4_text or ""
 
+    # Strip the required override sentence out of s3 before scanning it:
+    # KINETIC_CATEGORY_MARKERS matches raw "category 2"/"category 3"
+    # substrings anywhere in the text, and the override sentence itself
+    # ("NO CATEGORY 2/3 PAYLOADS...") contains that exact substring. Since
+    # Stage 3's own prompt (CRITICAL INSTRUCTION 5) now requires this
+    # sentence to appear IN stage3_text whenever no Category 2/3 concepts
+    # exist, leaving it unstripped would make category_2_3_detected always
+    # true on a genuinely clean Stage 3 output -- a false positive that
+    # only started happening once Stage 3 itself began emitting this
+    # sentence, not a pre-existing issue with unrelated causes.
+    s3_for_category_scan = re.sub(NO_GATE_NEEDED_MARKER, "", s3, flags=re.I)
+
     matched = [m.group(0) for pat in KINETIC_CATEGORY_MARKERS + KINETIC_KEYWORD_MARKERS
-               for m in [re.search(pat, s3, re.I)] if m]
+               for m in [re.search(pat, s3_for_category_scan, re.I)] if m]
     category_2_3_detected = len(matched) > 0
 
     gate_present = any(re.search(pat, s4, re.I) for pat in SAFETY_GATE_MARKERS)
@@ -780,13 +922,15 @@ def check_phase0_safety_gate(stage3_text: str, stage4_text: str) -> dict:
             "No Category 2/3 (kinetic/destructive) payload detected in Stage 3 — "
             "Phase 0 Safety Gate not required.")
     elif explicit_not_needed:
-        # Checked BEFORE gate_present: the override phrase itself contains
-        # "phase 0 ... safety gate", which would otherwise false-positive
-        # match SAFETY_GATE_MARKERS and get misattributed as a real gate
-        # section rather than recognized as the explicit override it is.
-        is_compliant, summary = True, (
-            "Stage 4 explicitly states no Category 2/3 payloads apply — accepted, but "
-            "flagged for human review since Stage 3 language suggested otherwise.")
+        # Checked BEFORE gate_present so the override phrase (which itself
+        # contains "phase 0 ... safety gate") isn't misattributed as a
+        # real gate section. Category 2/3 WAS detected in Stage 3 at this
+        # point, so Stage 4 stating no Category 2/3 payloads apply is a
+        # direct contradiction, not an acceptable override — fail closed
+        # rather than accept-with-a-flag.
+        is_compliant, summary = False, (
+            "COMPLIANCE GAP: Stage 3 contains Category 2/3 concepts, but Stage 4 "
+            "states that no Category 2/3 payloads apply.")
     elif gate_present:
         is_compliant, summary = True, (
             f"Category 2/3 payload detected ({matched[:3]}) and a Phase 0 Safety Gate "

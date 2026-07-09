@@ -1,0 +1,257 @@
+"""
+Tests for the pre-Stage-4 safety gate (check_stage3_safety_gate) and the
+tightened contradiction handling in check_phase0_safety_gate.
+
+Covers the reviewer's 11 requested checker unit tests, plus 3 additional
+markdown-robustness tests I added after finding that the originally
+proposed CATEGORY_LINE regex silently fails to match real Stage 3 output
+(observed this session: '**Category:** 3, 4', '**Category:** `1, 4`') --
+a bolded field label is the norm for this project's actual LLM output,
+not an edge case, and a regex that only matches unstyled 'Category: 2'
+would be a dangerous false negative for a safety gate. See
+_strip_markdown_emphasis in tools.py.
+
+Also covers the two gate-report artifact-boundary tests (stamped,
+run-rejecting) and the check_phase0_safety_gate contradiction fix.
+
+The crew.py-level integration proof -- that stage4_crew is NEVER even
+constructed when this gate fails, and IS constructed and succeeds when it
+passes -- was verified this session via a mocked-kickoff run against the
+real pipeline (4 scenarios: pass-with-no-category, pass-with-category,
+fail-missing-review, fail-incomplete-review; the failure cases assert the
+stage4_crew mock's call flag is never set at all). That isn't packaged as
+a pytest file here since I don't know this repo's fixture/conftest.py
+conventions for a mocked-Crew.kickoff harness at that scale -- happy to
+add it in whatever shape matches tests/ if useful.
+
+I have not seen this project's existing tests/ directory or its fixture
+conventions -- this file uses plain pytest with no external fixtures, so
+it should drop in cleanly, but import paths or naming may need a small
+adjustment to match whatever conventions are already established there.
+"""
+import json
+from pathlib import Path
+
+import pytest
+
+from src import run_context
+from src.tools import check_stage3_safety_gate, check_phase0_safety_gate
+
+
+COMPLETE_REVIEW = """
+## PRE-STAGE-4 SAFETY REVIEW
+Category 2/3 concepts present: YES
+Covered test concepts: RT-001, RT-004
+Affected assets: AFATDS fire control endpoint
+Required approving roles: RSO, Blue Team Commander
+RSO or domain-equivalent safety authority: Range Safety Officer
+Abort authority: Red Team Lead
+Abort criteria: Any telemetry showing coordinate deviation >5m
+Maximum termination time: <15 sec
+Rollback or recovery procedure: Immediate kill-switch, revert to baseline routing
+Release condition: Phase 1 may not begin until safety clearance is signed off.
+"""
+
+NO_GATE = "NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED."
+
+
+# ---------- check_stage3_safety_gate: reviewer-requested unit tests ----------
+
+def test_no_category_2_3_with_exact_statement_passes():
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 1\n\n{NO_GATE}")
+    assert r["is_compliant"] is True
+    assert r["category_2_3_detected"] is False
+
+
+def test_no_category_2_3_without_statement_fails():
+    r = check_stage3_safety_gate("### RT-001\nCategory: 1\n")
+    assert r["is_compliant"] is False
+    assert r["category_2_3_detected"] is False
+
+
+def test_category_2_with_complete_safety_review_passes():
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 2\n{COMPLETE_REVIEW}")
+    assert r["is_compliant"] is True
+    assert r["category_2_3_detected"] is True
+    assert not r["missing_fields"]
+    assert not r["invalid_fields"]
+
+
+def test_category_3_with_complete_safety_review_passes():
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 3\n{COMPLETE_REVIEW}")
+    assert r["is_compliant"] is True
+
+
+def test_mixed_category_3_4_passes_with_complete_review():
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 3, 4\n{COMPLETE_REVIEW}")
+    assert r["is_compliant"] is True
+    assert r["matched_categories"] == [3]
+
+
+@pytest.mark.parametrize("removed_line", [
+    "Affected assets: AFATDS fire control endpoint\n",
+    "Required approving roles: RSO, Blue Team Commander\n",
+    "RSO or domain-equivalent safety authority: Range Safety Officer\n",
+    "Abort authority: Red Team Lead\n",
+    "Abort criteria: Any telemetry showing coordinate deviation >5m\n",
+    "Maximum termination time: <15 sec\n",
+    "Rollback or recovery procedure: Immediate kill-switch, revert to baseline routing\n",
+])
+def test_category_2_missing_each_required_field_fails(removed_line):
+    bad_review = COMPLETE_REVIEW.replace(removed_line, "")
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 2\n{bad_review}")
+    assert r["is_compliant"] is False
+    assert r["missing_fields"], "at least one field must be reported missing"
+
+
+def test_tbd_values_fail():
+    bad_review = COMPLETE_REVIEW.replace("Range Safety Officer", "TBD")
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 2\n{bad_review}")
+    assert r["is_compliant"] is False
+    assert "safety_authority" in r["invalid_fields"]
+
+
+def test_missing_release_condition_fails():
+    bad_review = COMPLETE_REVIEW.replace(
+        "Release condition: Phase 1 may not begin until safety clearance is signed off.", "")
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 2\n{bad_review}")
+    assert r["is_compliant"] is False
+    assert "release_condition" in r["missing_fields"]
+
+
+def test_weak_release_condition_fails():
+    bad_review = COMPLETE_REVIEW.replace(
+        "Release condition: Phase 1 may not begin until safety clearance is signed off.",
+        "Release condition: Proceed with caution.")
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 2\n{bad_review}")
+    assert r["is_compliant"] is False
+    assert "release_condition" in r["invalid_fields"]
+
+
+def test_category_2_with_not_required_statement_fails():
+    """Contradiction: Category 2 declared AND the not-required sentence
+    both present. Must fail, not silently pick one."""
+    r = check_stage3_safety_gate(f"### RT-001\nCategory: 2\n{COMPLETE_REVIEW}\n{NO_GATE}")
+    assert r["is_compliant"] is False
+    assert "contradictory_not_required_statement" in r["invalid_fields"]
+
+
+def test_no_gate_sentence_does_not_trigger_category_detection():
+    """The sentinel phrase itself contains the literal text 'CATEGORY 2/3'
+    -- a naive substring search would false-positive against its own
+    override statement. Must not self-trigger detection."""
+    r = check_stage3_safety_gate(NO_GATE)
+    assert r["category_2_3_detected"] is False
+    assert r["is_compliant"] is True
+
+
+# ---------- Additional: markdown-robustness (found during verification) ----------
+
+def test_bold_category_label_still_detected():
+    """Real Stage 3 output bolds field labels -- this must still work,
+    not just the illustrative unstyled format."""
+    r = check_stage3_safety_gate(f"### RT-001\n**Category:** 2\n{COMPLETE_REVIEW}")
+    assert r["category_2_3_detected"] is True
+    assert r["is_compliant"] is True
+
+
+def test_bold_field_labels_in_review_still_detected():
+    text = (
+        "### RT-001\n**Category:** 2\n\n"
+        "## PRE-STAGE-4 SAFETY REVIEW\n"
+        "**Category 2/3 concepts present:** YES\n"
+        "**Covered test concepts:** RT-001\n"
+        "**Affected assets:** AFATDS\n"
+        "**Required approving roles:** RSO\n"
+        "**RSO or domain-equivalent safety authority:** RSO\n"
+        "**Abort authority:** Red Team Lead\n"
+        "**Abort criteria:** deviation >5m\n"
+        "**Maximum termination time:** <15 sec\n"
+        "**Rollback or recovery procedure:** kill-switch\n"
+        "**Release condition:** Phase 1 may not begin until cleared.\n"
+    )
+    r = check_stage3_safety_gate(text)
+    assert r["is_compliant"] is True, r
+
+
+def test_backtick_wrapped_category_value_still_detected():
+    """Matches the exact format observed in a real Stage 3 transcript
+    this session: '**Category:** `1, 4`'."""
+    r = check_stage3_safety_gate(f"### RT-001\n**Category:** `2, 3`\n{COMPLETE_REVIEW}")
+    assert r["category_2_3_detected"] is True
+    assert r["is_compliant"] is True
+
+
+# ---------- Gate report artifact-boundary tests ----------
+
+def test_gate_report_is_run_stamped(tmp_path):
+    run_context.reset_active_run()
+    out_dir = tmp_path / "outputs" / "test-run"
+    run_context.set_active_run("test-run", "sha256:test-corpus", str(out_dir))
+
+    gate_result = check_stage3_safety_gate(f"### RT-001\nCategory: 1\n\n{NO_GATE}")
+    gate_path = run_context.artifact_path("stage3_safety_gate.json")
+    run_context.write_stamped_json(gate_path, gate_result)
+
+    envelope = json.loads(Path(gate_path).read_text())
+    assert envelope["_meta"]["run_id"] == "test-run"
+    assert envelope["_meta"]["corpus_manifest_hash"] == "sha256:test-corpus"
+    assert envelope["data"]["is_compliant"] is True
+
+    run_context.reset_active_run()
+
+
+def test_gate_rejects_stage3_from_another_run(tmp_path):
+    out_dir_a = tmp_path / "outputs" / "run-a"
+    run_context.reset_active_run()
+    run_context.set_active_run("run-a", "sha256:corpus-a", str(out_dir_a))
+    gate_path = run_context.artifact_path("stage3_safety_gate.json")
+    run_context.write_stamped_json(gate_path, {"is_compliant": True})
+    run_context.reset_active_run()
+
+    out_dir_b = tmp_path / "outputs" / "run-b"
+    run_context.set_active_run("run-b", "sha256:corpus-b", str(out_dir_b))
+    with pytest.raises(ValueError):
+        run_context.read_stamped_json(gate_path)
+    run_context.reset_active_run()
+
+
+# ---------- check_phase0_safety_gate: tightened contradiction handling ----------
+
+def test_final_phase0_check_still_runs():
+    """Baseline: the existing defense-in-depth check is unaffected for
+    the normal compliant case."""
+    s3 = "Category: 3\nkinetic effect"
+    s4 = "PHASE 0 -- SAFETY GATE\nRSO required. Abort <15 sec."
+    r = check_phase0_safety_gate(s3, s4)
+    assert r["is_compliant"] is True
+
+
+def test_stage4_contradiction_fails_final_check():
+    """The fix this commit makes: Stage 3 declares Category 2/3, but
+    Stage 4 states no Category 2/3 payloads apply -- must now FAIL, not
+    pass with a 'flagged for review' note."""
+    s3 = "Category: 2\nDegradation payload targeting the fires control endpoint."
+    s4 = NO_GATE
+    r = check_phase0_safety_gate(s3, s4)
+    assert r["is_compliant"] is False
+    assert "COMPLIANCE GAP" in r["summary"]
+
+
+def test_clean_stage3_override_sentence_does_not_self_trigger_final_check():
+    """Regression test for a bug found DURING verification of this
+    commit, not present in the original proposal: Stage 3's own required
+    override sentence ('NO CATEGORY 2/3 PAYLOADS...', now mandated by
+    CRITICAL INSTRUCTION 5) contains the literal substring 'CATEGORY 2',
+    which check_phase0_safety_gate's cruder KINETIC_CATEGORY_MARKERS scan
+    of raw stage3_text would otherwise match -- making a genuinely clean
+    Stage 3 output (no Category 2/3 concepts, correctly stating so)
+    falsely register as category_2_3_detected=True. This bug did not
+    exist before this commit, because Stage 3 never needed to contain
+    this sentence prior to CRITICAL INSTRUCTION 5."""
+    s3_clean = f"Category: 1\n\n{NO_GATE}"
+    s4_clean = "# stage4\nPhase 1: normal operations."
+    r = check_phase0_safety_gate(s3_clean, s4_clean)
+    assert r["category_2_3_detected"] is False, \
+        "the override sentence's own text must not self-trigger category detection"
+    assert r["is_compliant"] is True

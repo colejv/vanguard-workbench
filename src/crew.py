@@ -6,7 +6,7 @@ from src.tasks import build_tasks, build_stage4_task
 from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
                        discover_corpus_files, read_corpus_file,
                        check_attribution_boundary, check_phase0_safety_gate,
-                       verify_stage2_vectors)
+                       check_stage3_safety_gate, verify_stage2_vectors)
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status,
@@ -527,6 +527,31 @@ if __name__ == "__main__":
 
     state.current_stage = "stage3"
     commit_stage_output(state, "stage3", stage3_prose_path, status=StageStatus.PENDING)
+    save_assessment_state(state, run_id)
+
+    # ---- PRE-STAGE-4 SAFETY GATE (deterministic, HARD BLOCK) ----
+    # This is the actual fix for the gap the crew split was built to close:
+    # unlike check_phase0_safety_gate below (defense in depth, runs after
+    # Stage 4's own human_input approval), this gate runs BEFORE Stage 4 is
+    # even constructed. A non-compliant Stage 3 output now never reaches a
+    # human approval prompt for Stage 4 at all.
+    stage3_safety = check_stage3_safety_gate(stage3_text)
+    stage3_gate_path = run_context.artifact_path("stage3_safety_gate.json")
+    run_context.write_stamped_json(stage3_gate_path, stage3_safety)
+    print(f"Pre-Stage-4 safety gate: "
+          f"{'COMPLIANT' if stage3_safety['is_compliant'] else 'NON-COMPLIANT'} — {stage3_safety['summary']}")
+
+    if not stage3_safety["is_compliant"]:
+        set_stage_status(state, "stage3", StageStatus.FAIL)
+        state.current_stage = "stage3"
+        save_assessment_state(state, run_id)
+        raise RuntimeError(
+            f"Stage 3 safety gate FAILED: {stage3_safety['summary']} "
+            f"See {stage3_gate_path}. Stage 4 was not constructed. "
+            f"Run audit trail: {out_dir}/assessment_state.json"
+        )
+
+    set_stage_status(state, "stage3", StageStatus.PASS)
     save_assessment_state(state, run_id)
 
     # ---- BUILD AND RUN STAGE 4 (separate crew, no live context=[t_stage3];

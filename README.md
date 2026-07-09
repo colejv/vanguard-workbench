@@ -1,140 +1,1641 @@
-# Vanguard Workbench: Autonomous Information Warfare Analysis
+# Vanguard Workbench
 
-Vanguard Workbench is an agentic AI pipeline designed for Information Warfare (IW) analysis, Reverse Intelligence Preparation of the Battlefield (IPB), and Red Team mission planning against friendly Systems Under Test (SUT). 
+**AI-augmented threat modeling and human-governed assessment planning**
 
-Powered by CrewAI and local MLX-optimized LLMs, Vanguard completely isolates the analytical environment from the public internet to maintain OPSEC. It ingests unstructured intelligence, maps system architectures to adversarial frameworks (MITRE ATT&CK, ATLAS, EMB3D, SPARTA), computes mathematical threat probabilities via Bayesian Belief Networks (BBN), and outputs actionable Military Decision Making Process (MDMP) payload designs.
+Vanguard Workbench is a local-first, agentic analysis pipeline for authorized Information Warfare, Red Team, and Purple Team assessment planning.
 
-## System Requirements
-* **OS:** macOS (Optimized for Apple Silicon / M-Series Unified Memory)
-* **Python:** 3.12+
-* **Local LLM Engine:** [Ollama](https://ollama.com/)
-* **Containerization:** Docker Desktop (for local SearXNG collection)
+It converts an approved source corpus into:
 
-## Core Architecture
-* **Orchestration:** CrewAI (Sequential Process)
-* **Reasoning Engine:** `gemma4:12b-mlx` (Tool execution, Pydantic validation, synthesis)
-* **Extraction Engine:** `gemma4:e4b` (Fast, high-temperature document decomposition)
-* **Graph/Math:** `NetworkX` (KCAG Min-Cut paths), `pgmpy` (Discrete BBN Scoring)
+* Reverse IPB findings
+* Structured system decomposition
+* Framework-grounded attack vectors
+* Kill Chain Attack Graph analysis
+* Bayesian threat estimates
+* Human-reviewed test concepts
+* MDMP-style mission plans
+* Defensive coverage and Sigma-rule scaffolds
+
+Vanguard is a **decision-support system**. It does not autonomously execute tests against a System Under Test. Human operators remain responsible for authorization, model review, implementation, execution, safety, and final assessment decisions.
+
+> [!WARNING]
+> Use Vanguard only on systems you own or are explicitly authorized to assess.
+>
+> Generated findings, threat scores, test concepts, mission plans, and detection rules require qualified human review before operational use.
 
 ---
 
-## 1. Installation & Setup
+## Table of Contents
 
-### Clone and Isolate
-```bash
-git clone [https://github.com/YOUR_USERNAME/vanguard-workbench.git](https://github.com/YOUR_USERNAME/vanguard-workbench.git)
-cd vanguard-workbench
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+* [What Vanguard Does](#what-vanguard-does)
+* [How the Pipeline Works](#how-the-pipeline-works)
+* [System Requirements](#system-requirements)
+* [Installation](#installation)
+* [Model Setup](#model-setup)
+* [Quick Start](#quick-start)
+* [Prepare the Assessment Brief](#prepare-the-assessment-brief)
+* [Add Source Material](#add-source-material)
+* [Optional Source Collection](#optional-source-collection)
+* [Freeze the Corpus](#freeze-the-corpus)
+* [Run an Assessment](#run-an-assessment)
+* [Monitor a Running Assessment](#monitor-a-running-assessment)
+* [Resume an Interrupted Assessment](#resume-an-interrupted-assessment)
+* [Assessment Outputs](#assessment-outputs)
+* [Pipeline Stages](#pipeline-stages)
+* [Purple Team Workflow](#purple-team-workflow)
+* [Dashboard](#dashboard)
+* [Testing](#testing)
+* [Security Considerations](#security-considerations)
+* [Current Limitations](#current-limitations)
+* [Troubleshooting](#troubleshooting)
+* [Repository Layout](#repository-layout)
+* [Responsible Use](#responsible-use)
 
+---
+
+## What Vanguard Does
+
+Vanguard helps an authorized assessment team answer four questions:
+
+1. Where should we test first?
+2. Why is that path important?
+3. How should the test be controlled?
+4. What should defenders observe and measure?
+
+The project combines local language models with deterministic Python tools.
+
+AI agents organize evidence, build structured analysis, and draft planning artifacts. Deterministic tools perform corpus verification, framework-ID validation, graph calculations, Bayesian inference, artifact hashing, and safety-language checks.
+
+The intended operating model is:
+
+> **Vanguard proposes, prioritizes, explains, and documents. Humans authorize, implement, execute, and decide.**
+
+---
+
+## How the Pipeline Works
+
+```text
+Approved source corpus
+        ↓
+Corpus lock verification
+        ↓
+Stage 0 — Reverse IPB
+        ↓
+Stage 1 — System decomposition
+        ↓
+Stage 2 — Attack-surface mapping
+        ↓
+Deterministic framework verification
+        ↓
+Annex B — Kill Chain Attack Graph
+        ↓
+Annex C — Bayesian threat model
+        ↓
+Stage 3 — Human-reviewed test concepts
+        ↓
+Stage 4 — MDMP-style mission plan
+        ↓
+Purple Team defensive validation
 ```
 
-### Configure Local Models
+Vanguard currently uses:
 
-Vanguard relies entirely on local inference to prevent data leakage of sensitive SUT architectures. Ensure Ollama is running, then pull the required models:
+* **CrewAI** for multi-agent orchestration
+* **Ollama** for local model inference
+* **Pydantic** for structured artifacts
+* **NetworkX** for KCAG analysis
+* **pgmpy** for Bayesian inference
+* **SearXNG** for optional locally brokered web search
+* **Streamlit** for the experimental dashboard
+
+---
+
+## System Requirements
+
+### Required
+
+* macOS or Linux
+* Python 3.12 or newer
+* Git
+* Ollama
+* Sufficient local memory for the configured models
+
+### Optional
+
+* Docker with Docker Compose for the SearXNG collection workflow
+* A second terminal for monitoring the heartbeat log
+
+### Hardware considerations
+
+The reasoning model is a 27-billion-parameter local model. Runtime depends heavily on:
+
+* Available RAM or unified memory
+* Model quantization
+* CPU or GPU acceleration
+* Corpus size
+* Number of generated graph nodes and edges
+
+Large Stage 1, Stage 2, and Annex C generations may take substantially longer than simple extraction tasks.
+
+---
+
+## Installation
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/colejv/vanguard-workbench.git
+cd vanguard-workbench
+```
+
+### 2. Create a virtual environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+### 3. Upgrade the packaging tools
+
+```bash
+python -m pip install --upgrade pip setuptools wheel
+```
+
+### 4. Install the project dependencies
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### 5. Install the PDF reader
+
+The corpus reader currently imports `pypdf`, which is not yet declared directly in `requirements.txt`.
+
+```bash
+python -m pip install pypdf
+```
+
+Verify it:
+
+```bash
+python -c "from pypdf import PdfReader; print('pypdf ready')"
+```
+
+### 6. Create the runtime directories
+
+```bash
+mkdir -p sources outputs corpus-index
+```
+
+### 7. Verify the Python import path
+
+Run this command from the repository root:
+
+```bash
+python -c "import src.crew; print('Vanguard imports successfully')"
+```
+
+---
+
+## Model Setup
+
+Start Ollama using the normal method for your operating system.
+
+### Core analysis models
+
+The current core pipeline uses:
+
+* `gemma4:e4b` for lightweight extraction
+* `qwen3.6:27b` for reasoning, structured output, and tool execution
+
+Install them:
 
 ```bash
 ollama pull gemma4:e4b
+ollama pull qwen3.6:27b
+```
+
+### Optional collection and Sigma model
+
+The current collection query planner and Sigma generator still reference:
+
+```text
+gemma4:12b-mlx
+```
+
+Install it when using those optional components:
+
+```bash
 ollama pull gemma4:12b-mlx
+```
 
+### Verify the models
+
+```bash
+ollama list
+```
+
+Verify the Ollama API:
+
+```bash
+curl http://localhost:11434/api/tags
+```
+
+The core model configuration is stored in:
+
+```text
+config/llm.py
+```
+
+The default endpoints are:
+
+```text
+OpenAI-compatible endpoint: http://localhost:11434/v1
+Native Ollama endpoint:     http://localhost:11434
 ```
 
 ---
 
-## 2. Phase 1: OPSEC-Safe Collection & Research
+## Quick Start
 
-Before analyzing a system, you must gather Open Source Intelligence (OSINT) and structure the intelligence requirements. Vanguard uses a local instance of SearXNG to prevent fingerprinting or search-engine tracking during the collection phase.
+After installation and model setup:
 
-### Step 2A: Spin up SearXNG
+````bash
+# 1. Edit the authorized assessment brief
+$EDITOR collection/brief.md
 
-Navigate to the collection directory and start the Docker container:
+# 2. Add approved sources
+cp /path/to/approved/material.md sources/
+cp /path/to/approved/manual.pdf sources/
 
-```bash
-cd collection/searxng
-docker-compose up -d
+# 3. Freeze the corpus
+python - <<'PY'
+import hashlib
+import json
+from pathlib import Path
 
+source_dir = Path("sources")
+extensions = {".md", ".txt", ".json", ".pdf"}
+
+files = sorted(
+    path
+    for path in source_dir.iterdir()
+    if path.is_file()
+    and path.suffix.lower() in extensions
+    and not path.name.startswith("_")
+    and path.name != "corpus_manifest.md"
+)
+
+manifest = {
+    "files": [
+        {
+            "file": path.name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in files
+    ]
+}
+
+manifest_path = source_dir / "corpus_manifest.md"
+manifest_path.write_text(
+    "# Frozen Corpus Manifest\n\n"
+    "This manifest binds the assessment to the exact files listed below.\n\n"
+    "```json\n"
+    + json.dumps(manifest, indent=2)
+    + "\n```\n",
+    encoding="utf-8",
+)
+
+print(f"Wrote {manifest_path}")
+print(f"Locked {len(files)} source files")
+PY
+
+# 4. Run Vanguard
+python -m src.crew
+````
+
+Vanguard prints the new run ID near the beginning of execution.
+
+Example:
+
+```text
+Run ID: vaf_20260709_143022
 ```
 
-*SearXNG is now running locally on `http://localhost:8080`.*
+All assessment artifacts are written under:
 
-### Step 2B: Define the Assessment Brief (Target SUT)
+```text
+outputs/<run_id>/
+```
 
-Open `collection/brief.md`. This file acts as the single source of truth for the entire operation. Define your System Under Test (SUT) designation, the vendor, and specific collection priorities.
+---
 
-### Step 2C: Execute Autonomous Collection
-Run the collector script to query the local SearXNG instance for technical documentation, vendor whitepapers, and exercise reports regarding the SUT. It will read your `brief.md`, autonomously generate iterative search queries using Gemma 4, scrape the results via SearXNG, score them for relevance, and save the best documents to the corpus.
+## Prepare the Assessment Brief
+
+Edit:
+
+```text
+collection/brief.md
+```
+
+The brief should define the friendly System Under Test and the authorized assessment boundaries.
+
+Recommended structure:
+
+```markdown
+# Assessment Brief
+
+## System Under Test
+
+- Name or designation:
+- System type:
+- Owner:
+- Vendor:
+- Mission or business purpose:
+- High-level architecture:
+
+## Assessment Purpose
+
+- Assessment objective:
+- Questions to answer:
+- Intended audience:
+- Required deliverables:
+
+## Authorization
+
+- Authorizing authority:
+- Authorization reference:
+- Authorized assets:
+- Authorized environments:
+- Authorized dates:
+- Expiration date:
+
+## Explicit Exclusions
+
+- Out-of-scope systems:
+- Prohibited actions:
+- Prohibited effects:
+- Restricted data:
+- Restricted collection areas:
+
+## Collection Priorities
+
+- Technical:
+- Procedural:
+- Organizational:
+- Cognitive:
+- Defensive telemetry:
+- Relevant threat actors:
+
+## Safety Requirements
+
+- Required approvers:
+- Range or test-environment owner:
+- Abort authority:
+- Rollback requirements:
+- Emergency contacts:
+- Additional physical-safety restrictions:
+```
+
+Do not place credentials, classified data, export-controlled information, or sensitive operational material in the repository unless the system and workstation are approved to handle it.
+
+---
+
+## Add Source Material
+
+Place approved files in:
+
+```text
+sources/
+```
+
+Supported extensions are:
+
+```text
+.md
+.txt
+.json
+.pdf
+```
+
+Example:
 
 ```bash
-cd ..
+cp ~/Documents/system-architecture.md sources/
+cp ~/Documents/vendor-manual.pdf sources/
+cp ~/Documents/exercise-report.txt sources/
+```
+
+Files beginning with `_` are treated as metadata and excluded from the analytical corpus.
+
+Examples:
+
+```text
+sources/_provenance.jsonl
+```
+
+The frozen manifest is also excluded:
+
+```text
+sources/corpus_manifest.md
+```
+
+### PDF requirements
+
+Text-based PDFs are extracted with `pypdf`.
+
+Scanned or image-only PDFs must be processed with an approved OCR workflow before ingestion. Confirm that text can be extracted before freezing the corpus.
+
+---
+
+## Optional Source Collection
+
+Vanguard includes an optional open-web collection workflow using a local SearXNG service.
+
+> [!CAUTION]
+> The collection workflow is internet-connected.
+>
+> SearXNG runs locally, but the collector retrieves selected destination webpages directly. Local SearXNG does not make collection offline, anonymous, or fully isolated.
+
+### 1. Start SearXNG
+
+From the repository root:
+
+```bash
+docker compose \
+  -f collection/searxng/docker-compose.yml \
+  up -d
+```
+
+Confirm that the service is available:
+
+```bash
+curl http://localhost:8080
+```
+
+Check container status:
+
+```bash
+docker compose \
+  -f collection/searxng/docker-compose.yml \
+  ps
+```
+
+### 2. Install the collection model
+
+The current query planner uses `gemma4:12b-mlx`:
+
+```bash
+ollama pull gemma4:12b-mlx
+```
+
+### 3. Run the collector
+
+```bash
 python collection/collector.py collection/brief.md
-
 ```
 
-* Saves the downloaded PDF, TXT, or MD reports directly into the root `sources/` directory.
-* A provenance log is automatically generated at `sources/_provenance.jsonl` to track the origin and hash of every piece of intelligence gathered.
-* **Note:** The pipeline supports dynamic ingestion. You can drop new files into `sources/` at any time between runs.
+The collector:
 
+* Generates bounded search queries
+* Queries the local SearXNG instance
+* Retrieves candidate webpages
+* Scores document relevance
+* Saves retained documents under `sources/`
+* Appends provenance records to `sources/_provenance.jsonl`
+
+The collector currently uses hard limits for:
+
+* Query expansion depth
+* Total searches
+* Retained documents
+* Minimum relevance
+
+Review all collected material before freezing the corpus.
+
+### 4. Stop SearXNG
+
+```bash
+docker compose \
+  -f collection/searxng/docker-compose.yml \
+  down
+```
+
+### Collection security recommendations
+
+For sensitive assessments:
+
+* Run collection separately from analysis.
+* Use a restricted container or virtual machine.
+* Route traffic through an approved proxy.
+* Apply outbound network controls.
+* Block private, loopback, link-local, and metadata-service addresses.
+* Review redirects and destination domains.
+* Inspect all collected documents before transferring them into the analysis environment.
 
 ---
 
-## 3. Phase 2: Execution & Analysis
+## Freeze the Corpus
 
-Once your `sources/` directory is populated and your `brief.md` is set, execute the CrewAI pipeline from the project root:
+Vanguard refuses to start Stage 0 unless the corpus matches:
+
+```text
+sources/corpus_manifest.md
+```
+
+The manifest must contain a JSON block listing every source filename and SHA-256 hash.
+
+### Create the manifest
+
+Run from the repository root:
+
+````bash
+python - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+
+source_dir = Path("sources")
+extensions = {".md", ".txt", ".json", ".pdf"}
+
+source_dir.mkdir(parents=True, exist_ok=True)
+
+files = sorted(
+    path
+    for path in source_dir.iterdir()
+    if path.is_file()
+    and path.suffix.lower() in extensions
+    and not path.name.startswith("_")
+    and path.name != "corpus_manifest.md"
+)
+
+manifest = {
+    "files": [
+        {
+            "file": path.name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in files
+    ]
+}
+
+manifest_path = source_dir / "corpus_manifest.md"
+manifest_path.write_text(
+    "# Frozen Corpus Manifest\n\n"
+    "This manifest binds the assessment to the exact source files listed below.\n\n"
+    "```json\n"
+    + json.dumps(manifest, indent=2)
+    + "\n```\n",
+    encoding="utf-8",
+)
+
+print(f"Wrote {manifest_path}")
+print(f"Locked {len(files)} source files")
+PY
+````
+
+Review it:
+
+```bash
+cat sources/corpus_manifest.md
+```
+
+### Corpus-lock behavior
+
+Before Stage 0, Vanguard re-hashes the current source files.
+
+The run fails closed when:
+
+* The manifest is missing
+* The JSON block is malformed
+* A source file is missing
+* A new source was added
+* A source file changed
+* A source cannot be read
+
+After intentionally changing the corpus:
+
+1. Review the new or changed material.
+2. Regenerate `sources/corpus_manifest.md`.
+3. Start a new assessment run.
+
+Do not resume an older run against a changed corpus.
+
+---
+
+## Run an Assessment
+
+From the repository root:
 
 ```bash
 python -m src.crew
-
 ```
 
-Here is the exact markdown section to add to your `README.md` to document the new Purple Team and Defensive Engineering pipeline, followed by the terminal commands to push everything safely to your repository.
+The pipeline will:
 
-## 4. Phase 3: Purple Team & Defensive Engineering
+1. Discover the current corpus.
+2. Create or reuse a versioned corpus snapshot.
+3. Generate a unique run ID.
+4. Create a run-specific output directory.
+5. Initialize `assessment_state.json`.
+6. Verify the frozen corpus manifest.
+7. Request human confirmation of the corpus lock.
+8. Read and chunk the source corpus.
+9. Extract named systems, interfaces, organizations, people, and events.
+10. Generate Stage 0 Reverse IPB.
+11. Generate Stage 1 system decomposition.
+12. Generate Stage 2 attack vectors and graph topology.
+13. Verify Stage 2 framework identifiers.
+14. Halt if Stage 2 verification fails.
+15. Run Annex B KCAG analysis.
+16. Run Annex C Bayesian inference.
+17. Request human review for Stage 3.
+18. Request human review for Stage 4.
+19. Run the deterministic Phase 0 safety-language check.
+20. Preserve the artifacts in the run directory.
 
-Vanguard includes a decoupled, defensively-scoped compiler that consumes the Red Team MDMP plan to orchestrate validation testing and generate SIEM detection rules. To prevent weaponization, this pipeline **does not** generate offensive exploit code. It strictly crosswalks payloads against published atomic tests and flags coverage gaps.
+### Human-input prompts
 
-### Step 3A: The Purple Team Compiler
-The compiler parses the Stage 4 MDMP output, extracts the technique IDs, and crosswalks them against the live [Atomic Red Team](https://github.com/redcanaryco/atomic-red-team) index. 
+Vanguard currently requests human input at:
 
-```bash
-python src/purple/purple_compiler.py
+* Corpus-lock confirmation
+* Stage 3 authorization
+* Stage 4 mission-plan release
 
-```
+Do not approve a stage unless:
 
-* **Coverage Map:** Outputs a CLI interface detailing which techniques have vetted `[VETTED]` tests ready to pull, and which are `[COVERAGE GAP]` items the Purple Team must source or author under their own authority.
-* **Scaffold Generation:** Exports the parsed telemetry and alert criteria to `outputs/purple_scaffold.json`.
-
-### Step 3B: Sigma Rule Generation
-
-Once the scaffold is generated, the defensive LLM translates the natural language Blue Team assessment criteria (e.g., "Position Jump > 1m") into structured, machine-readable Sigma rules.
-
-```bash
-python src/purple/sigma_generator.py
-
-```
-
-* **Detection Artifacts:** Automatically writes strictly formatted `.yml` Sigma rules to `outputs/sigma_rules/` for immediate ingestion into Blue Team SIEM platforms (Splunk, Elastic, etc.).
-
-### The Autonomous Pipeline
-
-Vanguard executes via a strict, doctrinal sequential process:
-
-1. **Pre-Flight Snapshot:** The system hashes all files in `sources/`, compares them to the last run, and generates a versioned `manifest_vX.json`. This stamps all downstream outputs with the exact corpus version used.
-2. **Chunking & Extraction:** Large documents are chunked into 60K segments. The `decomposer` agent iteratively extracts every named system, subsystem, protocol, and human terrain element into a scratchpad.
-3. **Stage 0 & 1 (Synthesis):** The scratchpad is synthesized into a formal Reverse IPB and decomposed into the ADP 3-13 Cognitive Hierarchy (Data $\rightarrow$ Information $\rightarrow$ Knowledge $\rightarrow$ Understanding $\rightarrow$ Decision $\rightarrow$ Behavior).
-4. **Stage 2 (Attack Surface Mapping):** The `mapper` cross-references vulnerabilities against local indices of MITRE Enterprise, ICS, Mobile, ATLAS (AI), and EMB3D.
-5. **Verification Gate:** An adversarial `verifier` agent mechanically checks every generated technique ID against the v18.1 local index, auto-correcting hallucinations and blocking upstream failures.
-6. **Annex B & C (Graph Modeling):** The `modeler` agent converts the attack surface into a Directed Acyclic Graph (DAG) to find the minimum node cut, and scores the phase probability via a 5-layer Bayesian Belief Network.
-7. **Stage 3 & 4 (MDMP):** The `red_team_lead` reviews the priority kill-chain path and develops testable, four-category payloads (C2 Disruption, Degradation, Physical Alteration, Decision Corruption), culminating in a phased Red Team Mission Plan.
-
-All outputs are saved to the `outputs/` directory in Markdown format.
+* The System Under Test is authorized.
+* The assets are within the approved scope.
+* The proposed effects are permitted.
+* The required owners and operators are present.
+* Abort authority is assigned.
+* Rollback procedures are understood.
+* Required safety personnel have approved the activity.
 
 ---
 
-## Future Sprints / Roadmap
+## Monitor a Running Assessment
 
-* [ ] **Streamlit GUI:** Transition from CLI to a web-based dashboard for dynamic SUT selection and individual stage execution.
-* [ ] **Corpus Chat (Local RAG):** Implementation of ChromaDB and local embedding models (`mxbai-embed-large`) for conversational Q&A against the versioned SUT corpus.
-* [ ] **Dynamic Tooling:** Direct Shodan/Nmap parsing integration for Live-Environment testing. (This will be fun!)
+Each run writes a heartbeat log to:
 
+```text
+outputs/<run_id>/heartbeat.log
+```
 
+Follow it from another terminal:
+
+```bash
+tail -f outputs/<run_id>/heartbeat.log
+```
+
+Example:
+
+```bash
+tail -f outputs/vaf_20260709_143022/heartbeat.log
+```
+
+The heartbeat indicates whether the pre-analysis or post-analysis crew is still active during long local-model operations.
+
+---
+
+## Resume an Interrupted Assessment
+
+Resume an existing run with:
+
+```bash
+python -m src.crew --resume <run_id>
+```
+
+Example:
+
+```bash
+python -m src.crew --resume vaf_20260709_143022
+```
+
+Vanguard detects completed artifacts and can skip eligible completed work, including:
+
+* Corpus chunking
+* Stage 0
+* Stage 1
+* Stage 2
+* Annex B
+* Annex C
+
+Stage 3 and Stage 4 are intentionally executed again because they contain human approval prompts.
+
+### Resume safety
+
+Vanguard refuses to resume when the current corpus snapshot differs from the corpus associated with the original run.
+
+This prevents artifacts from two different corpora from being mixed under the same run ID.
+
+### Find existing runs
+
+```bash
+find outputs -maxdepth 1 -type d -name 'vaf_*' | sort
+```
+
+Inspect a run:
+
+```bash
+find outputs/<run_id> -maxdepth 1 -type f | sort
+```
+
+---
+
+## Assessment Outputs
+
+Each assessment receives its own directory:
+
+```text
+outputs/<run_id>/
+```
+
+Example:
+
+```text
+outputs/vaf_20260709_143022/
+├── assessment_state.json
+├── heartbeat.log
+├── corpus_chunks.json
+├── corpus_lock_confirmation.md
+├── _stage0_scratch.md
+├── stage0.md
+├── stage0_output.json
+├── stage1.md
+├── stage1_output.json
+├── attribution_check.md
+├── stage2.md
+├── stage2_vectors.json
+├── stage2_verification.md
+├── annexB_kcag.md
+├── kcag_report.json
+├── annexC_bbn.md
+├── bbn_report.json
+├── stage3.md
+├── stage4_mission_plan.md
+└── phase0_safety_check.md
+```
+
+The exact set of files depends on how far the run progressed.
+
+### Artifact isolation
+
+Per-run tools resolve their paths through the active run context.
+
+Structured JSON and Markdown artifacts are stamped with run and corpus identity information. This reduces the risk of accidentally accepting an artifact from another run.
+
+### Shared corpus history
+
+The following directory is intentionally shared across runs:
+
+```text
+corpus-index/
+```
+
+It records corpus versions and framework indexes rather than assessment-specific artifacts.
+
+---
+
+## Pipeline Stages
+
+### Pre-flight corpus snapshot
+
+Vanguard hashes all supported source files and compares the result with earlier corpus snapshots.
+
+Versioned snapshots are written under:
+
+```text
+corpus-index/manifest_vN.json
+```
+
+This snapshot tracks corpus changes across assessments.
+
+It is separate from the operator-approved frozen manifest:
+
+```text
+sources/corpus_manifest.md
+```
+
+### Corpus lock gate
+
+The deterministic corpus-lock gate verifies that the current files match the frozen source manifest before Stage 0 begins.
+
+The result is also presented to a human reviewer through the first CrewAI approval prompt.
+
+### Chunking and extraction
+
+The corpus is assembled into chunks of approximately 60,000 characters.
+
+The decomposer extracts:
+
+* Named systems
+* Subsystems
+* Vendor products
+* Interfaces
+* Protocols
+* Versions
+* Exercise events
+* Named people
+* Organizations
+
+The extracted findings are accumulated in:
+
+```text
+_stage0_scratch.md
+```
+
+### Stage 0 — Reverse IPB
+
+Stage 0 synthesizes technical, procedural, cognitive, and social or personnel signatures.
+
+Outputs:
+
+```text
+stage0.md
+stage0_output.json
+```
+
+The structured output contains a curated set of significant signatures with:
+
+* Signature IDs
+* Categories
+* Descriptions
+* Confidence levels
+* Gap markers
+* Deception-candidate markers
+
+### Stage 1 — System decomposition
+
+Stage 1 models:
+
+* Technical components
+* Procedural workflows
+* Cognitive dependencies
+* Asset-control states
+* Information flows
+* Downstream dependencies
+* Trust boundaries
+* Centers-of-gravity candidates
+
+Outputs:
+
+```text
+stage1.md
+stage1_output.json
+```
+
+### Attribution-boundary check
+
+After Stage 0 and Stage 1, Vanguard checks whether named entities in the generated prose can be traced to:
+
+1. The extraction scratchpad
+2. The locked source corpus
+
+Output:
+
+```text
+attribution_check.md
+```
+
+The attribution check is currently advisory. High-confidence untraceable entities are reported for human review but do not automatically halt the run.
+
+### Stage 2 — Attack-surface mapping
+
+Stage 2 maps candidate vectors against the local framework index.
+
+It can reference identifiers from frameworks such as:
+
+* MITRE ATT&CK Enterprise
+* MITRE ATT&CK ICS
+* MITRE ATT&CK Mobile
+* MITRE ATLAS
+* CAPEC
+* EMB3D
+* SPARTA
+* MITRE Engage
+
+Outputs:
+
+```text
+stage2.md
+stage2_vectors.json
+stage2_verification.md
+```
+
+The structured Stage 2 artifact contains graph nodes and edges used by Annex B.
+
+### Stage 2 verification gate
+
+A deterministic verifier checks generated technique identifiers against:
+
+```text
+corpus-index/technique_index.json
+```
+
+When verification fails:
+
+* Stage 2 is marked as failed.
+* Annex B does not run.
+* Downstream stages are blocked.
+
+Review:
+
+```text
+stage2_verification.md
+```
+
+### Annex B — Kill Chain Attack Graph
+
+Annex B reads the Stage 2 graph artifact and uses NetworkX to calculate:
+
+* Graph size
+* Goal nodes
+* Minimum node cuts
+* Betweenness centrality
+* Candidate attack paths
+* A priority path
+
+Outputs:
+
+```text
+annexB_kcag.md
+kcag_report.json
+```
+
+> [!IMPORTANT]
+> The current KCAG path values are heuristic traversal scores based on fixed difficulty mappings.
+>
+> They are useful for relative ranking but are not empirically calibrated real-world probabilities.
+
+### Annex C — Bayesian threat model
+
+Annex C uses pgmpy to build a Bayesian model from:
+
+* Annex B results
+* An adversary capability prior
+* Assessed operational tempo
+* Defensive posture
+* A geopolitical trigger prior
+* Optional observed evidence
+* Structural priors from `config/bbn_priors.json`
+
+Outputs:
+
+```text
+annexC_bbn.md
+bbn_report.json
+```
+
+The BBN refuses to use silent per-assessment defaults for required inputs.
+
+The priors file currently contains several analyst-judgment template values. These are not empirically calibrated for a specific assessment and must be reviewed before relying on the resulting scores.
+
+A Bayesian result is conditional on:
+
+* The model structure
+* The supplied priors
+* The conditional probability tables
+* The observed evidence
+* The analyst assumptions
+
+It should not be treated as objective ground truth.
+
+### Stage 3 — Human-reviewed test concepts
+
+Stage 3 reviews the verified attack vectors and Annex B priority path.
+
+It currently drafts categorized test concepts for human review.
+
+Output:
+
+```text
+stage3.md
+```
+
+Stage 3 requires human input.
+
+The human reviewer remains responsible for determining whether each concept is:
+
+* Authorized
+* Technically grounded
+* Safe
+* Within scope
+* Appropriate for the actual system architecture
+
+### Stage 4 — MDMP-style mission plan
+
+Stage 4 produces a phased mission plan containing:
+
+* Planned actions
+* Framework mappings
+* Execution sequencing
+* OPSEC measures
+* Blue Team telemetry requirements
+* Detection criteria
+* Safety-gate language where required
+
+Output:
+
+```text
+stage4_mission_plan.md
+```
+
+Stage 4 requires human input.
+
+### Phase 0 safety-language check
+
+After Stage 3 and Stage 4 complete, Vanguard checks whether Category 2 or Category 3 concepts include required Phase 0 safety language.
+
+Output:
+
+```text
+phase0_safety_check.md
+```
+
+A noncompliant result prevents the run from completing successfully.
+
+> [!WARNING]
+> The current safety check runs after the Stage 3 and Stage 4 human-input prompts.
+>
+> It can prevent finalization, but it does not currently prevent noncompliant content from reaching the Stage 4 review prompt.
+
+---
+
+## Purple Team Workflow
+
+Vanguard includes a separate Purple Team workflow for:
+
+* Parsing the Stage 4 plan
+* Extracting ATT&CK technique identifiers
+* Crosswalking them with Atomic Red Team
+* Identifying coverage gaps
+* Creating defensive scaffolds
+* Generating draft Sigma rules
+
+### Current run-isolation compatibility step
+
+The Purple Team scripts currently read legacy flat paths under `outputs/`, while the main assessment pipeline now writes Stage 4 under `outputs/<run_id>/`.
+
+Select the run you want to process:
+
+```bash
+export VANGUARD_RUN_ID=vaf_20260709_143022
+```
+
+Copy its Stage 4 plan to the current Purple Team compatibility path:
+
+```bash
+cp \
+  "outputs/${VANGUARD_RUN_ID}/stage4_mission_plan.md" \
+  outputs/stage4_mission_plan.md
+```
+
+### Run the Purple Team compiler
+
+```bash
+python src/purple/purple_compiler.py
+```
+
+The compiler currently:
+
+* Downloads or loads a cached Atomic Red Team index
+* Parses Stage 4 phases
+* Extracts ATT&CK and CAPEC identifiers
+* Marks published Atomic Red Team coverage
+* Flags coverage gaps
+* Writes dashboard artifacts
+
+Outputs:
+
+```text
+outputs/purple_scaffold.json
+outputs/kcag_data.json
+```
+
+The Atomic Red Team index is cached at:
+
+```text
+corpus-index/art_index.json
+```
+
+### Generate Sigma-rule scaffolds
+
+The current Sigma generator uses:
+
+```text
+gemma4:12b-mlx
+```
+
+Install it first:
+
+```bash
+ollama pull gemma4:12b-mlx
+```
+
+Then run:
+
+```bash
+python src/purple/sigma_generator.py
+```
+
+Outputs are written under:
+
+```text
+outputs/sigma_rules/
+```
+
+Generated rules are scaffolds, not production-ready detections.
+
+Before deployment, validate:
+
+* Sigma syntax
+* Log-source availability
+* Field mappings
+* SIEM backend compatibility
+* False-positive behavior
+* Expected event volume
+* Detection latency
+* Test-case coverage
+
+---
+
+## Dashboard
+
+The experimental Streamlit dashboard is located at:
+
+```text
+src/ui/dashboard.py
+```
+
+Start it from the repository root:
+
+```bash
+streamlit run src/ui/dashboard.py
+```
+
+The dashboard contains views for:
+
+* Threat surface
+* Purple Team coverage
+* Defensive validation
+
+The dashboard currently expects the legacy Purple Team output files under the root `outputs/` directory.
+
+Run the Purple Team compiler and Sigma generator before expecting all dashboard views to contain data.
+
+---
+
+## Testing
+
+Activate the virtual environment:
+
+```bash
+source .venv/bin/activate
+```
+
+Run the test suite:
+
+```bash
+pytest -q
+```
+
+Run an import smoke test:
+
+```bash
+python -c "import src.crew"
+```
+
+The current test suite includes coverage for:
+
+* Pydantic schemas
+* Stage 0 and Stage 1 schemas
+* Assessment state behavior
+* Stage 0 and Stage 1 tools
+* Crew and state integration
+
+The live model pipeline is significantly more expensive and less deterministic than the unit tests. Use mocked or fixture-based tests for routine development wherever practical.
+
+---
+
+## Security Considerations
+
+### Vanguard is not an autonomous execution platform
+
+The core pipeline generates analysis and planning artifacts.
+
+It does not, by itself, establish:
+
+* Legal authority
+* Rules of engagement
+* System-owner approval
+* Safety approval
+* Technical correctness
+* Operational feasibility
+
+Those remain human responsibilities.
+
+### Local inference does not mean the entire project is offline
+
+The core analysis models run through local Ollama endpoints.
+
+However, network access may still occur during:
+
+* Package installation
+* Model installation
+* Optional web collection
+* Atomic Red Team index retrieval
+* Repository updates
+
+### Collection content is untrusted
+
+External webpages and documents may contain:
+
+* Incorrect information
+* Fabricated identifiers
+* Prompt-injection attempts
+* Misleading instructions
+* Hidden or malformed content
+
+Treat source documents as evidence, not as trusted agent instructions.
+
+### Review generated artifacts
+
+LLMs can produce:
+
+* Unsupported claims
+* Incorrect architecture assumptions
+* Incorrect framework mappings
+* Internally inconsistent plans
+* Overconfident conclusions
+
+Deterministic validation reduces some failure modes but does not eliminate the need for expert review.
+
+### Protect sensitive artifacts
+
+Assessment outputs may disclose:
+
+* System architecture
+* Trust relationships
+* Defensive gaps
+* Candidate attack paths
+* Operational procedures
+* Safety assumptions
+
+Protect `sources/`, `outputs/`, and `corpus-index/` according to the sensitivity of the assessment.
+
+---
+
+## Current Limitations
+
+Vanguard is an active research prototype.
+
+Current limitations include:
+
+* The modeler agent is still named `Graph & Probability Modeler`; the planned Quantitative Threat Modeler upgrade is not yet implemented.
+* There is no dedicated semantic KCAG-review task between Stage 2 and Annex B.
+* Annex B currently selects the first zero-indegree graph source rather than strictly requiring `ADV_START`.
+* KCAG traversal values are still labeled as probabilities internally.
+* The BBN contains analyst-judgment template priors that require case-specific review.
+* BBN sensitivity analysis is not yet implemented.
+* Stage 3 remains a free-form Markdown artifact.
+* There is no deterministic Stage 3 test-plan validator.
+* Stage 3 and Stage 4 still run in the same post-analysis CrewAI invocation.
+* The Phase 0 safety-language check runs after the Stage 4 human-input prompt.
+* Stage 4 is not yet included in the assessment-state stage list.
+* The attribution-boundary check is advisory rather than blocking.
+* `pypdf` is used by the code but is not yet declared directly in `requirements.txt`.
+* The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
+* The Purple Team tools still use flat compatibility paths under `outputs/`.
+* The Purple Team compiler retrieves the Atomic Red Team index from the internet.
+* The project has not been qualified for safety-critical or operational deployment.
+
+---
+
+## Troubleshooting
+
+### `ModuleNotFoundError`
+
+Confirm that commands are being run from the repository root:
+
+```bash
+pwd
+ls
+```
+
+The directory should contain:
+
+```text
+src/
+collection/
+config/
+requirements.txt
+```
+
+Activate the environment:
+
+```bash
+source .venv/bin/activate
+```
+
+Reinstall dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install pypdf
+```
+
+### Ollama connection failure
+
+Check the API:
+
+```bash
+curl http://localhost:11434/api/tags
+```
+
+List installed models:
+
+```bash
+ollama list
+```
+
+Install the core models:
+
+```bash
+ollama pull gemma4:e4b
+ollama pull qwen3.6:27b
+```
+
+Install the optional collection and Sigma model:
+
+```bash
+ollama pull gemma4:12b-mlx
+```
+
+### Model not found
+
+Compare the names shown by:
+
+```bash
+ollama list
+```
+
+with:
+
+```text
+config/llm.py
+collection/collector.py
+src/purple/sigma_generator.py
+```
+
+The model name must match exactly.
+
+### `pypdf` is not installed
+
+```bash
+python -m pip install pypdf
+```
+
+Verify:
+
+```bash
+python -c "from pypdf import PdfReader; print('pypdf ready')"
+```
+
+### PDF source produces no useful text
+
+The PDF may be image-only or scanned.
+
+Use an approved OCR process before adding it to the corpus, then regenerate the frozen manifest.
+
+### `corpus_manifest.md not found`
+
+The corpus has not been frozen.
+
+Create:
+
+```text
+sources/corpus_manifest.md
+```
+
+using the command in [Freeze the Corpus](#freeze-the-corpus).
+
+### Corpus lock violation
+
+One or more source files changed after the corpus was frozen.
+
+The error will identify:
+
+* Missing files
+* Added files
+* Changed files
+
+Review the changes, regenerate the manifest, and start a new run.
+
+### Resume refused because the corpus changed
+
+Do not force the old run to continue.
+
+Start a new assessment:
+
+```bash
+python -m src.crew
+```
+
+### Stage 2 verification failure
+
+Review:
+
+```text
+outputs/<run_id>/stage2_verification.md
+```
+
+Look for:
+
+* Invalid framework identifiers
+* Unsupported mappings
+* Gap markers
+* Malformed vectors
+* Missing graph fields
+
+Correct the source data, prompt, index, or mapping behavior before resuming.
+
+### Annex B fails
+
+Confirm that this file exists and is valid:
+
+```text
+outputs/<run_id>/stage2_vectors.json
+```
+
+Review:
+
+```text
+outputs/<run_id>/stage2_verification.md
+```
+
+Annex B should not be bypassed by manually inventing a replacement graph.
+
+### Annex C fails
+
+Confirm that these files exist:
+
+```text
+outputs/<run_id>/kcag_report.json
+config/bbn_priors.json
+```
+
+Review the error for missing per-assessment fields such as:
+
+* `adversary.capability_prior`
+* `adversary.tempo`
+* `defensive_posture`
+* `geopolitical_trigger_prior`
+
+### Phase 0 safety check fails
+
+Review:
+
+```text
+outputs/<run_id>/phase0_safety_check.md
+```
+
+Do not satisfy the checker by adding keywords without completing the underlying safety, authorization, abort, and rollback review.
+
+### Purple Team compiler cannot find Stage 4
+
+Copy the selected run’s Stage 4 plan into the current compatibility path:
+
+```bash
+export VANGUARD_RUN_ID=<run_id>
+
+cp \
+  "outputs/${VANGUARD_RUN_ID}/stage4_mission_plan.md" \
+  outputs/stage4_mission_plan.md
+```
+
+Then run:
+
+```bash
+python src/purple/purple_compiler.py
+```
+
+### Dashboard is empty
+
+Confirm that the Purple Team artifacts exist:
+
+```bash
+ls -l outputs/purple_scaffold.json
+ls -l outputs/kcag_data.json
+find outputs/sigma_rules -type f
+```
+
+Then start:
+
+```bash
+streamlit run src/ui/dashboard.py
+```
+
+---
+
+## Repository Layout
+
+```text
+vanguard-workbench/
+├── collection/
+│   ├── brief.md
+│   ├── collector.py
+│   └── searxng/
+│       ├── config/
+│       └── docker-compose.yml
+├── config/
+│   ├── bbn_priors.json
+│   └── llm.py
+├── corpus-index/
+│   ├── technique_index.json
+│   └── manifest_vN.json
+├── outputs/
+│   └── <run_id>/
+├── sources/
+│   ├── corpus_manifest.md
+│   └── _provenance.jsonl
+├── src/
+│   ├── agents.py
+│   ├── crew.py
+│   ├── heartbeat.py
+│   ├── run_context.py
+│   ├── schemas.py
+│   ├── state.py
+│   ├── tasks.py
+│   ├── tools.py
+│   ├── purple/
+│   │   ├── purple_compiler.py
+│   │   └── sigma_generator.py
+│   └── ui/
+│       ├── dashboard.py
+│       ├── components/
+│       └── utils/
+├── tests/
+└── requirements.txt
+```
+
+---
+
+## Responsible Use
+
+Use Vanguard only for:
+
+* Authorized defensive research
+* Red Team assessments
+* Purple Team exercises
+* Controlled test ranges
+* Training environments
+* Systems with explicit written owner authorization
+
+The operator is responsible for:
+
+* Written authorization
+* Scope control
+* Legal compliance
+* Rules of engagement
+* Safety controls
+* Data classification and handling
+* Source review
+* Model-assumption review
+* Test implementation
+* Test execution
+* Abort procedures
+* Rollback procedures
+* Defensive validation
+* Final operational decisions
+
+Do not use generated material to access, disrupt, degrade, manipulate, or damage systems without explicit authorization from the system owner.
+
+---
+
+## Project Status
+
+Vanguard Workbench is an advanced research prototype.
+
+The current development priorities are:
+
+* Upgrade the modeler into a Quantitative Threat Modeler
+* Add deterministic KCAG semantic validation
+* Rename heuristic KCAG probabilities
+* Add BBN validation and sensitivity analysis
+* Convert Stage 3 into structured test-plan drafting
+* Validate Stage 3 before Stage 4
+* Move safety enforcement before Stage 4
+* Add Stage 4 to assessment-state tracking
+* Update Purple Team tools to consume run-scoped artifacts directly
+* Add `pypdf` to the declared dependencies
+
+The project’s intended direction is:
+
+> **Evidence-backed analysis, deterministic calculation, explicit uncertainty, human authorization, and controlled external execution.**

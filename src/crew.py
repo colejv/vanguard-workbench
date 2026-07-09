@@ -11,6 +11,7 @@ from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status)
 from src import run_context
+from src.heartbeat import heartbeat
 
 
 if __name__ == "__main__":
@@ -66,6 +67,40 @@ if __name__ == "__main__":
         else:
             return latest_v, len(current_files), "UNCHANGED"
 
+    def detect_resume_progress(out_dir):
+        """Check which expensive pre_crew/post_crew steps already completed in a
+        previous, interrupted attempt at this exact run_id. Only trusts an
+        artifact as 'done' if its defining file(s) exist — presence, not a
+        state-file flag, since assessment_state.json's commit code runs
+        AFTER kickoff() returns, which never happens on a crash mid-crew.
+        Returns (chunking_done, stage0_done, stage1_done, stage2_done,
+        annexB_done, annexC_done). Stage 3/4 are NEVER auto-skipped — both
+        are human_input=True gates the analyst always re-approves fresh,
+        and stage3 in particular is often exactly the stage being resumed
+        TO (e.g. after fixing its prompt), never the stage being resumed
+        PAST."""
+        scratch_path = os.path.join(out_dir, "_stage0_scratch.md")
+        chunking_done = os.path.exists(scratch_path) and os.path.getsize(scratch_path) > 0
+
+        stage0_done = (os.path.exists(os.path.join(out_dir, "stage0_output.json"))
+                       and os.path.exists(os.path.join(out_dir, "stage0.md")))
+        stage1_done = (os.path.exists(os.path.join(out_dir, "stage1_output.json"))
+                       and os.path.exists(os.path.join(out_dir, "stage1.md")))
+        stage2_done = (os.path.exists(os.path.join(out_dir, "stage2_vectors.json"))
+                       and os.path.exists(os.path.join(out_dir, "stage2.md")))
+        annexB_done = os.path.exists(os.path.join(out_dir, "kcag_report.json"))
+        annexC_done = os.path.exists(os.path.join(out_dir, "bbn_report.json"))
+        return chunking_done, stage0_done, stage1_done, stage2_done, annexB_done, annexC_done
+
+    # ---- CLI: --resume <run_id> -------------------------------------------
+    resume_run_id = None
+    if "--resume" in sys.argv:
+        idx = sys.argv.index("--resume")
+        if idx + 1 >= len(sys.argv):
+            raise SystemExit("--resume requires a run_id argument, e.g. "
+                             "--resume vaf_20260709_143022")
+        resume_run_id = sys.argv[idx + 1]
+
     # ==========================================
     # PRE-FLIGHT & SNAPSHOT
     # ==========================================
@@ -73,17 +108,41 @@ if __name__ == "__main__":
     c_version, c_count, c_status = snapshot_corpus()
     print(f"Corpus Version: v{c_version} | File Count: {c_count} | Status: {c_status}")
 
-    # ---- RUN IDENTITY & ASSESSMENT STATE (audit trail) ----
-    run_id = new_run_id()
-    out_dir = run_output_dir(run_id)
-    print(f"Run ID: {run_id}")
-
-    # Pin this run to the corpus manifest that snapshot_corpus() just wrote
-    # or confirmed unchanged, so assessment_state.json records exactly which
-    # corpus snapshot backs this run's findings.
+    # ---- RUN IDENTITY: fresh run, or resume an interrupted one ----
     manifest_path = os.path.join("corpus-index", f"manifest_v{c_version}.json")
     with open(manifest_path, "rb") as f:
         corpus_manifest_hash = f"sha256:{hashlib.sha256(f.read()).hexdigest()}"
+
+    if resume_run_id:
+        run_id = resume_run_id
+        out_dir = run_output_dir(run_id)
+        if not os.path.isdir(out_dir):
+            raise SystemExit(f"--resume {run_id}: {out_dir} does not exist. "
+                             f"Nothing to resume.")
+        print(f"Resuming run: {run_id}")
+
+        from src.state import load_assessment_state
+        state = load_assessment_state(run_id)
+
+        # FAIL CLOSED: refuse to resume against a corpus that has moved
+        # since the original attempt. Resuming here would silently mix
+        # artifacts from two different corpus snapshots into one run — the
+        # exact failure mode run-isolation exists to prevent, just
+        # approached from a different angle (time, not concurrency).
+        if state.corpus_manifest_hash != corpus_manifest_hash:
+            raise RuntimeError(
+                f"Cannot resume {run_id}: corpus has changed since this run "
+                f"started (was {state.corpus_manifest_hash}, now "
+                f"{corpus_manifest_hash}). Start a fresh run instead — "
+                f"resuming against a different corpus snapshot would mix "
+                f"artifacts from two different assessments."
+            )
+    else:
+        run_id = new_run_id()
+        out_dir = run_output_dir(run_id)
+        print(f"Run ID: {run_id}")
+        state = init_assessment_state(run_id, corpus_manifest_hash)
+        save_assessment_state(state, run_id)
 
     # ---- RUN ISOLATION: set the active run BEFORE any task or tool runs ----
     # Every tool that reads/writes a per-run artifact resolves its path via
@@ -94,9 +153,6 @@ if __name__ == "__main__":
     # hash, so even a code bug that points at the wrong path is caught by
     # read_stamped_json/read_stamped_prose rather than silently succeeding.
     run_context.set_active_run(run_id, corpus_manifest_hash, out_dir)
-
-    state = init_assessment_state(run_id, corpus_manifest_hash)
-    save_assessment_state(state, run_id)
 
     # ---- GATE 1: CORPUS LOCK (deterministic — plain Python, not an agent
     # task) ----
@@ -125,48 +181,120 @@ if __name__ == "__main__":
     with open("collection/brief.md") as f:
         brief_text = f.read()
 
-    # Scratchpad lives under the run directory now, so there is nothing to
-    # dedup against a previous run's leftovers -- a fresh run_id always
-    # means a fresh, empty scratch file. Still touch it so read_scratch
-    # doesn't hit FileNotFoundError if called before the first extraction.
+    # ---- RESUME-PROGRESS DETECTION ----
+    chunking_done = stage0_done = stage1_done = stage2_done = annexB_done = annexC_done = False
+    if resume_run_id:
+        (chunking_done, stage0_done, stage1_done,
+         stage2_done, annexB_done, annexC_done) = detect_resume_progress(out_dir)
+        print(f"Resume progress: chunking_done={chunking_done}, stage0_done={stage0_done}, "
+              f"stage1_done={stage1_done}, stage2_done={stage2_done}, "
+              f"annexB_done={annexB_done}, annexC_done={annexC_done}")
+
     scratch_path = run_context.artifact_path("_stage0_scratch.md")
-    open(scratch_path, "a").close()
-
-    # Read and assemble corpus chunks — discover_corpus_files is the exact
-    # same file set snapshot_corpus() just hashed above, so every file in
-    # the frozen manifest is guaranteed to enter analysis.
-    print("Assembling corpus from chunks...")
-    src = "sources"
-    files = discover_corpus_files(src)
-
-    CHUNK = 60000
-    chunks = []
-    current = []
-    current_len = 0
-    for fn in files:
-        content = f"\n===== {fn} =====\n" + read_corpus_file(os.path.join(src, fn))
-        if current_len + len(content) > CHUNK and current:
-            chunks.append("".join(current))
-            current, current_len = [], 0
-        current.append(content)
-        current_len += len(content)
-    if current:
-        chunks.append("".join(current))
-
-    total_chars = sum(len(c) for c in chunks)
-    print(f"Corpus: {len(files)} files, {total_chars:,} chars, {len(chunks)} chunks")
-
-    # Run-scoped and stamped -- moved off corpus-index/ (shared, and the
-    # original location of the collision risk between concurrent runs).
     chunks_path = run_context.artifact_path("corpus_chunks.json")
-    run_context.write_stamped_json(
-        chunks_path, {"chunks": chunks, "total": len(chunks), "files": len(files)}
-    )
+    if chunking_done:
+        print(f"Skipping corpus chunking — {scratch_path} already populated "
+              f"from the interrupted run.")
+        chunks = []  # chunk_tasks below is only built from this; empty means none built
+    else:
+        # Scratchpad lives under the run directory now, so there is nothing to
+        # dedup against a previous run's leftovers -- a fresh run_id always
+        # means a fresh, empty scratch file. Still touch it so read_scratch
+        # doesn't hit FileNotFoundError if called before the first extraction.
+        open(scratch_path, "a").close()
+
+        # Read and assemble corpus chunks — discover_corpus_files is the exact
+        # same file set snapshot_corpus() just hashed above, so every file in
+        # the frozen manifest is guaranteed to enter analysis.
+        print("Assembling corpus from chunks...")
+        src = "sources"
+        files = discover_corpus_files(src)
+
+        CHUNK = 60000
+        chunks = []
+        current = []
+        current_len = 0
+        for fn in files:
+            content = f"\n===== {fn} =====\n" + read_corpus_file(os.path.join(src, fn))
+            if current_len + len(content) > CHUNK and current:
+                chunks.append("".join(current))
+                current, current_len = [], 0
+            current.append(content)
+            current_len += len(content)
+        if current:
+            chunks.append("".join(current))
+
+        total_chars = sum(len(c) for c in chunks)
+        print(f"Corpus: {len(files)} files, {total_chars:,} chars, {len(chunks)} chunks")
+
+        # Run-scoped and stamped -- moved off corpus-index/ (shared, and the
+        # original location of the collision risk between concurrent runs).
+        run_context.write_stamped_json(
+            chunks_path, {"chunks": chunks, "total": len(chunks), "files": len(files)}
+        )
+
+    # ---- RESUME CONTEXT: retroactively stamp + read already-completed
+    # prose so it can be injected into whichever task resumes first ----
+    # (CrewAI writes output_file content directly from the agent's answer
+    # as each task completes, not deferred to kickoff() returning — so
+    # stage0.md/stage1.md already exist even though the run crashed before
+    # crew.py's own post-kickoff stamping code ever ran on them.)
+    resume_context = {}
+    if annexB_done:
+        # Annex C not done (or also skipped separately below) -- if Annex C
+        # itself still needs to run, it needs Annex B injected (context=
+        # [t_annexB] would otherwise reference a task not in this crew).
+        annexB_prose_path = run_context.artifact_path("annexB_kcag.md")
+        run_context.stamp_prose_file(annexB_prose_path)
+        annexB_content = run_context.read_stamped_prose(annexB_prose_path)
+        if not annexC_done:
+            resume_context["t_annexC"] = annexB_content
+            print("Injecting completed Annex B output into Annex C (skipping Annex B task execution).")
+    elif stage2_done:
+        stage2_prose_path = run_context.artifact_path("stage2.md")
+        run_context.stamp_prose_file(stage2_prose_path)
+        resume_context["t_annexB"] = run_context.read_stamped_prose(stage2_prose_path)
+        print("Injecting completed Stage 2 output into Annex B (skipping Stage 2 task execution).")
+    elif stage1_done:
+        # Failure was actually at/after Stage 2 — Stage 0 AND Stage 1 both
+        # already complete. Inject Stage 1 into Stage 2, skip both upstream tasks.
+        stage1_prose_path = run_context.artifact_path("stage1.md")
+        run_context.stamp_prose_file(stage1_prose_path)
+        resume_context["t_stage2"] = run_context.read_stamped_prose(stage1_prose_path)
+        print(f"Injecting completed Stage 1 output into Stage 2 (skipping "
+              f"Stage 0 and Stage 1 task execution).")
+    elif stage0_done:
+        stage0_prose_path = run_context.artifact_path("stage0.md")
+        run_context.stamp_prose_file(stage0_prose_path)
+        resume_context["t_stage1"] = run_context.read_stamped_prose(stage0_prose_path)
+        print(f"Injecting completed Stage 0 output into Stage 1 (skipping "
+              f"Stage 0 task execution).")
+
+    # ---- t_stage3's TWO upstream dependencies (t_stage2, t_annexB) are
+    # each independently skippable, unlike every task above (which each
+    # have exactly one). Handle separately from the elif chain: whichever
+    # of stage2_done/annexB_done is true gets its content injected here,
+    # regardless of which branch above fired (that chain only determines
+    # the FIRST resume point for the single-dependency tasks upstream).
+    if stage2_done:
+        stage2_prose_path = run_context.artifact_path("stage2.md")
+        run_context.stamp_prose_file(stage2_prose_path)
+        resume_context["t_stage3_stage2"] = run_context.read_stamped_prose(stage2_prose_path)
+    if annexB_done:
+        annexB_prose_path = run_context.artifact_path("annexB_kcag.md")
+        run_context.stamp_prose_file(annexB_prose_path)
+        resume_context["t_stage3_annexb"] = run_context.read_stamped_prose(annexB_prose_path)
+    if stage2_done or annexB_done:
+        parts = []
+        if stage2_done: parts.append("Stage 2")
+        if annexB_done: parts.append("Annex B")
+        print(f"Stage 3 will receive injected context for: {' and '.join(parts)} "
+              f"(skipped task execution for whichever is listed).")
 
     # ==========================================
     # TASK ASSEMBLY (run-scoped output_file paths, built fresh each run)
     # ==========================================
-    tasks = build_tasks(out_dir)
+    tasks = build_tasks(out_dir, resume_context=resume_context)
     t_research = tasks["t_research"]
     t_synthesize_stage0 = tasks["t_synthesize_stage0"]
     t_stage1 = tasks["t_stage1"]
@@ -192,19 +320,42 @@ if __name__ == "__main__":
         ))
 
     # ---- CREW 1: through Stage 2 (produces stage2_vectors.json) ----
-    pre_tasks = [t_research] + chunk_tasks + [t_synthesize_stage0, t_stage1, t_stage2]
+    # Resume-aware: only include tasks for stages that haven't already
+    # completed against THIS run_id. chunk_tasks is already [] when
+    # chunking_done (chunks was set to [] above in that branch), so the
+    # list-comprehension there is naturally a no-op.
+    pre_tasks = []
+    if not chunking_done:
+        pre_tasks += [t_research] + chunk_tasks
+    if not stage0_done:
+        pre_tasks += [t_synthesize_stage0]
+    if not stage1_done:
+        pre_tasks += [t_stage1]
+    if not stage2_done:
+        pre_tasks += [t_stage2]
 
-    pre_crew = Crew(
-        agents=[researcher, decomposer, mapper],
-        tasks=pre_tasks,
-        process=Process.sequential,
-        verbose=True,
-    )
-    pre_crew.kickoff(inputs={
-        "sut_brief": brief_text,
-        "file_count": c_count,
-        "corpus_version": c_version,
-    })
+    if not pre_tasks:
+        print("pre_crew: nothing to run — chunking through Stage 2 all already "
+              "complete for this run. Skipping pre_crew.kickoff() entirely.")
+    else:
+        print(f"pre_crew will run {len(pre_tasks)} task(s): "
+              f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in pre_tasks][:6]}"
+              f"{' ...' if len(pre_tasks) > 6 else ''}")
+
+        pre_crew = Crew(
+            agents=[researcher, decomposer, mapper],
+            tasks=pre_tasks,
+            process=Process.sequential,
+            verbose=True,
+        )
+        pre_heartbeat_log = run_context.artifact_path("heartbeat.log")
+        print(f"Heartbeat log: {pre_heartbeat_log} (tail -f it in a second terminal)")
+        with heartbeat("pre_crew", log_path=pre_heartbeat_log):
+            pre_crew.kickoff(inputs={
+                "sut_brief": brief_text,
+                "file_count": c_count,
+                "corpus_version": c_version,
+            })
 
     # ---- STAMP PRE-CREW PROSE ARTIFACTS ----
     # CrewAI writes output_file content directly from each agent's final
@@ -321,17 +472,33 @@ if __name__ == "__main__":
         )
 
     # ---- CREW 2: Annex B onward (only reached if gate passed) ----
+    # Stage 3/4 are never skipped on resume (see detect_resume_progress) --
+    # both are human_input=True gates the analyst re-approves fresh every
+    # time, and stage3 is very often exactly the stage BEING resumed to
+    # (e.g. after correcting its prompt), never one to skip past.
+    post_tasks = []
+    if not annexB_done:
+        post_tasks += [t_annexB]
+    if not annexC_done:
+        post_tasks += [t_annexC]
+    post_tasks += [t_stage3, t_stage4]
+
+    print(f"post_crew will run {len(post_tasks)} task(s): "
+          f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in post_tasks]}")
+
     post_crew = Crew(
         agents=[modeler, red_team_lead, orchestrator],
-        tasks=[t_annexB, t_annexC, t_stage3, t_stage4],
+        tasks=post_tasks,
         process=Process.sequential,
         verbose=True,
     )
-    result = post_crew.kickoff(inputs={
-        "sut_brief": brief_text,
-        "file_count": c_count,
-        "corpus_version": c_version,
-    })
+    post_heartbeat_log = run_context.artifact_path("heartbeat.log")
+    with heartbeat("post_crew", log_path=post_heartbeat_log):
+        result = post_crew.kickoff(inputs={
+            "sut_brief": brief_text,
+            "file_count": c_count,
+            "corpus_version": c_version,
+        })
 
     # ---- STAMP POST-CREW PROSE ARTIFACTS ----
     annexB_prose_path = run_context.artifact_path("annexB_kcag.md")

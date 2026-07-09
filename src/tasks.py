@@ -6,12 +6,24 @@ from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
                        write_stage0_output, write_stage1_output)
 
 
-def build_tasks(out_dir: str) -> dict:
+def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
     """Construct all eight stage/annex/gate tasks with run-scoped output_file
     paths. Tasks can't be built at module-import time the way they used to
     be — out_dir depends on run_id, which doesn't exist until crew.py
     generates it inside __main__. crew.py calls this once, right after
     run_context.set_active_run(), and unpacks the returned dict.
+
+    resume_context: optional {"t_stage1": "<stage0 prose text>", ...}. Used
+    only when resuming an interrupted run past a stage that already
+    completed. CrewAI's context=[...] mechanism requires the referenced
+    task to actually execute as part of THIS crew's kickoff() — it can't
+    supply an already-computed answer from a task that isn't running. So
+    when a prior stage is being skipped on resume, its completed content is
+    injected directly into the dependent task's description instead of
+    using context=[...] to reference the (now absent) upstream task. Keys
+    are task names as in this function's return dict; only "t_stage1" and
+    "t_stage2" are ever meaningful resume-injection points (t_synthesize_stage0
+    has no upstream context dependency to begin with).
 
     Tool-call path references have been simplified in several descriptions
     below (t_annexB, t_annexC) since kcag_min_cut/bbn_threat_score now
@@ -20,6 +32,7 @@ def build_tasks(out_dir: str) -> dict:
     a literal path, which is one fewer thing for a local model to get right
     on every tool call.
     """
+    resume_context = resume_context or {}
 
     # Gate 1: corpus lock confirmation (human authorizes before analysis)
     t_research = Task(
@@ -89,8 +102,15 @@ def build_tasks(out_dir: str) -> dict:
         output_file=f"{out_dir}/stage0.md",
     )
 
+    _stage1_resume_prefix = (
+        f"PRIOR STAGE OUTPUT (Stage 0 — already completed on a previous, interrupted "
+        f"run; provided here as context since this run resumed past it, not generated "
+        f"by you):\n\n{resume_context['t_stage1']}\n\n---\n\n"
+    ) if "t_stage1" in resume_context else ""
+
     t_stage1 = Task(
         description=(
+            _stage1_resume_prefix +
             "Stage 1 system decomposition per ADP 3-13. You have the Stage 0 signatures "
             "in context and may call `read_scratch('EXECUTE')` for source detail.\n\n"
             "Produce THREE layers — not just the cognitive layer:\n\n"
@@ -161,13 +181,20 @@ def build_tasks(out_dir: str) -> dict:
             "written via the write_stage1_output tool."
         ),
         agent=decomposer,
-        context=[t_synthesize_stage0],
+        context=[] if "t_stage1" in resume_context else [t_synthesize_stage0],
         tools=[read_scratch, write_stage1_output],
         output_file=f"{out_dir}/stage1.md",
     )
 
+    _stage2_resume_prefix = (
+        f"PRIOR STAGE OUTPUT (Stage 1 — already completed on a previous, interrupted "
+        f"run; provided here as context since this run resumed past it, not generated "
+        f"by you):\n\n{resume_context['t_stage2']}\n\n---\n\n"
+    ) if "t_stage2" in resume_context else ""
+
     t_stage2 = Task(
         description=(
+            _stage2_resume_prefix +
             "Stage 2 attack surface characterization. For each vector give: \n"
             "(1) technique ID, (2) cognitive hierarchy stage affected, \n"
             "(3) whether it exploits a Stage 0 friendly signature.\n\n"
@@ -196,14 +223,21 @@ def build_tasks(out_dir: str) -> dict:
             "Ranked vectors with cross-framework technique IDs (Enterprise, ATLAS, ICS, EMB3D) in prose, "
             "AND confirmation that the structured edge list was written via the write_stage2_vectors tool."
         ),
-        context=[t_stage1],
+        context=[] if "t_stage2" in resume_context else [t_stage1],
         agent=mapper,
         tools=[lookup_technique, write_stage2_vectors],
         output_file=f"{out_dir}/stage2.md",
     )
 
+    _annexB_resume_prefix = (
+        f"PRIOR STAGE OUTPUT (Stage 2 — already completed on a previous, interrupted "
+        f"run; provided here as context since this run resumed past it, not generated "
+        f"by you):\n\n{resume_context['t_annexB']}\n\n---\n\n"
+    ) if "t_annexB" in resume_context else ""
+
     t_annexB = Task(
         description=(
+            _annexB_resume_prefix +
             "Annex B: build the Kill Chain Attack Graph and compute the minimum node "
             "cut and betweenness centrality to identify the priority kill-chain path.\n\n"
             "CRITICAL: You do NOT author the graph. The topology was written by the "
@@ -225,13 +259,20 @@ def build_tasks(out_dir: str) -> dict:
             "Confirmation that the KCAG report was written for Annex C ingestion."
         ),
         agent=modeler,
-        context=[t_stage2],
+        context=[] if "t_annexB" in resume_context else [t_stage2],
         tools=[kcag_min_cut],
         output_file=f"{out_dir}/annexB_kcag.md",
     )
 
+    _annexC_resume_prefix = (
+        f"PRIOR ANNEX OUTPUT (Annex B — already completed on a previous, interrupted "
+        f"run; provided here as context since this run resumed past it, not generated "
+        f"by you):\n\n{resume_context['t_annexC']}\n\n---\n\n"
+    ) if "t_annexC" in resume_context else ""
+
     t_annexC = Task(
         description=(
+            _annexC_resume_prefix +
             "Annex C: construct the evidence-driven BBN, ingest the Annex B KCAG priors, "
             "run inference, and return the threat score, kill-chain phase estimate, and "
             "CPD audit log.\n\n"
@@ -247,14 +288,40 @@ def build_tasks(out_dir: str) -> dict:
         ),
         expected_output="Verbatim BBN threat score, level, phase distribution, and CPD audit reference.",
         agent=modeler,
-        context=[t_annexB],
+        context=[] if "t_annexC" in resume_context else [t_annexB],
         tools=[bbn_threat_score],
         output_file=f"{out_dir}/annexC_bbn.md",
     )
 
     # Gate 2: authorization confirmation before payload design
+    # t_stage3 has TWO upstream dependencies -- t_stage2 and t_annexB --
+    # each independently skippable on resume, unlike every other task above
+    # which only has one. resume_context["t_stage3_stage2"] and
+    # ["t_stage3_annexb"] are set independently by crew.py; whichever is
+    # ABSENT stays a live context=[...] reference (that upstream task is
+    # actually running in this crew), whichever is PRESENT gets injected as
+    # text instead (that upstream task was skipped).
+    _stage3_parts = []
+    _stage3_live_context = []
+    if "t_stage3_stage2" in resume_context:
+        _stage3_parts.append("[STAGE 2]\n" + resume_context["t_stage3_stage2"])
+    else:
+        _stage3_live_context.append(t_stage2)
+    if "t_stage3_annexb" in resume_context:
+        _stage3_parts.append("[ANNEX B]\n" + resume_context["t_stage3_annexb"])
+    else:
+        _stage3_live_context.append(t_annexB)
+
+    _stage3_resume_prefix = (
+        "PRIOR STAGE OUTPUT (already completed on a previous, interrupted run; "
+        "provided here as context since this run resumed past it, not generated "
+        "by you — section headers below mark which stage each part came from):\n\n"
+        + "\n\n---\n\n".join(_stage3_parts) + "\n\n---\n\n"
+    ) if _stage3_parts else ""
+
     t_stage3 = Task(
         description=(
+            _stage3_resume_prefix +
             "Confirm all preconditions are met (corpus fixed; explicit authorization for SUT testing granted). "
             "Review the CORRECTED attack vectors from Stage 2 (provided in the verifier output context) and the priority kill-chain path from Annex B. "
             "Design testable payloads for these specific vulnerabilities using the four-category taxonomy. For "
@@ -269,11 +336,36 @@ def build_tasks(out_dir: str) -> dict:
             "CRITICAL INSTRUCTION 1: For every payload designed, you MUST use the `lookup_technique` tool to cross-reference "
             "and assign specific Red Team execution IDs (MITRE ATT&CK/CAPEC/ATLAS) and corresponding Blue Team defensive/mitigation concepts.\n"
             "CRITICAL INSTRUCTION 2: If a vector is marked [GAP], you have two choices: use your `lookup_technique` tool to search for a valid framework ID yourself, "
-            "or explicitly write `[UNMAPPED]` for the technique ID. DO NOT fabricate or hallucinate a MITRE ID. Do not assign IDs like T1606 to AI poisoning unless the index confirms it."
+            "or explicitly write `[UNMAPPED]` for the technique ID. DO NOT fabricate or hallucinate a MITRE ID. Do not assign IDs like T1606 to AI poisoning unless the index confirms it.\n"
+            "CRITICAL INSTRUCTION 3 — GROUND THE MECHANISM, NOT JUST THE ID: every payload's technical description must match the "
+            "ACTUAL nature of its target component as characterized in Stage 1 — check that component's `name` and `information_flows` "
+            "before writing the payload, not a generic or stock attack pattern for that vector category. If Stage 1 characterizes a "
+            "component as cloud-native/API/container/UI-based, the payload must describe cloud-native/API/container/UI mechanics — "
+            "do NOT introduce industrial-control terminology (PLC, SCADA, Modbus, HMI, historian, holding registers, valve/actuator "
+            "positions) unless Stage 1 explicitly establishes that component as an ICS/OT system. The reverse also applies: do not "
+            "describe cloud-native mechanics against a component Stage 1 characterizes as embedded/ICS. A correct technique ID "
+            "attached to a fabricated architecture is still a fabrication. If you genuinely lack enough characterization to ground a "
+            "payload (e.g. Stage 2's vector description is too thin), say so explicitly rather than inventing detail — do not "
+            "silently fall back on category-generic boilerplate either.\n"
+            "CRITICAL INSTRUCTION 4 — A SUCCESSFUL LOOKUP IS NOT THE SAME AS A MATCHING LOOKUP: `lookup_technique` returning a result "
+            "is not sufficient grounds to cite that ID. Read the tool's full returned `description` field — not just the id/name — and "
+            "confirm it actually describes the mechanism you are writing, before citing it:\n"
+            "  - Sub-techniques matter: if a technique has numbered variants (e.g. T1195.002 vs T1195.003), verify the SPECIFIC "
+            "sub-technique's description matches your scenario. Do not cite a sibling sub-technique just because the parent technique "
+            "matched — a hardware-supply-chain sub-technique does not correctly cite a software/CI-CD-supply-chain payload, and vice versa.\n"
+            "  - SPARTA-framework results describe space-segment/spacecraft techniques specifically (onboard flight code, GNSS, "
+            "crosslinks, TT&C beacons). If the SUT has no established space component in Stage 0/1, a SPARTA ID's own description will "
+            "contradict your scenario — do not use it; search again with different keywords or mark [UNMAPPED] instead.\n"
+            "  - If the tool's description does not match your scenario, do not silently keep the ID anyway — re-run `lookup_technique` "
+            "with adjusted keywords, or fall back to [UNMAPPED] per Critical Instruction 2. A technique ID whose own description "
+            "contradicts your payload narrative is a fabrication, even though the tool call itself succeeded without error.\n"
+            "  - Before finalizing your answer, re-read your own payload set for internal consistency: any summary or priority-path-"
+            "alignment section must reference the SAME node/vector each payload's own header states. Do not let a summary table drift "
+            "from the payload details it is supposed to be summarizing."
         ),
         expected_output="Authorized payload set keyed directly to Stage 2 vectors, rigorously cross-referenced with real MITRE IDs.",
         agent=red_team_lead,
-        context=[t_annexB],
+        context=_stage3_live_context,
         human_input=True,
         output_file=f"{out_dir}/stage3.md",
     )

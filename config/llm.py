@@ -12,12 +12,30 @@ OLLAMA_BASE = "http://localhost:11434/v1"
 # call). The native endpoint avoids that translation layer entirely.
 OLLAMA_NATIVE = "http://localhost:11434"
 
+# No timeout was previously set on either LLM below, so both ran on
+# whatever CrewAI's client default is (~600s / 10 min in most Ollama+CrewAI
+# setups per the CrewAI community forums — this exact symptom, a local
+# model timing out on a bigger generation, is one of the most commonly
+# reported CrewAI+Ollama issues). Stage 1 (three-layer decomposition + a
+# ~25-30 node structured JSON write via reason_llm, a 27B dense model
+# running locally) is meaningfully bigger than Stage 0's generation, which
+# completed fine on the same model/config — that size difference, not a
+# routing or endpoint problem, is the most likely cause of the timeout.
+# Set generously rather than tightly: the cost of guessing too low is
+# hitting this same failure again on an even bigger prompt later (Stage 2's
+# edge list, Annex C's BBN config), each time re-running Stage 0 from
+# scratch (run-isolation gives every retry a fresh run_id, no checkpoint).
+LOCAL_LLM_TIMEOUT_SECONDS = 1800  # 30 min ceiling per call
+LOCAL_LLM_MAX_RETRIES = 2
+
 # Light edge model for extraction/decomposition. Gemma 4 sampling defaults.
 light_llm = LLM(
     model="ollama/gemma4:e4b", 
     base_url=OLLAMA_BASE,
     temperature=1.0, 
-    top_p=0.95
+    top_p=0.95,
+    timeout=LOCAL_LLM_TIMEOUT_SECONDS,
+    max_retries=LOCAL_LLM_MAX_RETRIES,
 )
 
 # 27B Qwen3.6 (dense) for reasoning, coding/agentic, and tool execution.
@@ -41,4 +59,6 @@ reason_llm = LLM(
     temperature=0.1,
     top_p=0.95,
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    timeout=LOCAL_LLM_TIMEOUT_SECONDS,
+    max_retries=LOCAL_LLM_MAX_RETRIES,
 )

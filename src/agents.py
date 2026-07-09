@@ -6,7 +6,6 @@ from src.tools import (
     kcag_min_cut, 
     bbn_threat_score,
     lookup_technique, 
-    verify_corpus_lock, 
     read_corpus_chunk,
     extract_to_scratch, 
     read_scratch,

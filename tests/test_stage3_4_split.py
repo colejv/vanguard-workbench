@@ -43,24 +43,50 @@ def test_build_tasks_does_not_return_stage4():
     }
 
 
+_MINIMAL_STAGE3_TEST_PLAN = {
+    "schema_version": 1, "plan_title": "Minimal Test Plan",
+    "test_concepts": [{
+        "test_id": "RT-001", "title": "x", "objective": "x",
+        "stage2_vector_ids": ["V-01"], "kcag_path": ["ADV_START", "G1"],
+        "path_relationship": "PRIORITY_PATH", "target_node_ids": [], "categories": [1],
+        "execution_techniques": [], "defensive_concepts": [],
+        "mechanism_summary": "x", "preconditions": ["x"], "expected_effects": ["x"],
+        "success_criteria": ["x"], "abort_criteria": ["x"], "rollback_or_recovery_steps": ["x"],
+        "telemetry_requirements": ["x"], "assumptions": ["x"], "safety_controls": None,
+    }],
+    "assessment_safety_review": {"category_2_3_present": False, "covered_test_ids": [],
+                                 "not_required_statement": "NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED."},
+}
+
+
 def test_build_stage4_task_requires_content():
     with pytest.raises(ValueError, match="non-empty"):
-        build_stage4_task("/tmp/test-output", "")
+        build_stage4_task("/tmp/test-output", "", stage3_test_plan=_MINIMAL_STAGE3_TEST_PLAN)
     with pytest.raises(ValueError, match="non-empty"):
-        build_stage4_task("/tmp/test-output", "   \n\n  ")
+        build_stage4_task("/tmp/test-output", "   \n\n  ", stage3_test_plan=_MINIMAL_STAGE3_TEST_PLAN)
     with pytest.raises(ValueError, match="non-empty"):
-        build_stage4_task("/tmp/test-output", None)
+        build_stage4_task("/tmp/test-output", None, stage3_test_plan=_MINIMAL_STAGE3_TEST_PLAN)
+
+
+def test_build_stage4_task_requires_test_plan():
+    with pytest.raises(ValueError, match="structured Stage 3 test plan"):
+        build_stage4_task("/tmp/test-output", "verified stage 3 content", stage3_test_plan=None)
+    with pytest.raises(ValueError, match="structured Stage 3 test plan"):
+        build_stage4_task("/tmp/test-output", "verified stage 3 content", stage3_test_plan={})
 
 
 def test_stage4_has_no_live_stage3_context():
-    task = build_stage4_task("/tmp/test-output", "verified stage 3 content")
+    task = build_stage4_task("/tmp/test-output", "verified stage 3 content",
+                             stage3_test_plan=_MINIMAL_STAGE3_TEST_PLAN)
     assert not task.context
 
 
 def test_stage4_description_contains_stage3_content():
-    task = build_stage4_task("/tmp/test-output", "TEST-ID: RT-001")
+    task = build_stage4_task("/tmp/test-output", "TEST-ID: RT-001",
+                             stage3_test_plan=_MINIMAL_STAGE3_TEST_PLAN)
     assert "TEST-ID: RT-001" in task.description
-    assert "=== VERIFIED STAGE 3 ARTIFACT ===" in task.description
+    assert "=== VERIFIED STAGE 3 HUMAN-READABLE ARTIFACT ===" in task.description
+    assert "=== VERIFIED STRUCTURED STAGE 3 TEST PLAN ===" in task.description
     # The doctrinal Phase 0 instruction must survive the refactor verbatim --
     # this is the actual safety-relevant content, not incidental text.
     assert "CRITICAL INSTRUCTION — PHASE 0 SAFETY GATE" in task.description
@@ -78,7 +104,7 @@ def test_stage3_round_trip_before_stage4(tmp_path):
     run_context.stamp_prose_file(stage3_path)
     stage3_text = run_context.read_stamped_prose(stage3_path)
 
-    task = build_stage4_task(str(out_dir), stage3_text)
+    task = build_stage4_task(str(out_dir), stage3_text, stage3_test_plan=_MINIMAL_STAGE3_TEST_PLAN)
     assert "Verified content" in task.description
 
     run_context.reset_active_run()

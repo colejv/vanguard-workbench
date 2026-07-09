@@ -1,20 +1,27 @@
 from crewai.tools import tool, BaseTool
 from pydantic import BaseModel, Field
-from typing import List, Type, Any
+from typing import List, Type, Any, Optional
 import networkx as nx
 import json
 import re
 import os
+
+from src import run_context
 
 
 # --- Annex B: KCAG minimum node cut over the real DAG ---
 class KCAGSchema(BaseModel):
     # Agent passes ONE string: the path to the Stage 2 edge-list artifact.
     # Topology is derived from that file, NOT authored by the LLM.
-    stage2_vectors_path: str = Field(
-        default="outputs/stage2_vectors.json",
+    # Default is None, not a literal path — a Python default evaluated at
+    # import time would bake in whatever run (if any) happened to be active
+    # then. None lets _run() resolve run_context.artifact_path() fresh on
+    # every call, using whichever run is actually active right now.
+    stage2_vectors_path: Optional[str] = Field(
+        default=None,
         description="Path to the structured Stage 2 edge list (JSON). "
-                    "Do NOT hand-author nodes/edges; they are read from this file."
+                    "Do NOT hand-author nodes/edges; they are read from this file. "
+                    "Leave unset — it resolves to the current run's Stage 2 output automatically."
     )
  
 # 1. Move the dictionary OUTSIDE the class
@@ -35,19 +42,21 @@ class KCAGMinCutTool(BaseTool):
     # difficulty -> base traversal probability
     # DIFF_PROB = {"LOW": 0.80, "MEDIUM": 0.50, "HIGH": 0.20}
  
-    def _run(self, stage2_vectors_path: str = "outputs/stage2_vectors.json") -> str:
+    def _run(self, stage2_vectors_path: Optional[str] = None) -> str:
         # ---- 1. Load topology from the artifact (deterministic) -------------
+        if stage2_vectors_path is None:
+            stage2_vectors_path = run_context.artifact_path("stage2_vectors.json")
         if not os.path.exists(stage2_vectors_path):
             return (f"ERROR: {stage2_vectors_path} not found. Stage 2 must emit a "
                     f"structured edge list before Annex B can run. Expected schema: "
                     f'{{"nodes":[{{"id","node_type","criticality"}}],'
                     f'"edges":[{{"source","target","technique","difficulty","effect","vec"}}]}}')
         try:
-            data = json.load(open(stage2_vectors_path))
+            data = run_context.read_stamped_json(stage2_vectors_path)
             raw_nodes = data["nodes"]
             raw_edges = data["edges"]
-        except (json.JSONDecodeError, KeyError) as e:
-            return f"ERROR: {stage2_vectors_path} malformed ({e}). Need keys 'nodes' and 'edges'."
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            return f"ERROR: {stage2_vectors_path} malformed or failed run-isolation check ({e})."
  
         G = nx.DiGraph()
         for n in raw_nodes:
@@ -164,8 +173,8 @@ class KCAGMinCutTool(BaseTool):
             "objective_results": objective_results,
         }
         os.makedirs("outputs", exist_ok=True)
-        with open("outputs/kcag_report.json", "w") as f:
-            json.dump(report, f, indent=2)
+        kcag_report_path = run_context.artifact_path("kcag_report.json")
+        run_context.write_stamped_json(kcag_report_path, report)
  
         # ---- 9. Human-readable summary --------------------------------------
         top_bc = list(bc_sorted.items())
@@ -185,7 +194,7 @@ class KCAGMinCutTool(BaseTool):
         if priority_path:
             lines.append(f"Priority path (highest probability P={priority_path['probability']}):")
             lines.append(f"  {' -> '.join(priority_path['path'])}  [{priority_path['objective']}]")
-        lines.append("Report written: outputs/kcag_report.json")
+        lines.append(f"Report written: {kcag_report_path}")
         lines.append("STATUS: SUCCESS")
         return "\n".join(lines)
  
@@ -404,10 +413,11 @@ def check_attribution_boundary(text: str, scratch_text: str, corpus_text: str = 
 @tool("read_corpus_chunk")
 def read_corpus_chunk(chunk_index: str = "0") -> str:
     """Return one pre-assembled chunk of the locked corpus.
-    Chunks are built from all 64 source files before crew kickoff.
+    Chunks are built from all source files before crew kickoff.
     Call with chunk_index '0' through N-1. The response tells you total chunks."""
     import json
-    data = json.load(open("corpus-index/corpus_chunks.json"))
+    chunks_path = run_context.artifact_path("corpus_chunks.json")
+    data = run_context.read_stamped_json(chunks_path)
     chunks = data["chunks"]
     total = data["total"]
     try:
@@ -426,12 +436,11 @@ def extract_to_scratch(chunk_index_and_findings: str) -> str:
     Input format: first line is the chunk index, remaining lines are the
     extracted findings (named systems, personnel, exercises, interfaces, etc.)
     for that chunk. Call once per chunk after reading it."""
-    import os
-    os.makedirs("outputs", exist_ok=True)
+    scratch_path = run_context.artifact_path("_stage0_scratch.md")
     lines = chunk_index_and_findings.split("\n", 1)
     idx = lines[0].strip()
     findings = lines[1] if len(lines) > 1 else ""
-    with open("outputs/_stage0_scratch.md", "a") as f:
+    with open(scratch_path, "a") as f:
         f.write(f"\n## Extraction — chunk {idx}\n{findings}\n")
     return f"Chunk {idx} findings appended to scratchpad."
 
@@ -441,27 +450,34 @@ def read_scratch(trigger: str) -> str:
     You MUST pass the string 'EXECUTE' as the trigger argument."""
     if trigger != "EXECUTE":
          return "ERROR: You must pass the string 'EXECUTE' to read the scratchpad."
+    scratch_path = run_context.artifact_path("_stage0_scratch.md")
     try:
-        return open("outputs/_stage0_scratch.md").read()
+        return open(scratch_path).read()
     except FileNotFoundError:
         return "[scratchpad empty — no extractions recorded]"
     
 @tool("verify_and_fix_stage2")
 def verify_and_fix_stage2(_: str = "") -> str:
-    """Read outputs/stage2.md, verify EVERY framework ID across all schemas,
-    auto-correct hallucinated IDs via keyword search, and FAIL on any
-    [GAP]/[UNMAPPED] marker or category-mismatched SPARTA ID.
- 
+    """Read the active run's stage2.md, verify EVERY framework ID across all
+    schemas, auto-correct hallucinated IDs via keyword search, and FAIL on
+    any [GAP]/[UNMAPPED] marker or category-mismatched SPARTA ID.
+
     A FAIL blocks Annex B. This is mechanical, not analytical.
+
+    NOTE: this tool is currently not assigned to any agent in pre_crew or
+    post_crew (the 'verifier' agent that holds it isn't a member of either
+    crew) -- it's unreachable from the actual pipeline. Paths here are kept
+    run-scoped for consistency regardless.
     """
+    stage2_path = run_context.artifact_path("stage2.md")
     try:
         idx = json.load(open("corpus-index/technique_index.json"))
     except FileNotFoundError:
         return "ERROR: corpus-index/technique_index.json not found — cannot verify."
     try:
-        stage2 = open("outputs/stage2.md").read()
+        stage2 = open(stage2_path).read()
     except FileNotFoundError:
-        return "ERROR: outputs/stage2.md not found — Stage 2 has not been written yet."
+        return f"ERROR: {stage2_path} not found — Stage 2 has not been written yet."
  
     # All framework ID schemas — note SPARTA prefixes split into ATTACK vs DEFENSE
     SPARTA_ATTACK = r'(?:REC|IA|EX|EXF|LM|PER|IMP|RD)-\d{4}(?:\.\d{1,2})?'
@@ -557,8 +573,8 @@ def verify_and_fix_stage2(_: str = "") -> str:
                  f"resolve to Txxxx / CAPEC-nnn / AML.Tnnn or flag GAP]", 1)
         changes.append(f"UNRESOLVABLE {bad} -> malformed framework ID")
  
-    os.makedirs("outputs", exist_ok=True)
-    with open("outputs/stage2_corrected.md", "w") as f:
+    corrected_path = run_context.artifact_path("stage2_corrected.md")
+    with open(corrected_path, "w") as f:
         f.write("<!-- AUTO-CORRECTED BY verify_and_fix_stage2 -->\n\n")
         f.write(corrected_text)
  
@@ -591,7 +607,7 @@ def verify_and_fix_stage2(_: str = "") -> str:
         "--- BLOCKING ISSUES (human review before Annex B) ---",
         *([f"  {c}" for c in blocking] or ["  (none)"]),
         "",
-        "Corrected output: outputs/stage2_corrected.md",
+        f"Corrected output: {corrected_path}",
         f"STATUS: {status}",
     ]
     return "\n".join(report) + "\n\n=== CORRECTED STAGE 2 VECTORS ===\n" + corrected_text
@@ -601,7 +617,7 @@ def verify_and_fix_stage2(_: str = "") -> str:
 #  Add to src/tools.py. Called directly from src/crew.py between crews.
 #  Single function, single return contract: {"is_valid": bool, ...}
 # ============================================================================
-def verify_stage2_vectors(vectors_path: str = "outputs/stage2_vectors.json",
+def verify_stage2_vectors(vectors_path: Optional[str] = None,
                           index_path: str = "corpus-index/technique_index.json") -> dict:
     """Deterministically verify every technique ID in the Stage 2 attack GRAPH
     (not the prose) against the indexed corpus. This is the enforcement gate:
@@ -609,6 +625,10 @@ def verify_stage2_vectors(vectors_path: str = "outputs/stage2_vectors.json",
 
     Verifies the authoritative artifact (stage2_vectors.json) — the file Annex B
     actually consumes — so prose/graph drift cannot pass unverified IDs to the KCAG.
+
+    vectors_path defaults to the active run's Stage 2 output (run_context);
+    index_path stays a plain default since the technique index is corpus-level,
+    not per-run, data.
 
     Returns:
       {
@@ -626,6 +646,9 @@ def verify_stage2_vectors(vectors_path: str = "outputs/stage2_vectors.json",
     result = {"is_valid": False, "status": "FAIL", "checked": 0,
               "invalid_edges": [], "gap_edges": [], "summary": ""}
 
+    if vectors_path is None:
+        vectors_path = run_context.artifact_path("stage2_vectors.json")
+
     if not os.path.exists(vectors_path):
         result["summary"] = f"{vectors_path} not found — Stage 2 did not emit an edge list."
         return result
@@ -634,10 +657,10 @@ def verify_stage2_vectors(vectors_path: str = "outputs/stage2_vectors.json",
         return result
 
     try:
-        data = json.load(open(vectors_path))
+        data = run_context.read_stamped_json(vectors_path)
         index = json.load(open(index_path))
-    except json.JSONDecodeError as e:
-        result["summary"] = f"JSON parse error: {e}"
+    except (json.JSONDecodeError, ValueError) as e:
+        result["summary"] = f"{vectors_path} failed to load or run-isolation check ({e})."
         return result
 
     edges = data.get("edges")
@@ -849,11 +872,10 @@ def write_stage2_vectors(vectors_json: str) -> str:
         return ("REJECTED: edge list failed validation. Nothing written. Fix and resubmit:\n  - "
                 + "\n  - ".join(errors))
 
-    os.makedirs("outputs", exist_ok=True)
-    with open("outputs/stage2_vectors.json", "w") as f:
-        json.dump({"nodes": nodes, "edges": edges}, f, indent=2)
+    out_path = run_context.artifact_path("stage2_vectors.json")
+    run_context.write_stamped_json(out_path, {"nodes": nodes, "edges": edges})
 
-    return (f"WRITTEN: outputs/stage2_vectors.json | "
+    return (f"WRITTEN: {out_path} | "
             f"{len(nodes)} nodes, {len(edges)} edges, {len(goal_nodes)} goal(s), "
             f"entry node(s): {entry_nodes}. Annex B may now build the KCAG.")
 
@@ -1063,7 +1085,7 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     PER-ASSESSMENT INPUTS are required in cpd_config_json with no silent
     defaults -- this also fails closed if any are missing:
       {
-        "kcag_report_path": "outputs/kcag_report.json",   // optional, this default path is a file-location convention, not an analytical prior
+        "kcag_report_path": null,   // optional; omit to auto-resolve to the active run's kcag_report.json
         "adversary": {
             "capability_prior": [0.0, 0.05, 0.95],        // REQUIRED: [hacktivist,criminal,nation-state]
             "tempo": "HIGH"                                // REQUIRED: LOW|MEDIUM|HIGH
@@ -1081,7 +1103,8 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     outputs/kcag_report.json is also required (Annex B must run before Annex C)
     -- this fails closed rather than substituting a fallback objective prior.
 
-    Returns a human-readable report plus writes outputs/bbn_report.json.
+    Returns a human-readable report plus writes bbn_report.json under the
+    active run's output directory.
     """
     from pgmpy.models import DiscreteBayesianNetwork
     from pgmpy.factors.discrete import TabularCPD
@@ -1149,15 +1172,15 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     evidence = cfg.get("evidence", {})  # absent evidence = legitimate baseline state, not a hidden prior
 
     # ---- Ingest Annex B KCAG priors -- REQUIRED, fail closed -----------------
-    kcag_path = cfg.get("kcag_report_path", "outputs/kcag_report.json")
+    kcag_path = cfg.get("kcag_report_path") or run_context.artifact_path("kcag_report.json")
     if not os.path.exists(kcag_path):
         return (f"ERROR: {kcag_path} not found. Annex B must run before Annex C — "
                 f"refusing to substitute a fallback objective-path prior. Run "
                 f"kcag_min_cut first.")
     try:
-        kcag = json.load(open(kcag_path))
-    except json.JSONDecodeError as e:
-        return f"ERROR: {kcag_path} malformed ({e}). Refusing to run."
+        kcag = run_context.read_stamped_json(kcag_path)
+    except (json.JSONDecodeError, ValueError) as e:
+        return f"ERROR: {kcag_path} failed to load or run-isolation check ({e}). Refusing to run."
     objs = kcag.get("objective_results", {})
     if not objs:
         return f"ERROR: {kcag_path} has no objective_results — Annex B did not complete successfully."
@@ -1353,9 +1376,8 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         "priors_file": priors_path,
         "cpd_audit_log": AUDIT,
     }
-    os.makedirs("outputs", exist_ok=True)
-    with open("outputs/bbn_report.json", "w") as f:
-        json.dump(report, f, indent=2)
+    bbn_report_path = run_context.artifact_path("bbn_report.json")
+    run_context.write_stamped_json(bbn_report_path, report)
 
     lines = [
         "=== ANNEX C: BBN THREAT ASSESSMENT ===",
@@ -1367,7 +1389,7 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         *[f"  {PHASE_LABELS[i]:16s} {float(phase_dist[i]):.4f}" for i in range(4)],
         f"Evidence applied: {ev or '(none — baseline)'}",
         f"Priors file: {priors_path}",
-        f"CPD audit entries: {len(AUDIT)} (full log in outputs/bbn_report.json)",
+        f"CPD audit entries: {len(AUDIT)} (full log in {bbn_report_path})",
         "STATUS: SUCCESS",
     ]
     return "\n".join(lines)
@@ -1431,11 +1453,10 @@ def write_stage0_output(stage0_json: str) -> str:
     if dupes:
         return f"REJECTED: duplicate signature_id(s) {sorted(dupes)}. Nothing written."
 
-    os.makedirs("outputs", exist_ok=True)
-    with open("outputs/stage0_output.json", "w") as f:
-        f.write(parsed.model_dump_json(indent=2))
+    out_path = run_context.artifact_path("stage0_output.json")
+    run_context.write_stamped_json(out_path, parsed.model_dump(mode="json"))
 
-    return (f"WRITTEN: outputs/stage0_output.json | "
+    return (f"WRITTEN: {out_path} | "
             f"{len(parsed.signatures)} signature(s), {parsed.gap_count} flagged [GAP]. "
             f"Stage 1 may now build on this signature set.")
 
@@ -1548,11 +1569,10 @@ def write_stage1_output(stage1_json: str) -> str:
     else:
         cog_note = f"multiple flagged {[n.component_id for n in cog_flagged]} — advisory only, not rejected"
 
-    os.makedirs("outputs", exist_ok=True)
-    with open("outputs/stage1_output.json", "w") as f:
-        f.write(parsed.model_dump_json(indent=2))
+    out_path = run_context.artifact_path("stage1_output.json")
+    run_context.write_stamped_json(out_path, parsed.model_dump(mode="json"))
 
-    return (f"WRITTEN: outputs/stage1_output.json | "
+    return (f"WRITTEN: {out_path} | "
             f"{len(parsed.technical_nodes)} technical, {len(parsed.procedural_nodes)} procedural, "
             f"{len(parsed.cognitive_nodes)} cognitive node(s), {len(parsed.trust_boundaries)} trust "
             f"boundary(ies), {parsed.gap_count} flagged [GAP]. "

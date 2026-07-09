@@ -2,8 +2,7 @@ from crewai import Crew, Process, Task
 import sys, os
 from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
-from src.tasks import (t_research, t_synthesize_stage0, t_stage1,t_stage2, 
-                       t_annexB, t_annexC, t_stage3, t_stage4)
+from src.tasks import build_tasks
 from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
                        discover_corpus_files, read_corpus_file,
                        check_attribution_boundary, check_phase0_safety_gate,
@@ -11,6 +10,7 @@ from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status)
+from src import run_context
 
 
 if __name__ == "__main__":
@@ -48,7 +48,10 @@ if __name__ == "__main__":
             except (IndexError, ValueError, json.JSONDecodeError):
                 continue
 
-        # Compare and version
+        # Compare and version. NOTE: manifest_v{N}.json under corpus-index/
+        # is deliberately NOT run-scoped -- it tracks corpus drift over time
+        # across many runs, not one assessment's artifacts, so it stays
+        # shared by design (unlike everything under outputs/<run_id>/).
         if current_hash != latest_hash:
             new_v = latest_v + 1
             manifest_data = {
@@ -71,14 +74,8 @@ if __name__ == "__main__":
     print(f"Corpus Version: v{c_version} | File Count: {c_count} | Status: {c_status}")
 
     # ---- RUN IDENTITY & ASSESSMENT STATE (audit trail) ----
-    # One run_id per pipeline execution; every new audit artifact this run
-    # produces is scoped under outputs/<run_id>/. Existing task output_file
-    # paths (outputs/stage0.md, etc.) are intentionally left flat for now —
-    # scoping those is a separate, larger change to tasks.py, not part of
-    # this increment.
     run_id = new_run_id()
     out_dir = run_output_dir(run_id)
-    os.makedirs(out_dir, exist_ok=True)
     print(f"Run ID: {run_id}")
 
     # Pin this run to the corpus manifest that snapshot_corpus() just wrote
@@ -88,6 +85,16 @@ if __name__ == "__main__":
     with open(manifest_path, "rb") as f:
         corpus_manifest_hash = f"sha256:{hashlib.sha256(f.read()).hexdigest()}"
 
+    # ---- RUN ISOLATION: set the active run BEFORE any task or tool runs ----
+    # Every tool that reads/writes a per-run artifact resolves its path via
+    # run_context.artifact_path() from this point on -- there is no shared
+    # "outputs/<filename>" path left anywhere in tools.py. Two runs, whether
+    # sequential or concurrent, cannot collide: each gets its own directory,
+    # and every JSON/prose artifact is stamped with this run's id + corpus
+    # hash, so even a code bug that points at the wrong path is caught by
+    # read_stamped_json/read_stamped_prose rather than silently succeeding.
+    run_context.set_active_run(run_id, corpus_manifest_hash, out_dir)
+
     state = init_assessment_state(run_id, corpus_manifest_hash)
     save_assessment_state(state, run_id)
 
@@ -95,50 +102,39 @@ if __name__ == "__main__":
     # task) ----
     # Doctrinal Annex A Phase 1 requirement: the corpus must not have moved
     # since it was frozen (sources/corpus_manifest.md, written at the
-    # collection/lock step) before Stage 0 may begin. t_research previously
-    # only asserted a verbatim confirmation string and never actually
-    # checked this — verify_corpus_lock_gate() re-hashes sources/ against
-    # the frozen manifest and this call raises on any drift, so a moved,
-    # added, or edited source file now genuinely blocks the run instead of
-    # being silently accepted.
+    # collection/lock step) before Stage 0 may begin. verify_corpus_lock_gate()
+    # re-hashes sources/ against the frozen manifest and this call raises on
+    # any drift.
     lock = verify_corpus_lock_gate()
     print(f"Corpus lock: {lock['status']} — {lock['summary']}")
 
-    # NOT committed into assessment_state.json: STAGE_NAMES in the real
-    # src/schemas.py is ('stage0','stage1','stage2','stage3') and both
-    # commit_stage_output and set_stage_status raise ValueError on any other
-    # stage name, so 'corpus_lock' has no slot to commit into. The Gate 1
-    # doctrinal check still fully enforces below (RuntimeError halts the
-    # run on any drift) — it just isn't tracked as a row in the audit
-    # trail's stages dict. If you want it tracked there too, that's a
-    # one-line addition to STAGE_NAMES plus adding "corpus_lock" to every
-    # place that iterates it (all_stages_passed, the stages default_factory)
-    # — say the word and I'll do it against your actual schemas.py rather
-    # than guess at it again.
+    # NOT committed into assessment_state.json: STAGE_NAMES in schemas.py is
+    # ('stage0','stage1','stage2','stage3') and both commit_stage_output and
+    # set_stage_status raise ValueError on any other stage name, so
+    # 'corpus_lock' has no slot to commit into. The Gate 1 doctrinal check
+    # still fully enforces below (RuntimeError halts the run on any drift).
     if not lock["is_valid"]:
         raise RuntimeError(
             f"Corpus lock verification FAILED: {lock['summary']} "
             f"Stage 0 NOT started. Re-freeze the corpus or restore the "
             f"drifted file(s) before re-running. "
-            f"Run audit trail: {run_output_dir(run_id)}/assessment_state.json"
+            f"Run audit trail: {out_dir}/assessment_state.json"
         )
 
     print("Reading assessment brief...")
     with open("collection/brief.md") as f:
         brief_text = f.read()
 
-    # Robust Dedup: Ensure scratchpad is zeroed out to prevent duplicate 
-    # entries if a previous run crashed mid-extraction.
-    scratch_path = "outputs/_stage0_scratch.md"
-    if os.path.exists(scratch_path):
-        os.remove(scratch_path)
-        # Touch the file so the tool doesn't throw a FileNotFoundError if read early
-        open(scratch_path, 'a').close() 
+    # Scratchpad lives under the run directory now, so there is nothing to
+    # dedup against a previous run's leftovers -- a fresh run_id always
+    # means a fresh, empty scratch file. Still touch it so read_scratch
+    # doesn't hit FileNotFoundError if called before the first extraction.
+    scratch_path = run_context.artifact_path("_stage0_scratch.md")
+    open(scratch_path, "a").close()
 
     # Read and assemble corpus chunks — discover_corpus_files is the exact
     # same file set snapshot_corpus() just hashed above, so every file in
-    # the frozen manifest is guaranteed to enter analysis (previously .pdf/
-    # .json were hashed here but silently never read).
+    # the frozen manifest is guaranteed to enter analysis.
     print("Assembling corpus from chunks...")
     src = "sources"
     files = discover_corpus_files(src)
@@ -160,12 +156,26 @@ if __name__ == "__main__":
     total_chars = sum(len(c) for c in chunks)
     print(f"Corpus: {len(files)} files, {total_chars:,} chars, {len(chunks)} chunks")
 
-    with open("corpus-index/corpus_chunks.json", "w") as f:
-        json.dump({"chunks": chunks, "total": len(chunks), "files": len(files)}, f)
-    
+    # Run-scoped and stamped -- moved off corpus-index/ (shared, and the
+    # original location of the collision risk between concurrent runs).
+    chunks_path = run_context.artifact_path("corpus_chunks.json")
+    run_context.write_stamped_json(
+        chunks_path, {"chunks": chunks, "total": len(chunks), "files": len(files)}
+    )
+
     # ==========================================
-    # DYNAMIC TASK ASSEMBLY
+    # TASK ASSEMBLY (run-scoped output_file paths, built fresh each run)
     # ==========================================
+    tasks = build_tasks(out_dir)
+    t_research = tasks["t_research"]
+    t_synthesize_stage0 = tasks["t_synthesize_stage0"]
+    t_stage1 = tasks["t_stage1"]
+    t_stage2 = tasks["t_stage2"]
+    t_annexB = tasks["t_annexB"]
+    t_annexC = tasks["t_annexC"]
+    t_stage3 = tasks["t_stage3"]
+    t_stage4 = tasks["t_stage4"]
+
     chunk_tasks = []
     for i, chunk in enumerate(chunks):
         chunk_tasks.append(Task(
@@ -196,6 +206,17 @@ if __name__ == "__main__":
         "corpus_version": c_version,
     })
 
+    # ---- STAMP PRE-CREW PROSE ARTIFACTS ----
+    # CrewAI writes output_file content directly from each agent's final
+    # answer -- there's no Python write call to route through
+    # write_stamped_json for these, so stamp them here as a deterministic
+    # post-processing step instead of asking the model to do it.
+    stage0_prose_path = run_context.artifact_path("stage0.md")
+    stage1_prose_path = run_context.artifact_path("stage1.md")
+    stage2_prose_path = run_context.artifact_path("stage2.md")
+    for p in (stage0_prose_path, stage1_prose_path, stage2_prose_path):
+        run_context.stamp_prose_file(p)
+
     # ---- ATTRIBUTION-BOUNDARY CHECK (deterministic, warn-only) ----
     # Item 7: replaces trusting the "ATTRIBUTION DISCIPLINE" prompt text
     # alone. Checks every named person/unit/component mentioned in the
@@ -209,16 +230,17 @@ if __name__ == "__main__":
     # false-positive rate even after tiering — flip the `if not attr["...` block
     # below to `raise RuntimeError(...)` if you want it to hard-block instead.
     prose = ""
-    for p in ("outputs/stage0.md", "outputs/stage1.md"):
+    for p in (stage0_prose_path, stage1_prose_path):
         if os.path.exists(p):
-            prose += open(p).read() + "\n"
+            prose += run_context.read_stamped_prose(p) + "\n"
     scratch_text = open(scratch_path).read() if os.path.exists(scratch_path) else ""
     corpus_text = ""
-    if os.path.exists("corpus-index/corpus_chunks.json"):
-        corpus_text = "\n".join(json.load(open("corpus-index/corpus_chunks.json"))["chunks"])
+    if os.path.exists(chunks_path):
+        corpus_text = "\n".join(run_context.read_stamped_json(chunks_path)["chunks"])
 
     attr = check_attribution_boundary(prose, scratch_text, corpus_text)
-    with open("outputs/attribution_check.md", "w") as f:
+    attr_check_path = run_context.artifact_path("attribution_check.md")
+    with open(attr_check_path, "w") as f:
         f.write("# Attribution Boundary Check (Stage 0 + Stage 1)\n\n")
         f.write(f"Entities checked: {attr['checked']}\n\n")
         f.write("## High-confidence (rank+name / ordinal+unit) — drives verdict\n")
@@ -231,6 +253,7 @@ if __name__ == "__main__":
         f.write(f"- Traceable: {attr['advisory']['traceable']}\n")
         f.write(f"- Extraction gap: {attr['advisory']['extraction_gap']}\n")
         f.write(f"- Untraceable: {attr['advisory']['untraceable']}\n")
+    run_context.stamp_prose_file(attr_check_path)
 
     if attr["is_clean"]:
         print(f"Attribution check: CLEAN — {attr['checked']} entities checked, "
@@ -238,7 +261,7 @@ if __name__ == "__main__":
     else:
         print(f"Attribution check: FLAGGED — possible fabrication, human review "
               f"required: {attr['high_confidence']['untraceable']}. "
-              f"See outputs/attribution_check.md. (Not blocking this run — see "
+              f"See {attr_check_path}. (Not blocking this run — see "
               f"comment above this block to make it a hard gate.)")
 
     # ---- COMMIT PRE-CREW STAGE OUTPUTS TO ASSESSMENT STATE ----
@@ -246,14 +269,15 @@ if __name__ == "__main__":
     # kickoff() with no per-task hook exposed, so all three are committed
     # here, after the crew finishes, from whatever artifacts exist on disk.
     # Stage 0/1 land as PENDING — the attribution-boundary check above is
-    # deterministic but warn-only (not a PASS/FAIL gate the way Stage 2's
-    # verify_stage2_vectors is), so it doesn't change commit status here;
-    # its verdict lives in outputs/attribution_check.md instead. Stage 2 is
+    # deterministic but warn-only, so it doesn't change commit status here;
+    # its verdict lives in attribution_check.md instead. Stage 2 is
     # committed PENDING here and promoted to PASS/FAIL immediately below,
     # once verify_stage2_vectors actually runs.
+    stage0_json_path = run_context.artifact_path("stage0_output.json")
+    stage1_json_path = run_context.artifact_path("stage1_output.json")
     for stage_name, artifact_path in (
-        ("stage0", "outputs/stage0_output.json"),
-        ("stage1", "outputs/stage1_output.json"),
+        ("stage0", stage0_json_path),
+        ("stage1", stage1_json_path),
     ):
         if os.path.exists(artifact_path):
             commit_stage_output(state, stage_name, artifact_path, status=StageStatus.PENDING)
@@ -265,11 +289,11 @@ if __name__ == "__main__":
     save_assessment_state(state, run_id)
 
     # ---- DETERMINISTIC GATE (plain Python — the actual enforcement point) ----
-    verification = verify_stage2_vectors(
-        vectors_path="outputs/stage2_vectors.json",
-        index_path="corpus-index/technique_index.json",
-    )
-    with open("outputs/stage2_verification.md", "w") as f:
+    # No vectors_path passed -- verify_stage2_vectors resolves it via
+    # run_context automatically now, same as every other tool.
+    verification = verify_stage2_vectors(index_path="corpus-index/technique_index.json")
+    stage2_verification_path = run_context.artifact_path("stage2_verification.md")
+    with open(stage2_verification_path, "w") as f:
         f.write(f"# Stage 2 Verification\n\nSTATUS: {verification['status']}\n\n")
         f.write(verification["summary"] + "\n\n")
         for ie in verification["invalid_edges"]:
@@ -278,20 +302,22 @@ if __name__ == "__main__":
                     f"({ie['reason']}) — suggest `{sug}`\n")
         for ge in verification["gap_edges"]:
             f.write(f"- GAP edge[{ge['edge_index']}] `{ge['technique']}`\n")
+    run_context.stamp_prose_file(stage2_verification_path)
 
     # Register stage2_vectors.json in the audit trail regardless of outcome,
     # then promote/demote its status from the gate's actual verdict — same
     # two-step pattern (commit PENDING, then set_stage_status) used above.
-    if os.path.exists("outputs/stage2_vectors.json"):
-        commit_stage_output(state, "stage2", "outputs/stage2_vectors.json", status=StageStatus.PENDING)
+    stage2_vectors_path = run_context.artifact_path("stage2_vectors.json")
+    if os.path.exists(stage2_vectors_path):
+        commit_stage_output(state, "stage2", stage2_vectors_path, status=StageStatus.PENDING)
     set_stage_status(state, "stage2", StageStatus.PASS if verification["is_valid"] else StageStatus.FAIL)
     save_assessment_state(state, run_id)
 
     if not verification["is_valid"]:
         raise RuntimeError(
             f"Stage 2 verification FAILED: {verification['summary']} "
-            f"See outputs/stage2_verification.md. Annex B and downstream NOT executed. "
-            f"Run audit trail: {run_output_dir(run_id)}/assessment_state.json"
+            f"See {stage2_verification_path}. Annex B and downstream NOT executed. "
+            f"Run audit trail: {out_dir}/assessment_state.json"
         )
 
     # ---- CREW 2: Annex B onward (only reached if gate passed) ----
@@ -307,6 +333,14 @@ if __name__ == "__main__":
         "corpus_version": c_version,
     })
 
+    # ---- STAMP POST-CREW PROSE ARTIFACTS ----
+    annexB_prose_path = run_context.artifact_path("annexB_kcag.md")
+    annexC_prose_path = run_context.artifact_path("annexC_bbn.md")
+    stage3_prose_path = run_context.artifact_path("stage3.md")
+    stage4_prose_path = run_context.artifact_path("stage4_mission_plan.md")
+    for p in (annexB_prose_path, annexC_prose_path, stage3_prose_path, stage4_prose_path):
+        run_context.stamp_prose_file(p)
+
     # ---- ITEM 8: PHASE 0 SAFETY GATE COMPLIANCE CHECK (deterministic, HARD
     # BLOCK) ----
     # Unlike the attribution check (warn-only, item 7), this is a hard gate:
@@ -317,54 +351,52 @@ if __name__ == "__main__":
     # check fires AFTER a human has already approved the mission plan
     # content — it cannot intercept that approval. What it CAN do is refuse
     # to let the run complete/stamp the plan as final if the safety gate is
-    # missing, which still surfaces the compliance gap immediately rather
-    # than silently shipping a Category 2/3 mission plan with no safety
-    # section. If you want this enforced *before* the human sees Stage 4 at
-    # all, that requires splitting post_crew at the Stage 3/Stage 4 boundary
-    # the same way pre_crew/post_crew are already split around the Stage 2
-    # gate — a bigger structural change I didn't make unprompted; say the
-    # word and I will.
-    stage3_text = open("outputs/stage3.md").read() if os.path.exists("outputs/stage3.md") else ""
-    stage4_text = (open("outputs/stage4_mission_plan.md").read()
-                   if os.path.exists("outputs/stage4_mission_plan.md") else "")
+    # missing. Splitting post_crew at the Stage 3/Stage 4 boundary (same
+    # pattern as the pre_crew/post_crew split around the Stage 2 gate) would
+    # let this run BEFORE the human sees Stage 4 — a bigger structural
+    # change than run-isolation covers; say the word and I'll do that pass.
+    stage3_text = run_context.read_stamped_prose(stage3_prose_path) if os.path.exists(stage3_prose_path) else ""
+    stage4_text = run_context.read_stamped_prose(stage4_prose_path) if os.path.exists(stage4_prose_path) else ""
     safety = check_phase0_safety_gate(stage3_text, stage4_text)
-    with open("outputs/phase0_safety_check.md", "w") as f:
+    phase0_check_path = run_context.artifact_path("phase0_safety_check.md")
+    with open(phase0_check_path, "w") as f:
         f.write("# Phase 0 Safety Gate Compliance Check\n\n")
         f.write(f"Category 2/3 payload detected: {safety['category_2_3_detected']}\n")
         f.write(f"Matched terms: {safety['matched_terms']}\n")
         f.write(f"Phase 0 Safety Gate section present: {safety['phase0_gate_present']}\n\n")
         f.write(f"STATUS: {'COMPLIANT' if safety['is_compliant'] else 'NON-COMPLIANT'}\n")
         f.write(safety["summary"] + "\n")
+    run_context.stamp_prose_file(phase0_check_path)
     print(f"Phase 0 Safety Gate check: "
           f"{'COMPLIANT' if safety['is_compliant'] else 'NON-COMPLIANT'} — {safety['summary']}")
     if not safety["is_compliant"]:
         raise RuntimeError(
             f"Phase 0 Safety Gate compliance FAILED: {safety['summary']} "
-            f"See outputs/phase0_safety_check.md. Mission plan NOT finalized — "
+            f"See {phase0_check_path}. Mission plan NOT finalized — "
             f"revise Stage 4 to add the required safety section (or an explicit "
             f"'NO CATEGORY 2/3 PAYLOADS' statement if this is a false positive) "
-            f"and re-run. Run audit trail: {run_output_dir(run_id)}/assessment_state.json"
+            f"and re-run. Run audit trail: {out_dir}/assessment_state.json"
         )
 
     # ---- COMMIT POST-CREW STAGE OUTPUT TO ASSESSMENT STATE ----
     # Stage 3 (t_stage3) is the payload-design gate; no structured schema
     # exists for it yet, so it lands as PENDING against its prose artifact,
-    # same as Stage 0/1. (The Phase 0 safety check above does deterministically
-    # verify one specific cross-cutting property of Stage 3+4 together —
-    # category/safety-gate correlation — but that's not the same as a full
-    # structural verifier the way Stage 2 has one.)
-    if os.path.exists("outputs/stage3.md"):
-        commit_stage_output(state, "stage3", "outputs/stage3.md", status=StageStatus.PENDING)
+    # same as Stage 0/1.
+    if os.path.exists(stage3_prose_path):
+        commit_stage_output(state, "stage3", stage3_prose_path, status=StageStatus.PENDING)
     state.current_stage = "complete"
     save_assessment_state(state, run_id)
 
-    # Stamp the final mission plan with the corpus version
+    # Stamp the final mission plan with the corpus version. This is appended
+    # AFTER the run-isolation header (stamp_prose_file already ran above),
+    # so it doesn't disturb the header regex — read_stamped_prose only
+    # matches at the start of the file.
     try:
-        with open("outputs/stage4_mission_plan.md", "a") as f:
+        with open(stage4_prose_path, "a") as f:
             f.write(f"\n\n---\n*Analysis grounded in Corpus Version v{c_version} ({c_count} files)*")
     except Exception:
         pass
 
     print("\n\n=== PIPELINE FINISHED ===")
-    print(f"Run audit trail: {run_output_dir(run_id)}/assessment_state.json")
+    print(f"Run audit trail: {out_dir}/assessment_state.json")
     print(result)

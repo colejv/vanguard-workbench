@@ -6,7 +6,7 @@ from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
 from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
                        extract_to_scratch, read_scratch, write_stage2_vectors,
-                       write_stage0_output, write_stage1_output)
+                       write_stage0_output, write_stage1_output, write_stage3_test_plan)
 
 
 def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
@@ -434,11 +434,34 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
             "  If NO payload carries Category 2 or 3, the section must instead state, verbatim and exactly: "
             "'NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED.' Do not omit the section either way — its "
             "absence is itself a gate failure, never a silent gap. Do not state the not-required sentence if ANY "
-            "payload actually carries Category 2 or 3 — that is a direct contradiction and will also fail the gate."
+            "payload actually carries Category 2 or 3 — that is a direct contradiction and will also fail the gate.\n"
+            "CRITICAL INSTRUCTION 6 — STRUCTURED TEST PLAN: after drafting the human-readable assessment above, "
+            "call `write_stage3_test_plan` exactly once with a JSON object matching the required schema. The "
+            "structured artifact and the prose artifact must describe the SAME test concepts — do not add a "
+            "concept to one and omit it from the other.\n"
+            "  Every concept requires: a unique test_id in RT-NNN format matching a '### RT-NNN — <title>' heading "
+            "in your prose above; objective; one or more existing Stage 2 vector IDs; a complete kcag_path "
+            "beginning at ADV_START and ending at a goal node; whether that path is the Annex B PRIORITY_PATH or "
+            "an ALTERNATE_VALID_PATH (a valid path to a different meaningful objective is acceptable — it does "
+            "not have to be the global priority path, but it must be a real one); target node IDs on that path; "
+            "one or more category numbers 1-4; grounded execution technique references (a real ID from the "
+            "technique index, or exactly `[UNMAPPED]` with a rationale — never an invented-looking ID); defensive "
+            "concepts; preconditions; expected effects; measurable success criteria; explicit abort criteria; "
+            "rollback or recovery steps; required telemetry; and explicit assumptions.\n"
+            "  For a Category 2 or 3 concept, safety_controls is mandatory. For concepts containing neither "
+            "category, safety_controls must be null.\n"
+            "  Do not invent Stage 2 vector IDs, graph nodes, graph paths, framework IDs, assets, approving "
+            "roles, or safety authorities. A deterministic gate re-checks every reference against the real "
+            "Stage 2 graph, KCAG report, and technique index after this crew finishes — an invented-looking "
+            "reference will fail that gate even though the writer tool itself may accept it now."
         ),
-        expected_output="Authorized payload set keyed directly to Stage 2 vectors, rigorously cross-referenced with real MITRE IDs.",
+        expected_output=(
+            "Human-reviewed Stage 3 test concepts in stage3.md, plus confirmation that a matching "
+            "structured test plan was written to stage3_test_plan.json."
+        ),
         agent=red_team_lead,
         context=_stage3_live_context,
+        tools=[lookup_technique, write_stage3_test_plan],
         human_input=True,
         output_file=f"{out_dir}/stage3.md",
     )
@@ -460,24 +483,33 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
     }
 
 
-def build_stage4_task(out_dir: str, stage3_content: str) -> Task:
+def build_stage4_task(out_dir: str, stage3_content: str, stage3_test_plan: dict) -> Task:
     """
-    Constructs t_stage4 fresh, from already-verified Stage 3 text -- never
-    via a live CrewAI context=[...] reference. Stage 4 runs in its own
-    crew (stage4_crew), and Stage 3's task object is never part of that
-    crew's task list, so context=[t_stage3] is not just unnecessary here,
-    it would silently do nothing (CrewAI only resolves context from tasks
-    that execute as part of the SAME crew.kickoff() call).
+    Constructs t_stage4 fresh, from already-verified Stage 3 text AND the
+    already-verified structured test plan -- never via a live CrewAI
+    context=[...] reference. Stage 4 runs in its own crew (stage4_crew),
+    and Stage 3's task object is never part of that crew's task list, so
+    context=[t_stage3] is not just unnecessary here, it would silently do
+    nothing (CrewAI only resolves context from tasks that execute as part
+    of the SAME crew.kickoff() call).
 
     stage3_content must be the ALREADY-STAMPED-AND-VERIFIED body text --
     i.e. the return value of run_context.read_stamped_prose() called on
     the real stage3.md for the active run -- not raw file content, and
     never text the caller merely believes is trustworthy.
 
-    Raises ValueError on empty/whitespace-only content. This is the
-    load-bearing check the crew split exists to add: Stage 4 is not
-    merely sequenced after Stage 3, it is impossible to construct without
-    real, verified Stage 3 content in hand first.
+    stage3_test_plan must be the ALREADY-VALIDATED structured plan dict
+    -- i.e. the return value of run_context.read_stamped_json() called on
+    stage3_test_plan.json for the active run, after it has passed both
+    validate_stage3_test_plan() (referential/structural) and
+    check_stage3_artifact_consistency() (prose/JSON agreement). This is
+    the load-bearing check the structured-Stage-3 commit exists to add:
+    Stage 4 cannot be constructed from a plan that hasn't cleared the
+    hard gate, any more than it could be constructed from unverified
+    prose.
+
+    Raises ValueError on empty/whitespace-only content, or an empty/falsy
+    stage3_test_plan.
     """
     if not stage3_content or not stage3_content.strip():
         raise ValueError(
@@ -485,19 +517,35 @@ def build_stage4_task(out_dir: str, stage3_content: str) -> Task:
             "Stage 3 must be stamped and read via read_stamped_prose() "
             "before Stage 4 can be constructed."
         )
+    if not stage3_test_plan:
+        raise ValueError(
+            "build_stage4_task requires the verified structured Stage 3 test plan. "
+            "stage3_test_plan.json must be validated before Stage 4 can be constructed."
+        )
+
+    structured_json = json.dumps(stage3_test_plan, indent=2, sort_keys=True)
 
     return Task(
         description=(
-            "The following Stage 3 artifact was produced for the active "
-            "assessment run and verified through Vanguard's run-identity "
-            "and corpus-identity checks before being provided here — it is "
-            "not live CrewAI task context, but it is the complete, "
-            "unmodified Stage 3 output for this run.\n\n"
-            "=== VERIFIED STAGE 3 ARTIFACT ===\n"
+            "The following Stage 3 artifacts were produced for the active "
+            "assessment run and verified through Vanguard's run-identity, "
+            "corpus-identity, and structural checks before being provided "
+            "here — neither is live CrewAI task context, but both are the "
+            "complete, unmodified Stage 3 output for this run.\n\n"
+            "=== VERIFIED STAGE 3 HUMAN-READABLE ARTIFACT ===\n"
             f"{stage3_content}\n"
-            "=== END VERIFIED STAGE 3 ARTIFACT ===\n\n"
+            "=== END VERIFIED STAGE 3 HUMAN-READABLE ARTIFACT ===\n\n"
+            "=== VERIFIED STRUCTURED STAGE 3 TEST PLAN ===\n"
+            f"{structured_json}\n"
+            "=== END VERIFIED STRUCTURED STAGE 3 TEST PLAN ===\n\n"
+            "The structured test plan is authoritative for test IDs, category "
+            "numbers, Stage 2 vector references, KCAG paths, success criteria, "
+            "abort criteria, safety controls, and telemetry requirements. The "
+            "prose artifact supplies explanatory context. Do not invent a test "
+            "concept that is absent from the structured plan. Do not omit a "
+            "structured test concept from the Stage 4 mission plan.\n\n"
             "Draft the Stage 4 MDMP mission plan based on the payloads developed in the "
-            "Stage 3 artifact provided above. "
+            "Stage 3 artifacts provided above. "
             "Provide a phased execution timeline. For each phase, explicitly map the planned actions "
             "to the MITRE technique IDs identified previously. "
             "Define explicit OPSEC measures and Blue Team assessment/detection criteria for each test payload "

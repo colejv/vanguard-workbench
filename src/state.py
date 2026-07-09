@@ -232,3 +232,44 @@ def enforce_stage3_safety_gate(
     set_stage_status(state, "stage3", StageStatus.PASS)
     save_assessment_state(state, run_id, base)
     return state
+
+
+def enforce_stage3_test_plan_validation(
+    state: AssessmentState,
+    run_id: str,
+    *,
+    is_valid: bool,
+    summary: str,
+    base: str = "outputs",
+) -> None:
+    """
+    Single production implementation of the structured Stage 3 test-plan
+    gate's state transition. Runs BEFORE enforce_stage3_safety_gate() in
+    crew.py's real wiring -- an LLM-generated plan that is incomplete or
+    references a nonexistent graph node, edge, or technique ID must never
+    reach the prose safety gate, let alone Stage 4, merely because its
+    prose sounds convincing.
+
+    Deliberately does NOT mark Stage 3 PASS on success -- only FAIL, on
+    failure. The existing prose safety gate (enforce_stage3_safety_gate)
+    remains the single place that owns the transition to PASS; this
+    function's job is narrower: block progress on a structural or
+    cross-artifact failure, without pre-empting that later decision.
+
+    Mirrors enforce_stage3_safety_gate's separation of concerns: this
+    function does NOT call validate_stage3_test_plan() or
+    check_stage3_artifact_consistency() itself and does NOT write the
+    stamped validation report artifact -- the caller (crew.py) computes
+    is_valid from those checks and writes the report BEFORE calling this.
+    """
+    if is_valid:
+        return
+
+    set_stage_status(state, "stage3", StageStatus.FAIL)
+    state.current_stage = "stage3"
+    save_assessment_state(state, run_id, base)
+    raise RuntimeError(
+        f"Stage 3 structured test-plan validation FAILED: {summary} "
+        f"Stage 4 was not constructed. Run audit trail: "
+        f"{run_output_dir(run_id, base)}/assessment_state.json"
+    )

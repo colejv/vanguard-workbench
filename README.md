@@ -782,6 +782,8 @@ outputs/vaf_20260709_143022/
 ├── bbn_report.json
 ├── bbn_sensitivity.json
 ├── stage3.md
+├── stage3_test_plan.json
+├── stage3_test_plan_validation.json
 ├── stage3_safety_gate.json
 ├── stage4_mission_plan.md
 └── phase0_safety_check.md
@@ -1114,10 +1116,13 @@ Stage 3 reviews the verified attack vectors and Annex B priority path.
 
 It drafts categorized test concepts for human review. For any test concept carrying Category 2 (Degradation & Destruction) or Category 3 (Physical Behavior Alteration), Stage 3 is required to include a complete `PRE-STAGE-4 SAFETY REVIEW` section: affected assets, required approving roles, safety authority, abort authority, abort criteria, maximum termination time, rollback procedure, and an explicit release condition. When no Category 2/3 concepts exist, Stage 3 must instead state so explicitly — silence is never treated as compliant.
 
+Alongside the prose, Stage 3 also writes a structured, machine-checkable test plan via `write_stage3_test_plan` — the same test concepts (test ID, objective, category numbers, Stage 2 vector references, KCAG path, execution technique references, success/abort criteria, safety controls where applicable) in a closed Pydantic schema (`src/stage3_schema.py`), rather than only free-form prose.
+
 Output:
 
 ```text
 stage3.md
+stage3_test_plan.json
 ```
 
 Stage 3 requires human input.
@@ -1130,9 +1135,25 @@ The human reviewer remains responsible for determining whether each concept is:
 * Within scope
 * Appropriate for the actual system architecture
 
+### Structured test-plan validation
+
+Before the existing pre-Stage-4 safety gate runs, Vanguard deterministically validates the structured test plan against the real, already-verified Stage 2 graph, KCAG report, and technique index (`src/stage3_validation.py`) — not just whether the plan is well-formed, but whether it's *true*: every Stage 2 vector reference actually exists; every KCAG path starts at `ADV_START`, ends at a goal node, and only uses edges that are actually in the graph; a path declared as the Annex B priority path actually matches it; every execution technique reference is either a real ID from the technique index or the exact `[UNMAPPED]` marker with a stated rationale; every Category 2/3 concept carries complete safety controls, and every concept without Category 2/3 carries none; and the assessment-wide safety review's `covered_test_ids` exactly matches the concepts that actually carry Category 2/3 — no more, no fewer.
+
+A separate check (`check_stage3_artifact_consistency`) confirms the structured plan and the human-reviewed prose describe the *same* test concepts: every test ID in one has a matching heading or entry in the other, declared category numbers agree, and the prose never contains the "no Category 2/3" sentence when the structured plan declares Category 2/3 concepts.
+
+This is intentionally a hard gate, not advisory: an LLM-generated plan that references a nonexistent graph node, edge, or technique ID never reaches Stage 4 merely because its prose reads convincingly. `write_stage3_test_plan` (the writer tool) only performs shallow, writer-time checks — schema shape, size limits, placeholder values — deliberately deferring every referential and cross-artifact check to this later, deterministic pass, once every input artifact is final.
+
+Output:
+
+```text
+stage3_test_plan_validation.json
+```
+
+A failing result halts the run before the existing pre-Stage-4 safety gate below ever runs, and before Stage 4 is constructed.
+
 ### Pre-Stage-4 safety gate
 
-Before Stage 4 is even constructed, Vanguard deterministically checks the stamped, verified Stage 3 artifact for the safety-review requirement above.
+After the structured test-plan validation above passes, Vanguard deterministically checks the stamped, verified Stage 3 prose artifact for the safety-review requirement described above. This remains an independent check over the human-readable prose — intentionally duplicating part of what the structured validation already checked — and it remains the single place Stage 3 is promoted to `PASS`.
 
 Output:
 
@@ -1415,7 +1436,7 @@ Current limitations include:
 * The BBN contains analyst-judgment template priors that require case-specific review.
 * BBN sensitivity analysis is deterministic one-way perturbation only (no Monte Carlo, no joint/correlated scenarios, no CPD-matrix or probability-vector-prior perturbation yet).
 * Stage 3 remains a free-form Markdown artifact.
-* There is no deterministic Stage 3 test-plan validator for general structure (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria as a whole) — only the pre-Stage-4 safety-review fields are deterministically checked.
+* The structured Stage 3 test-plan validator checks referential integrity against the real Stage 2 graph, KCAG report, and technique index, plus internal quality rules (no identical success/abort criteria, no duplicate list entries) — it does not evaluate whether a test concept is itself well-designed, ethically sound, or operationally realistic. That remains the human reviewer's responsibility.
 * The final defense-in-depth safety check still runs after the Stage 4 human-input prompt, so it cannot intercept that specific approval (the pre-Stage-4 gate is what actually runs before it, and does intercept).
 * The attribution-boundary check is advisory rather than blocking.
 * The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
@@ -1728,8 +1749,7 @@ Vanguard Workbench is an advanced research prototype.
 The current development priorities are:
 
 * Make the Quantitative KCAG review's disposition enforceable (a human-approved blocking path when it recommends Stage 2 regeneration, rather than advisory-only)
-* Convert Stage 3 into structured test-plan drafting
-* Add a general-purpose Stage 3 test-plan structure validator (Test ID, Objective, Stage 2 vector, KCAG path, success/abort criteria) — separate from the pre-Stage-4 safety-review gate, which only checks Category 2/3 safety fields
+* Convert Stage 3 into structured test-plan drafting (structured JSON schema, deterministic referential validation, and prose/JSON consistency checking are already implemented — `src/stage3_schema.py`, `src/stage3_validation.py`)
 * Update Purple Team tools to consume run-scoped artifacts directly
 
 The project's intended direction is:

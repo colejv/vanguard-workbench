@@ -1,5 +1,5 @@
 from crewai import Crew, Process, Task
-import sys, os
+import sys, os, json
 from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
 from src.tasks import (build_tasks, build_stage4_task, build_kcag_review_task,
@@ -9,10 +9,12 @@ from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
                        check_attribution_boundary, check_phase0_safety_gate,
                        check_stage3_safety_gate, verify_stage2_vectors,
                        validate_kcag)
+from src.stage3_validation import validate_stage3_test_plan, check_stage3_artifact_consistency
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status,
-                        finalize_stage4_state, enforce_stage3_safety_gate)
+                        finalize_stage4_state, enforce_stage3_safety_gate,
+                        enforce_stage3_test_plan_validation)
 from src import run_context
 from src.heartbeat import heartbeat
 
@@ -565,31 +567,77 @@ if __name__ == "__main__":
     annexB_prose_path = run_context.artifact_path("annexB_kcag.md")
     annexC_prose_path = run_context.artifact_path("annexC_bbn.md")
     stage3_prose_path = run_context.artifact_path("stage3.md")
+    stage3_plan_path = run_context.artifact_path("stage3_test_plan.json")
 
-    if not os.path.exists(stage3_prose_path):
-        state.current_stage = "stage3"
-        set_stage_status(state, "stage3", StageStatus.FAIL)
-        save_assessment_state(state, run_id)
-        raise RuntimeError(
-            f"Stage 3 did not produce {stage3_prose_path} — Stage 4 cannot "
-            f"be constructed. Run audit trail: {out_dir}/assessment_state.json"
-        )
+    for required_path in (stage3_prose_path, stage3_plan_path):
+        if not os.path.exists(required_path):
+            state.current_stage = "stage3"
+            set_stage_status(state, "stage3", StageStatus.FAIL)
+            save_assessment_state(state, run_id)
+            raise RuntimeError(
+                f"Stage 3 did not produce {required_path} — Stage 4 cannot "
+                f"be constructed. Run audit trail: {out_dir}/assessment_state.json"
+            )
 
     for p in (annexB_prose_path, annexC_prose_path, stage3_prose_path):
         run_context.stamp_prose_file(p)
 
     stage3_text = run_context.read_stamped_prose(stage3_prose_path)
+    stage3_plan = run_context.read_stamped_json(stage3_plan_path)
+    stage2_vectors_for_stage3 = run_context.read_stamped_json(stage2_vectors_path)
+    kcag_report_for_stage3 = run_context.read_stamped_json(run_context.artifact_path("kcag_report.json"))
+    technique_index_for_stage3 = json.load(open("corpus-index/technique_index.json"))
 
     state.current_stage = "stage3"
     commit_stage_output(state, "stage3", stage3_prose_path, status=StageStatus.PENDING)
     save_assessment_state(state, run_id)
+
+    # ---- STRUCTURED TEST-PLAN VALIDATION (deterministic, HARD BLOCK) ----
+    # Runs BEFORE the existing prose safety gate. An LLM-generated plan
+    # that is incomplete or references a nonexistent graph node, edge, or
+    # technique ID must never reach Stage 4 merely because its prose
+    # sounds convincing -- this is the actual referential check;
+    # write_stage3_test_plan() (the writer tool) only performed shallow,
+    # writer-time checks (schema shape, size, placeholders).
+    plan_validation = validate_stage3_test_plan(
+        plan=stage3_plan, stage2_vectors=stage2_vectors_for_stage3,
+        kcag_report=kcag_report_for_stage3, technique_index=technique_index_for_stage3,
+    )
+    consistency = check_stage3_artifact_consistency(stage3_text=stage3_text, test_plan=stage3_plan)
+    stage3_validation_report = {
+        "is_valid": plan_validation["is_valid"] and consistency["is_consistent"],
+        "plan_validation": plan_validation,
+        "artifact_consistency": consistency,
+    }
+    stage3_validation_path = run_context.artifact_path("stage3_test_plan_validation.json")
+    run_context.write_stamped_json(stage3_validation_path, stage3_validation_report)
+    print(f"Stage 3 structured test-plan validation: "
+          f"{'PASS' if stage3_validation_report['is_valid'] else 'FAIL'} — "
+          f"{plan_validation['summary']} {consistency['summary']}")
+
+    # enforce_stage3_test_plan_validation raises RuntimeError (after
+    # persisting FAIL state) on an invalid result -- nothing below this
+    # call is reachable on the failure path. It does NOT mark Stage 3
+    # PASS on success: the existing prose safety gate below remains the
+    # single place that transition happens, same separation of concerns
+    # as enforce_stage3_safety_gate/finalize_stage4_state elsewhere in
+    # this pipeline.
+    enforce_stage3_test_plan_validation(
+        state, run_id,
+        is_valid=stage3_validation_report["is_valid"],
+        summary=f"{plan_validation['summary']} {consistency['summary']}",
+    )
 
     # ---- PRE-STAGE-4 SAFETY GATE (deterministic, HARD BLOCK) ----
     # This is the actual fix for the gap the crew split was built to close:
     # unlike check_phase0_safety_gate below (defense in depth, runs after
     # Stage 4's own human_input approval), this gate runs BEFORE Stage 4 is
     # even constructed. A non-compliant Stage 3 output now never reaches a
-    # human approval prompt for Stage 4 at all.
+    # human approval prompt for Stage 4 at all. Independent of, and defense
+    # in depth alongside, the structured validation above -- one validates
+    # the STRUCTURED artifact, this one remains an independent check over
+    # the human-readable prose, and is the check that actually promotes
+    # Stage 3 to PASS.
     stage3_safety = check_stage3_safety_gate(stage3_text)
     stage3_gate_path = run_context.artifact_path("stage3_safety_gate.json")
     run_context.write_stamped_json(stage3_gate_path, stage3_safety)
@@ -606,9 +654,9 @@ if __name__ == "__main__":
     )
 
     # ---- BUILD AND RUN STAGE 4 (separate crew, no live context=[t_stage3];
-    # stage3_text above is verified, stamped, run-and-corpus-bound content —
-    # see build_stage4_task()'s docstring in tasks.py) ----
-    t_stage4 = build_stage4_task(out_dir, stage3_content=stage3_text)
+    # stage3_text/stage3_plan above are verified, stamped, run-and-corpus-
+    # bound content — see build_stage4_task()'s docstring in tasks.py) ----
+    t_stage4 = build_stage4_task(out_dir, stage3_content=stage3_text, stage3_test_plan=stage3_plan)
 
     stage4_crew = Crew(
         agents=[red_team_lead],

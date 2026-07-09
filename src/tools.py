@@ -2086,3 +2086,118 @@ def write_stage1_output(stage1_json: str) -> str:
             f"Cognitive-layer candidate touchpoint: {cog_note}. "
             f"(Note: the graph-theoretic COG is computed by Annex B, not fixed here.) "
             f"Stage 2 may now build on this node inventory.")
+
+
+# ============================================================================
+#  write_stage3_test_plan: structured, machine-readable Stage 3 test plan
+#  (stage3_test_plan.json), alongside the existing free-form stage3.md.
+#
+#  Writer-time checks here are deliberately SHALLOW (schema shape, size
+#  ceiling, placeholder values) -- the deep, referential validation against
+#  the real Stage 2 graph, KCAG report, and technique index happens later,
+#  in src/stage3_validation.py, run once by crew.py after analysis_crew
+#  completes and every input artifact is final. The agent may call this
+#  tool mid-task, while other context is still being generated; deferring
+#  the deep checks avoids validating against a still-in-flight picture.
+# ============================================================================
+from src.stage3_schema import Stage3TestPlan
+
+MAX_STAGE3_TEST_CONCEPTS = 20
+MAX_STAGE3_LIST_ITEMS_PER_FIELD = 20
+MAX_STAGE3_TEXT_FIELD_LENGTH = 2_000
+
+_STAGE3_REQUIRED_STRING_FIELDS = ("title", "objective", "mechanism_summary")
+_STAGE3_REQUIRED_LIST_FIELDS = (
+    "stage2_vector_ids", "kcag_path", "target_node_ids", "preconditions",
+    "expected_effects", "success_criteria", "abort_criteria",
+    "rollback_or_recovery_steps", "telemetry_requirements", "assumptions",
+)
+
+
+def _stage3_find_placeholder(concept):
+    for field in _STAGE3_REQUIRED_STRING_FIELDS:
+        value = getattr(concept, field)
+        if value.strip().lower() in STAGE3_INVALID_VALUES:
+            return f"test_concepts[{concept.test_id}].{field} is a placeholder value ('{value}')."
+    for field in _STAGE3_REQUIRED_LIST_FIELDS:
+        for item in getattr(concept, field):
+            if item.strip().lower() in STAGE3_INVALID_VALUES:
+                return f"test_concepts[{concept.test_id}].{field} contains a placeholder value ('{item}')."
+    return None
+
+
+def _stage3_oversized_field(concept):
+    for field in _STAGE3_REQUIRED_LIST_FIELDS:
+        values = getattr(concept, field)
+        if len(values) > MAX_STAGE3_LIST_ITEMS_PER_FIELD:
+            return (f"test_concepts[{concept.test_id}].{field} has {len(values)} items, "
+                   f"exceeding the {MAX_STAGE3_LIST_ITEMS_PER_FIELD}-item ceiling.")
+    for field in _STAGE3_REQUIRED_STRING_FIELDS:
+        value = getattr(concept, field)
+        if len(value) > MAX_STAGE3_TEXT_FIELD_LENGTH:
+            return (f"test_concepts[{concept.test_id}].{field} is {len(value)} characters, "
+                   f"exceeding the {MAX_STAGE3_TEXT_FIELD_LENGTH}-character ceiling.")
+    return None
+
+
+@tool("write_stage3_test_plan")
+def write_stage3_test_plan(test_plan_json: str) -> str:
+    """Validate and write the structured Stage 3 test plan to
+    stage3_test_plan.json, alongside the existing stage3.md prose. Call
+    this exactly once, after drafting the human-readable Stage 3
+    assessment, with a JSON object matching the Stage3TestPlan schema
+    (src/stage3_schema.py): schema_version, plan_title, test_concepts
+    (each with test_id in RT-NNN format, objective, stage2_vector_ids,
+    kcag_path, path_relationship, target_node_ids, categories,
+    execution_techniques, defensive_concepts, mechanism_summary,
+    preconditions, expected_effects, success_criteria, abort_criteria,
+    rollback_or_recovery_steps, telemetry_requirements, assumptions, and
+    safety_controls — required for Category 2/3, null otherwise), and
+    assessment_safety_review.
+
+    This performs only shallow, writer-time checks (schema shape, size
+    ceiling, placeholder values, duplicate test IDs). It does NOT verify
+    that stage2_vector_ids, kcag_path, target_node_ids, or
+    execution_techniques reference real graph elements or framework IDs
+    — that deeper, referential validation runs once, later, against the
+    final artifacts, and is a hard gate before Stage 4 can be
+    constructed. Do not invent Stage 2 vector IDs, graph nodes, graph
+    paths, framework IDs, assets, approving roles, or safety
+    authorities — an invented-looking reference will fail that later
+    gate even though this tool accepts it now.
+    """
+    from pydantic import ValidationError
+
+    try:
+        plan = Stage3TestPlan.model_validate_json(test_plan_json)
+    except (ValidationError, ValueError) as exc:
+        return f"REJECTED: Stage 3 test plan failed schema validation.\n{exc}"
+
+    if not plan.test_concepts:
+        return "REJECTED: test_concepts must contain at least one test concept."
+
+    if len(plan.test_concepts) > MAX_STAGE3_TEST_CONCEPTS:
+        return (f"REJECTED: too many test concepts ({len(plan.test_concepts)}). "
+               f"Maximum is {MAX_STAGE3_TEST_CONCEPTS}. Curate to the most analytically "
+               f"significant concepts rather than transcribing every scratchpad entry.")
+
+    test_ids = [c.test_id for c in plan.test_concepts]
+    if len(test_ids) != len(set(test_ids)):
+        dupes = sorted({t for t in test_ids if test_ids.count(t) > 1})
+        return f"REJECTED: duplicate test_id(s): {dupes}. Every test concept requires a unique test_id."
+
+    for concept in plan.test_concepts:
+        placeholder = _stage3_find_placeholder(concept)
+        if placeholder:
+            return f"REJECTED: {placeholder} Nothing written."
+        oversized = _stage3_oversized_field(concept)
+        if oversized:
+            return f"REJECTED: {oversized} Nothing written."
+
+    payload = plan.model_dump(mode="json")
+    output_path = run_context.artifact_path("stage3_test_plan.json")
+    run_context.write_stamped_json(output_path, payload)
+
+    return (f"WRITTEN: {output_path} | {len(plan.test_concepts)} test concept(s). "
+           f"Deeper referential validation (Stage 2 vectors, KCAG path, technique index) "
+           f"runs after this crew completes, not here.")

@@ -769,6 +769,7 @@ outputs/vaf_20260709_143022/
 ├── stage2.md
 ├── stage2_vectors.json
 ├── stage2_verification.md
+├── kcag_validation.json
 ├── annexB_kcag.md
 ├── kcag_report.json
 ├── annexC_bbn.md
@@ -927,7 +928,7 @@ stage2_verification.md
 
 The structured Stage 2 artifact contains graph nodes and edges used by Annex B.
 
-### Stage 2 verification gate
+### Stage 2 verification gate (framework identifiers)
 
 A deterministic verifier checks generated technique identifiers against:
 
@@ -938,6 +939,7 @@ corpus-index/technique_index.json
 When verification fails:
 
 * Stage 2 is marked as failed.
+* The KCAG structural gate below does not run.
 * Annex B does not run.
 * Downstream stages are blocked.
 
@@ -946,6 +948,24 @@ Review:
 ```text
 stage2_verification.md
 ```
+
+### Stage 2 structural gate (KCAG topology)
+
+A second, independent deterministic check (`validate_kcag`) verifies the graph itself, separately from framework-ID correctness: `ADV_START` is present, has `node_type='privilege'`, has no incoming edges, and is the sole zero-indegree node; at least one goal node exists and every goal is terminal (no outgoing edges); every node is reachable from `ADV_START`; no duplicate directed edge pairs exist (which `networkx.DiGraph` would otherwise silently collapse); and every node/edge field uses a valid enum value. Directed cycles, non-goal dead ends, and isolated countermeasures are recorded as warnings, not failures.
+
+Neither gate mutates `stage2_vectors.json` — Annex B always reads the same original stamped artifact regardless of which gates ran. Stage 2 is only promoted to `PASS` after **both** gates succeed.
+
+Output:
+
+```text
+kcag_validation.json
+```
+
+When structural validation fails:
+
+* Stage 2 is marked as failed, even if the framework-ID gate above passed.
+* Annex B does not run.
+* Downstream stages are blocked.
 
 ### Annex B — Kill Chain Attack Graph
 
@@ -1319,8 +1339,7 @@ Vanguard is an active research prototype.
 
 Current limitations include:
 
-* There is no dedicated semantic KCAG-review task between Stage 2 and Annex B.
-* Annex B currently selects the first zero-indegree graph source rather than strictly requiring `ADV_START`.
+* There is a deterministic KCAG structural gate (`validate_kcag`), but no LLM-driven semantic review of the graph — the Quantitative Threat Modeler executes and interprets the graph, it does not evaluate whether the topology is analytically sound.
 * KCAG traversal values are still labeled as probabilities internally.
 * The BBN contains analyst-judgment template priors that require case-specific review.
 * BBN sensitivity analysis is not yet implemented.
@@ -1483,11 +1502,14 @@ Confirm that this file exists and is valid:
 outputs/<run_id>/stage2_vectors.json
 ```
 
-Review:
+Review both gates — either can independently block Annex B:
 
 ```text
 outputs/<run_id>/stage2_verification.md
+outputs/<run_id>/kcag_validation.json
 ```
+
+`stage2_verification.md` covers framework-ID correctness. `kcag_validation.json` covers graph topology (`ADV_START` as sole root, goal reachability, no duplicate edges, valid enums) — check its `errors` list for the specific structural problem.
 
 Annex B should not be bypassed by manually inventing a replacement graph.
 
@@ -1634,7 +1656,7 @@ Vanguard Workbench is an advanced research prototype.
 
 The current development priorities are:
 
-* Add deterministic KCAG semantic validation for the Quantitative Threat Modeler to consume (role upgrade and analytical-discipline prompts already in place; the validator itself is not yet built)
+* Add LLM-driven semantic KCAG review for the Quantitative Threat Modeler (deterministic structural validation via `validate_kcag` already exists; this would add analytical judgment on top of it — e.g. "is this topology analytically sound," not just "is it well-formed")
 * Rename heuristic KCAG probabilities
 * Add BBN validation and sensitivity analysis
 * Convert Stage 3 into structured test-plan drafting

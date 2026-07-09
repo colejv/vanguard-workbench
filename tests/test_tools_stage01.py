@@ -341,3 +341,4 @@ def test_write_stage1_output_requires_active_run():
     run_context.reset_active_run()
     with pytest.raises(RuntimeError, match="No active run set"):
         write_stage1_output._run(stage1_json=json.dumps(_valid_stage1_payload()))
+        

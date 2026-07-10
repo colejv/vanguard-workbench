@@ -38,6 +38,7 @@ light_llm = LLM(
     max_retries=LOCAL_LLM_MAX_RETRIES,
 )
 
+'''
 # 27B Qwen3.6 (dense) for reasoning, coding/agentic, and tool execution.
 # Replaces gemma4:12b-mlx here specifically because this is the model used
 # by every tool-calling agent (decomposer, mapper, modeler, red_team_lead,
@@ -59,6 +60,23 @@ reason_llm = LLM(
     temperature=0.1,
     top_p=0.95,
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    timeout=LOCAL_LLM_TIMEOUT_SECONDS,
+    max_retries=LOCAL_LLM_MAX_RETRIES,
+)
+'''
+
+# MLX-optimized Gemma 4 model for reasoning, structured output,
+# and CrewAI tool execution.
+#
+# Use Ollama's native endpoint rather than the OpenAI-compatible /v1
+# endpoint. Previous Gemma tool-call failures were observed in the
+# /v1 translation layer, where otherwise-valid tool calls could leak
+# into normal assistant content instead of being surfaced as tool calls.
+reason_llm = LLM(
+    model="ollama/gemma4:12b-mlx",
+    base_url=OLLAMA_NATIVE,
+    temperature=0.1,
+    top_p=0.95,
     timeout=LOCAL_LLM_TIMEOUT_SECONDS,
     max_retries=LOCAL_LLM_MAX_RETRIES,
 )

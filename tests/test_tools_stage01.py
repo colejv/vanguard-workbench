@@ -10,6 +10,16 @@ they resolve through run_context.artifact_path() and fail closed with
 RuntimeError if no active run has been set, same as every other run-scoped
 tool. tmp_path + monkeypatch still keep everything off the real outputs/
 directory.
+
+Both tools now take REAL STRUCTURED arguments (e.g. signatures=[...] as
+an actual list) rather than a single JSON-string parameter
+(stage0_json="..."). This removes the double-serialization layer that
+caused a real failure: a local model could successfully invoke the tool
+but still produce a malformed nested JSON string, since the outer
+tool-call JSON and the inner document JSON had to both be generated
+correctly. With structured arguments, CrewAI's own tool-call argument
+parsing handles the JSON -- there is no second document to construct or
+escape, and the function receives real Python lists/dicts directly.
 """
 
 import json
@@ -52,12 +62,12 @@ def _artifact(filename: str) -> Path:
 # ---------- write_stage0_output: valid paths ----------
 
 def test_write_stage0_output_valid_writes_file():
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": "S-T-01", "category": "technical",
          "description": "Legacy TLS 1.1 endpoint on C2 relay",
          "confidence": "HIGH", "deceive_candidate": False},
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     stage0_path = _artifact("stage0_output.json")
 
     assert result.startswith(f"WRITTEN: {stage0_path}")
@@ -71,18 +81,18 @@ def test_write_stage0_output_valid_writes_file():
 
 
 def test_write_stage0_output_reports_gap_count():
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": "S-T-01", "category": "technical", "description": "a",
          "confidence": "HIGH", "deceive_candidate": False, "is_gap": False},
         {"signature_id": "S-P-01", "category": "procedural", "description": "[GAP] b",
          "confidence": "LOW", "deceive_candidate": False, "is_gap": True},
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     assert "1 flagged [GAP]" in result
 
 
 def test_write_stage0_output_empty_signatures_still_writes():
-    result = write_stage0_output._run(stage0_json=json.dumps({"signatures": []}))
+    result = write_stage0_output._run(signatures=[])
     assert result.startswith("WRITTEN:")
     assert "0 signature(s)" in result
 
@@ -91,12 +101,12 @@ def test_write_stage0_output_rejects_more_than_max_signatures():
     """Defense-in-depth against oversized single-tool-call JSON — this is
     NOT the primary fix for truncated generation (that's task-prompt
     curation), it's a backstop against an agent ignoring that guidance."""
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": f"S-T-{i:02d}", "category": "technical", "description": f"item {i}",
          "confidence": "LOW", "deceive_candidate": False}
         for i in range(26)  # one over the 25-signature ceiling
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     assert result.startswith("REJECTED:")
     assert "exceeds the 25 ceiling" in result
     assert not _artifact("stage0_output.json").exists()
@@ -104,50 +114,53 @@ def test_write_stage0_output_rejects_more_than_max_signatures():
 
 def test_write_stage0_output_accepts_exactly_max_signatures():
     """Boundary check: exactly at the ceiling should still succeed."""
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": f"S-T-{i:02d}", "category": "technical", "description": f"item {i}",
          "confidence": "LOW", "deceive_candidate": False}
         for i in range(25)
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     assert result.startswith("WRITTEN:")
 
 
 # ---------- write_stage0_output: rejection paths ----------
 
-def test_write_stage0_output_rejects_invalid_json():
-    result = write_stage0_output._run(stage0_json="{not json")
+def test_write_stage0_output_rejects_non_list_signatures():
+    """The old 'malformed JSON string' rejection test no longer applies —
+    there is no inner JSON document to parse anymore. The equivalent
+    structural-shape check now is: 'signatures' must actually be a list."""
+    result = write_stage0_output._run(signatures="not a list")
     assert result.startswith("REJECTED:")
     assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_rejects_bad_category():
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": "S-X-01", "category": "financial", "description": "x",
          "confidence": "HIGH", "deceive_candidate": False},
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     assert result.startswith("REJECTED:")
     assert not _artifact("stage0_output.json").exists()
 
 
 def test_write_stage0_output_rejects_bad_confidence():
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": "S-X-01", "category": "technical", "description": "x",
          "confidence": "SORT_OF", "deceive_candidate": False},
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     assert result.startswith("REJECTED:")
 
 
 def test_write_stage0_output_rejects_duplicate_signature_id():
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": "S-T-01", "category": "technical", "description": "a",
          "confidence": "HIGH", "deceive_candidate": False},
         {"signature_id": "S-T-01", "category": "procedural", "description": "b",
          "confidence": "LOW", "deceive_candidate": False},
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     assert result.startswith("REJECTED:")
     assert "duplicate signature_id" in result
     assert not _artifact("stage0_output.json").exists()
@@ -155,11 +168,11 @@ def test_write_stage0_output_rejects_duplicate_signature_id():
 
 def test_write_stage0_output_rejects_missing_required_field():
     """category present but description missing entirely."""
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": "S-T-01", "category": "technical",
          "confidence": "HIGH", "deceive_candidate": False},
-    ]}
-    result = write_stage0_output._run(stage0_json=json.dumps(payload))
+    ]
+    result = write_stage0_output._run(signatures=signatures)
     assert result.startswith("REJECTED:")
 
 
@@ -168,12 +181,12 @@ def test_write_stage0_output_requires_active_run():
     reintroducing a fallback to a shared, unscoped outputs/ directory --
     the tool must refuse outright with no active run set."""
     run_context.reset_active_run()
-    payload = {"signatures": [
+    signatures = [
         {"signature_id": "S-T-01", "category": "technical", "description": "x",
          "confidence": "HIGH", "deceive_candidate": False},
-    ]}
+    ]
     with pytest.raises(RuntimeError, match="No active run set"):
-        write_stage0_output._run(stage0_json=json.dumps(payload))
+        write_stage0_output._run(signatures=signatures)
 
 
 # ---------- write_stage1_output: valid paths ----------
@@ -195,7 +208,7 @@ def _valid_stage1_payload(cog=True):
 
 
 def test_write_stage1_output_valid_writes_file():
-    result = write_stage1_output._run(stage1_json=json.dumps(_valid_stage1_payload()))
+    result = write_stage1_output._run(**_valid_stage1_payload())
     stage1_path = _artifact("stage1_output.json")
 
     assert result.startswith(f"WRITTEN: {stage1_path}")
@@ -214,7 +227,7 @@ def test_write_stage1_output_no_cognitive_nodes_is_valid_with_no_cog():
     unflagged (see the doctrinal tests below)."""
     payload = _valid_stage1_payload()
     payload["cognitive_nodes"] = []
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("WRITTEN:")
     assert "none flagged" in result
 
@@ -234,7 +247,7 @@ def test_write_stage1_output_rejects_more_than_max_total_nodes():
         "cognitive_nodes": [],
         "trust_boundaries": [],
     }
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("REJECTED:")
     assert "exceeds the 40 ceiling" in result
     assert not _artifact("stage1_output.json").exists()
@@ -256,14 +269,20 @@ def test_write_stage1_output_accepts_exactly_max_total_nodes():
         "cognitive_nodes": [],
         "trust_boundaries": [],
     }
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("WRITTEN:")
 
 
 # ---------- write_stage1_output: rejection paths ----------
 
-def test_write_stage1_output_rejects_invalid_json():
-    result = write_stage1_output._run(stage1_json="{not json")
+def test_write_stage1_output_rejects_non_list_technical_nodes():
+    """The old 'malformed JSON string' rejection test no longer applies —
+    there is no inner JSON document to parse anymore. The equivalent
+    structural-shape check now is: each of the four arguments must
+    actually be a list."""
+    payload = _valid_stage1_payload()
+    payload["technical_nodes"] = "not a list"
+    result = write_stage1_output._run(**payload)
     assert result.startswith("REJECTED:")
 
 
@@ -274,7 +293,7 @@ def test_write_stage1_output_zero_cognitive_touchpoints_flagged_still_writes():
     CDL_WRITE: min-cut=1, ~5.5x betweenness) rather than anything in the
     cognitive layer. Zero flagged cognitive touchpoints must NOT be rejected."""
     payload = _valid_stage1_payload(cog=False)
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("WRITTEN:")
     assert "none flagged" in result
 
@@ -288,7 +307,7 @@ def test_write_stage1_output_multiple_cognitive_touchpoints_flagged_still_writes
         "feeds": "x", "corrupts": "x", "downstream_effect": "x",
         "detection_probability": "MEDIUM", "is_center_of_gravity": True,
     })
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("WRITTEN:")
     assert "multiple flagged" in result
     assert "C-C-01" in result and "C-C-02" in result
@@ -297,7 +316,7 @@ def test_write_stage1_output_multiple_cognitive_touchpoints_flagged_still_writes
 def test_write_stage1_output_rejects_technical_node_with_wrong_layer():
     payload = _valid_stage1_payload()
     payload["technical_nodes"][0]["layer"] = "procedural"
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("REJECTED:")
     assert "wrong layer list" in result
     assert not _artifact("stage1_output.json").exists()
@@ -306,7 +325,7 @@ def test_write_stage1_output_rejects_technical_node_with_wrong_layer():
 def test_write_stage1_output_rejects_procedural_node_with_wrong_layer():
     payload = _valid_stage1_payload()
     payload["procedural_nodes"][0]["layer"] = "technical"
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("REJECTED:")
     assert "wrong layer list" in result
 
@@ -314,7 +333,7 @@ def test_write_stage1_output_rejects_procedural_node_with_wrong_layer():
 def test_write_stage1_output_rejects_duplicate_component_id_across_layers():
     payload = _valid_stage1_payload()
     payload["procedural_nodes"][0]["component_id"] = "C-T-01"  # collides with technical
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("REJECTED:")
     assert "duplicate component_id" in result
     assert not _artifact("stage1_output.json").exists()
@@ -323,15 +342,23 @@ def test_write_stage1_output_rejects_duplicate_component_id_across_layers():
 def test_write_stage1_output_rejects_bad_hierarchy_stage():
     payload = _valid_stage1_payload()
     payload["cognitive_nodes"][0]["hierarchy_stage"] = "Vibes"
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
+    result = write_stage1_output._run(**payload)
     assert result.startswith("REJECTED:")
 
 
-def test_write_stage1_output_rejects_missing_trust_boundaries_key():
+def test_write_stage1_output_missing_trust_boundaries_argument_raises():
+    """Under the old single-JSON-string contract, an omitted key was a
+    'REJECTED:' string return from this function's own validation. Under
+    the new structured-argument contract, trust_boundaries is a required
+    parameter of the tool itself -- omitting it is now a hard TypeError
+    raised by Python's own call mechanics, before this function's body
+    ever runs. Same underlying intent (a malformed/incomplete call must
+    never silently succeed), different, earlier failure point."""
     payload = _valid_stage1_payload()
     del payload["trust_boundaries"]
-    result = write_stage1_output._run(stage1_json=json.dumps(payload))
-    assert result.startswith("REJECTED:")
+    with pytest.raises(TypeError):
+        write_stage1_output._run(**payload)
+    assert not _artifact("stage1_output.json").exists()
 
 
 def test_write_stage1_output_requires_active_run():
@@ -340,5 +367,4 @@ def test_write_stage1_output_requires_active_run():
     to write_stage1_output and there's no reason to leave it uncovered."""
     run_context.reset_active_run()
     with pytest.raises(RuntimeError, match="No active run set"):
-        write_stage1_output._run(stage1_json=json.dumps(_valid_stage1_payload()))
-        
+        write_stage1_output._run(**_valid_stage1_payload())

@@ -1045,14 +1045,15 @@ KCAG_VECTOR_ID_PATTERN = re.compile(r"^V-\d{2,}$")
 
 
 @tool("write_stage2_vectors")
-def write_stage2_vectors(vectors_json: str) -> str:
+def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> str:
     """Validate and write the Stage 2 structured edge list to
     outputs/stage2_vectors.json for Annex B (KCAG) consumption.
 
-    Input: a JSON object with 'nodes' and 'edges'.
-      nodes[]: {id, node_type, criticality}
+    Arguments (pass these as real structured tool-call arguments, never
+    as a JSON string):
+      nodes: list of {id, node_type, criticality}
         node_type in {privilege, technique, property, countermeasure, goal}
-      edges[]: {source, target, technique, difficulty, effect, vec}
+      edges: list of {source, target, technique, difficulty, effect, vec}
         difficulty in {LOW, MEDIUM, HIGH}
 
     Rejects malformed graphs (no goal, no entry node, dangling edges,
@@ -1065,20 +1066,11 @@ def write_stage2_vectors(vectors_json: str) -> str:
     before Annex B. Left deliberately unchanged/unexpanded here: the two
     checks are meant to stay layered, not merged.
     """
-    import json, os
-
     VALID_TYPES = KCAG_NODE_TYPES
     VALID_DIFF = KCAG_DIFFICULTIES
 
-    try:
-        data = json.loads(vectors_json)
-    except json.JSONDecodeError as e:
-        return f"REJECTED: input is not valid JSON ({e}). Nothing written."
-
-    nodes = data.get("nodes")
-    edges = data.get("edges")
     if not isinstance(nodes, list) or not isinstance(edges, list):
-        return "REJECTED: JSON must contain 'nodes' (list) and 'edges' (list). Nothing written."
+        return "REJECTED: 'nodes' and 'edges' must both be lists. Nothing written."
 
     errors = []
     node_ids = set()
@@ -1911,16 +1903,18 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
 # source of truth for the shape.
 
 @tool("write_stage0_output")
-def write_stage0_output(stage0_json: str) -> str:
+def write_stage0_output(signatures: list[dict[str, Any]]) -> str:
     """Validate and write the Stage 0 Reverse IPB signatures to
     outputs/stage0_output.json for downstream (Stage 1 attribution, gate)
     consumption. The prose narrative still goes to outputs/stage0.md via
     output_file; this is the structured, machine-checkable counterpart.
 
-    Input: a JSON object with 'signatures': a list of
-      {signature_id, category, description, confidence, deceive_candidate, is_gap}
-      category in {technical, procedural, cognitive, social_personnel}
-      confidence in {HIGH, MEDIUM, LOW}
+    Arguments (pass this as a real structured tool-call argument, never
+    as a JSON string):
+      signatures: list of
+        {signature_id, category, description, confidence, deceive_candidate, is_gap}
+        category in {technical, procedural, cognitive, social_personnel}
+        confidence in {HIGH, MEDIUM, LOW}
 
     Rejects malformed input (bad enum values, missing fields, duplicate
     signature_ids) so downstream stages never consume a broken artifact.
@@ -1934,16 +1928,15 @@ def write_stage0_output(stage0_json: str) -> str:
     silently writing an oversized artifact that risks the same truncation
     failure on a future run or a smaller local model.
     """
-    import json, os
     from pydantic import ValidationError
     from src.schemas import Stage0Output
 
     MAX_SIGNATURES = 25  # generous ceiling above the requested top-15 curation target
 
-    try:
-        data = json.loads(stage0_json)
-    except json.JSONDecodeError as e:
-        return f"REJECTED: input is not valid JSON ({e}). Nothing written."
+    if not isinstance(signatures, list):
+        return "REJECTED: 'signatures' must be a list. Nothing written."
+
+    data = {"signatures": signatures}
 
     try:
         parsed = Stage0Output.model_validate(data)
@@ -1970,20 +1963,25 @@ def write_stage0_output(stage0_json: str) -> str:
 
 
 @tool("write_stage1_output")
-def write_stage1_output(stage1_json: str) -> str:
+def write_stage1_output(
+    technical_nodes: list[dict[str, Any]],
+    procedural_nodes: list[dict[str, Any]],
+    cognitive_nodes: list[dict[str, Any]],
+    trust_boundaries: list[dict[str, Any]],
+) -> str:
     """Validate and write the Stage 1 three-layer decomposition to
     outputs/stage1_output.json for Stage 2 (attribution check) consumption.
     The prose narrative still goes to outputs/stage1.md via output_file;
     this is the structured, machine-checkable counterpart.
 
-    Input: a JSON object with 'technical_nodes', 'procedural_nodes',
-      'cognitive_nodes' (lists), and 'trust_boundaries' (list).
-      technical_nodes[] / procedural_nodes[]:
+    Arguments (pass these as real structured tool-call arguments, never
+    as a single JSON string — each is its own list argument):
+      technical_nodes / procedural_nodes: list of
         {component_id, layer, name, asset_control_levels, information_flows,
          downstream_dependencies, is_gap}
         layer must match the list it's in (technical nodes cannot claim
         layer='procedural' or 'cognitive', and vice versa).
-      cognitive_nodes[]:
+      cognitive_nodes: list of
         {component_id, hierarchy_stage, feeds, corrupts, downstream_effect,
          detection_probability, is_center_of_gravity, is_gap}
         hierarchy_stage in {Data, Information, Knowledge, Understanding,
@@ -1996,7 +1994,7 @@ def write_stage1_output(stage1_json: str) -> str:
         COG may land on a Technical or Procedural node instead. This tool
         never rejects based on how many (or how few) cognitive nodes carry
         this flag.
-      trust_boundaries[]: {boundary_id, from_component, to_component, description}
+      trust_boundaries: list of {boundary_id, from_component, to_component, description}
 
     Rejects malformed input, duplicate component_ids across all three
     layers, and a technical/procedural node's layer not matching the list
@@ -2004,14 +2002,20 @@ def write_stage1_output(stage1_json: str) -> str:
     the agent's responsibility per the task's attribution discipline) —
     this tool only enforces structural correctness.
     """
-    import json, os
     from pydantic import ValidationError
     from src.schemas import Stage1Output, DecompositionLayer
 
-    try:
-        data = json.loads(stage1_json)
-    except json.JSONDecodeError as e:
-        return f"REJECTED: input is not valid JSON ({e}). Nothing written."
+    for arg_name, arg_value in (("technical_nodes", technical_nodes), ("procedural_nodes", procedural_nodes),
+                                ("cognitive_nodes", cognitive_nodes), ("trust_boundaries", trust_boundaries)):
+        if not isinstance(arg_value, list):
+            return f"REJECTED: '{arg_name}' must be a list. Nothing written."
+
+    data = {
+        "technical_nodes": technical_nodes,
+        "procedural_nodes": procedural_nodes,
+        "cognitive_nodes": cognitive_nodes,
+        "trust_boundaries": trust_boundaries,
+    }
 
     # Pre-check layer-vs-list placement before full model validation, since
     # this is a cross-field consistency rule the model alone can't express

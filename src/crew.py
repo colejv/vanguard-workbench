@@ -325,65 +325,113 @@ if __name__ == "__main__":
             tools=[extract_to_scratch],
         ))
 
-    # ---- CREW 1: through Stage 2 (produces stage2_vectors.json) ----
-    # Resume-aware: only include tasks for stages that haven't already
-    # completed against THIS run_id. chunk_tasks is already [] when
-    # chunking_done (chunks was set to [] above in that branch), so the
-    # list-comprehension there is naturally a no-op.
-    pre_tasks = []
+    # ---- STAGE 0 CREW: corpus research/chunking + Reverse IPB signatures ----
+    # Split from Stage 1/2 (previously one shared pre_crew.kickoff()) so a
+    # missing stage0_output.json is caught HERE, before Stage 1's crew is
+    # even constructed -- not discovered only after a whole shared crew
+    # finished, by which point Stage 2 may already have run against prose
+    # with no real Stage 0 artifact behind it. Same reasoning as the
+    # Stage 3 -> Stage 4 trust boundary elsewhere in this file.
+    stage0_tasks = []
     if not chunking_done:
-        pre_tasks += [t_research] + chunk_tasks
+        stage0_tasks += [t_research] + chunk_tasks
     if not stage0_done:
-        pre_tasks += [t_synthesize_stage0]
-    if not stage1_done:
-        pre_tasks += [t_stage1]
-    if not stage2_done:
-        pre_tasks += [t_stage2]
+        stage0_tasks += [t_synthesize_stage0]
 
-    if not pre_tasks:
-        print("pre_crew: nothing to run — chunking through Stage 2 all already "
-              "complete for this run. Skipping pre_crew.kickoff() entirely.")
-    else:
-        print(f"pre_crew will run {len(pre_tasks)} task(s): "
-              f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in pre_tasks][:6]}"
-              f"{' ...' if len(pre_tasks) > 6 else ''}")
+    heartbeat_log = run_context.artifact_path("heartbeat.log")
+    print(f"Heartbeat log: {heartbeat_log} (tail -f it in a second terminal)")
 
-        pre_crew = Crew(
-            agents=[researcher, decomposer, mapper],
-            tasks=pre_tasks,
+    if stage0_tasks:
+        print(f"stage0_crew will run {len(stage0_tasks)} task(s): "
+              f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in stage0_tasks][:6]}"
+              f"{' ...' if len(stage0_tasks) > 6 else ''}")
+        stage0_crew = Crew(
+            agents=[researcher, decomposer],
+            tasks=stage0_tasks,
             process=Process.sequential,
             verbose=True,
         )
-        pre_heartbeat_log = run_context.artifact_path("heartbeat.log")
-        print(f"Heartbeat log: {pre_heartbeat_log} (tail -f it in a second terminal)")
-        with heartbeat("pre_crew", log_path=pre_heartbeat_log):
-            pre_crew.kickoff(inputs={
+        with heartbeat("stage0_crew", log_path=heartbeat_log):
+            stage0_crew.kickoff(inputs={
                 "sut_brief": brief_text,
                 "file_count": c_count,
                 "corpus_version": c_version,
             })
+    else:
+        print("stage0_crew: nothing to run — chunking and Stage 0 already complete "
+              "for this run. Skipping stage0_crew.kickoff() entirely.")
 
-    # ---- STAMP PRE-CREW PROSE ARTIFACTS ----
-    # CrewAI writes output_file content directly from each agent's final
-    # answer -- there's no Python write call to route through
-    # write_stamped_json for these, so stamp them here as a deterministic
-    # post-processing step instead of asking the model to do it.
     stage0_prose_path = run_context.artifact_path("stage0.md")
+    if os.path.exists(stage0_prose_path):
+        run_context.stamp_prose_file(stage0_prose_path)
+
+    stage0_json_path = run_context.artifact_path("stage0_output.json")
+    if not os.path.exists(stage0_json_path):
+        set_stage_status(state, "stage0", StageStatus.FAIL)
+        state.current_stage = "stage0"
+        save_assessment_state(state, run_id)
+        raise RuntimeError(
+            f"Stage 0 did not produce {stage0_json_path} — the Reverse IPB agent may not "
+            f"have called write_stage0_output. Stage 1 cannot proceed without it. Run "
+            f"audit trail: {out_dir}/assessment_state.json"
+        )
+    commit_stage_output(state, "stage0", stage0_json_path, status=StageStatus.PENDING)
+    state.current_stage = "stage1"
+    save_assessment_state(state, run_id)
+
+    # ---- STAGE 1 CREW: three-layer decomposition ----
+    stage1_tasks = [] if stage1_done else [t_stage1]
+
+    if stage1_tasks:
+        print(f"stage1_crew will run {len(stage1_tasks)} task(s): "
+              f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in stage1_tasks]}")
+        stage1_crew = Crew(
+            agents=[decomposer],
+            tasks=stage1_tasks,
+            process=Process.sequential,
+            verbose=True,
+        )
+        with heartbeat("stage1_crew", log_path=heartbeat_log):
+            stage1_crew.kickoff(inputs={
+                "sut_brief": brief_text,
+                "file_count": c_count,
+                "corpus_version": c_version,
+            })
+    else:
+        print("stage1_crew: nothing to run — Stage 1 already complete for this run. "
+              "Skipping stage1_crew.kickoff() entirely.")
+
     stage1_prose_path = run_context.artifact_path("stage1.md")
-    stage2_prose_path = run_context.artifact_path("stage2.md")
-    for p in (stage0_prose_path, stage1_prose_path, stage2_prose_path):
-        run_context.stamp_prose_file(p)
+    if os.path.exists(stage1_prose_path):
+        run_context.stamp_prose_file(stage1_prose_path)
+
+    stage1_json_path = run_context.artifact_path("stage1_output.json")
+    if not os.path.exists(stage1_json_path):
+        set_stage_status(state, "stage1", StageStatus.FAIL)
+        state.current_stage = "stage1"
+        save_assessment_state(state, run_id)
+        raise RuntimeError(
+            f"Stage 1 did not produce {stage1_json_path} — the decomposer agent may not "
+            f"have called write_stage1_output. Stage 2 cannot proceed without it. Run "
+            f"audit trail: {out_dir}/assessment_state.json"
+        )
+    commit_stage_output(state, "stage1", stage1_json_path, status=StageStatus.PENDING)
+    state.current_stage = "stage2"
+    save_assessment_state(state, run_id)
 
     # ---- ATTRIBUTION-BOUNDARY CHECK (deterministic, warn-only) ----
-    # Item 7: replaces trusting the "ATTRIBUTION DISCIPLINE" prompt text
-    # alone. Checks every named person/unit/component mentioned in the
-    # Stage 0 + Stage 1 prose against the scratchpad (the documented
-    # boundary) and, as a fallback, the raw locked corpus. High-confidence
-    # findings (rank+name, ordinal+unit) are the enforcement signal;
-    # bare-phrase findings are reported but not counted against is_clean
-    # (see the false-positive calibration note in tools.py). This is
-    # warn-only, not a RuntimeError, because unlike the corpus-lock and
-    # Stage 2 gates, regex-based entity extraction has a real residual
+    # Runs here, now that both stage0_output.json and stage1_output.json
+    # are confirmed to actually exist (the hard checks above already
+    # raised if either was missing) -- rather than trusting the
+    # "ATTRIBUTION DISCIPLINE" prompt text alone. Checks every named
+    # person/unit/component mentioned in the Stage 0 + Stage 1 prose
+    # against the scratchpad (the documented boundary) and, as a
+    # fallback, the raw locked corpus. High-confidence findings
+    # (rank+name, ordinal+unit) are the enforcement signal; bare-phrase
+    # findings are reported but not counted against is_clean (see the
+    # false-positive calibration note in tools.py). This is warn-only,
+    # not a RuntimeError, because unlike the corpus-lock and Stage 2
+    # gates, regex-based entity extraction has a real residual
     # false-positive rate even after tiering — flip the `if not attr["...` block
     # below to `raise RuntimeError(...)` if you want it to hard-block instead.
     prose = ""
@@ -421,28 +469,46 @@ if __name__ == "__main__":
               f"See {attr_check_path}. (Not blocking this run — see "
               f"comment above this block to make it a hard gate.)")
 
-    # ---- COMMIT PRE-CREW STAGE OUTPUTS TO ASSESSMENT STATE ----
-    # pre_crew runs Stage 0, Stage 1, and Stage 2 sequentially inside one
-    # kickoff() with no per-task hook exposed, so all three are committed
-    # here, after the crew finishes, from whatever artifacts exist on disk.
-    # Stage 0/1 land as PENDING — the attribution-boundary check above is
-    # deterministic but warn-only, so it doesn't change commit status here;
-    # its verdict lives in attribution_check.md instead. Stage 2 is
-    # committed PENDING here and promoted to PASS/FAIL immediately below,
-    # once verify_stage2_vectors actually runs.
-    stage0_json_path = run_context.artifact_path("stage0_output.json")
-    stage1_json_path = run_context.artifact_path("stage1_output.json")
-    for stage_name, artifact_path in (
-        ("stage0", stage0_json_path),
-        ("stage1", stage1_json_path),
-    ):
-        if os.path.exists(artifact_path):
-            commit_stage_output(state, stage_name, artifact_path, status=StageStatus.PENDING)
-        else:
-            print(f"WARNING: {artifact_path} not found — {stage_name} agent may not have "
-                  f"called its write tool. assessment_state.json will show {stage_name} "
-                  f"as NOT_STARTED.")
-    state.current_stage = "stage2"
+    # ---- STAGE 2 CREW: attack surface characterization ----
+    stage2_tasks = [] if stage2_done else [t_stage2]
+
+    if stage2_tasks:
+        print(f"stage2_crew will run {len(stage2_tasks)} task(s): "
+              f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in stage2_tasks]}")
+        stage2_crew = Crew(
+            agents=[mapper],
+            tasks=stage2_tasks,
+            process=Process.sequential,
+            verbose=True,
+        )
+        with heartbeat("stage2_crew", log_path=heartbeat_log):
+            stage2_crew.kickoff(inputs={
+                "sut_brief": brief_text,
+                "file_count": c_count,
+                "corpus_version": c_version,
+            })
+    else:
+        print("stage2_crew: nothing to run — Stage 2 already complete for this run. "
+              "Skipping stage2_crew.kickoff() entirely.")
+
+    stage2_prose_path = run_context.artifact_path("stage2.md")
+    if os.path.exists(stage2_prose_path):
+        run_context.stamp_prose_file(stage2_prose_path)
+
+    # ---- COMMIT STAGE 2 OUTPUT TO ASSESSMENT STATE ----
+    # Stage 2 is committed PENDING here and promoted to PASS/FAIL immediately
+    # below, once verify_stage2_vectors and validate_kcag actually run.
+    stage2_vectors_path = run_context.artifact_path("stage2_vectors.json")
+    if not os.path.exists(stage2_vectors_path):
+        set_stage_status(state, "stage2", StageStatus.FAIL)
+        state.current_stage = "stage2"
+        save_assessment_state(state, run_id)
+        raise RuntimeError(
+            f"Stage 2 did not produce {stage2_vectors_path} — the mapper agent may not "
+            f"have called write_stage2_vectors. Annex B and downstream cannot proceed "
+            f"without it. Run audit trail: {out_dir}/assessment_state.json"
+        )
+    commit_stage_output(state, "stage2", stage2_vectors_path, status=StageStatus.PENDING)
     save_assessment_state(state, run_id)
 
     # ---- GATE 1 OF 2: FRAMEWORK-ID VERIFICATION (plain Python) ----
@@ -461,15 +527,6 @@ if __name__ == "__main__":
             f.write(f"- GAP edge[{ge['edge_index']}] `{ge['technique']}`\n")
     run_context.stamp_prose_file(stage2_verification_path)
 
-    # Register stage2_vectors.json in the audit trail regardless of outcome.
-    # Stage 2 is deliberately NOT promoted to PASS here anymore -- only
-    # FAIL on this gate's own failure. PASS now requires BOTH this ID gate
-    # AND the structural gate below to succeed; promoting early here (the
-    # previous behavior) meant "Stage 2: PASS" only ever reflected
-    # framework-ID correctness, never graph structure.
-    stage2_vectors_path = run_context.artifact_path("stage2_vectors.json")
-    if os.path.exists(stage2_vectors_path):
-        commit_stage_output(state, "stage2", stage2_vectors_path, status=StageStatus.PENDING)
     if not verification["is_valid"]:
         set_stage_status(state, "stage2", StageStatus.FAIL)
         save_assessment_state(state, run_id)
@@ -479,6 +536,7 @@ if __name__ == "__main__":
             f"Run audit trail: {out_dir}/assessment_state.json"
         )
     save_assessment_state(state, run_id)
+
 
     # ---- GATE 2 OF 2: KCAG STRUCTURAL VALIDATION (plain Python) ----
     # A separate, non-overlapping check from the ID gate above: this one

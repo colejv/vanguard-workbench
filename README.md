@@ -650,9 +650,9 @@ The pipeline will:
 7. Request human confirmation of the corpus lock.
 8. Read and chunk the source corpus.
 9. Extract named systems, interfaces, organizations, people, and events.
-10. Generate Stage 0 Reverse IPB.
-11. Generate Stage 1 system decomposition.
-12. Generate Stage 2 attack vectors and graph topology.
+10. Generate Stage 0 Reverse IPB. Halt if the structured signature list was never written.
+11. Generate Stage 1 system decomposition. Halt if the structured node inventory was never written.
+12. Generate Stage 2 attack vectors and graph topology. Halt if the structured edge list was never written.
 13. Verify Stage 2 framework identifiers.
 14. Halt if Stage 2 verification fails.
 15. Run Annex B KCAG analysis, including deterministic structural validation (`validate_kcag`) and a read-only quantitative review.
@@ -707,7 +707,7 @@ Example:
 tail -f outputs/vaf_20260709_143022/heartbeat.log
 ```
 
-The heartbeat log labels each phase by name — `pre_crew` (Stage 0-2), `analysis_crew` (Annex B, Annex C, Stage 3), and `stage4_crew` (Stage 4 alone) — so it indicates which specific crew is still active during long local-model operations, not just "still running somewhere."
+The heartbeat log labels each phase by name — `stage0_crew`, `stage1_crew`, `stage2_crew` (each gated separately, replacing the earlier single shared `pre_crew` that ran Stage 0 through Stage 2 in one kickoff), `analysis_crew` (Annex B, Annex C, Stage 3), and `stage4_crew` (Stage 4 alone) — so it indicates which specific crew is still active during long local-model operations, not just "still running somewhere."
 
 ---
 
@@ -866,6 +866,9 @@ The extracted findings are accumulated in:
 ```text
 _stage0_scratch.md
 ```
+
+> [!NOTE]
+> Stage 0, Stage 1, and Stage 2 each run in their own separately gated crew — `stage0_crew`, `stage1_crew`, `stage2_crew` — not a single shared crew. After each one finishes, Vanguard requires its structured JSON artifact to actually exist on disk before the next stage's crew is even constructed; a stage whose agent produced prose but never successfully wrote its structured artifact halts the run there; the next stage never starts against missing or stale upstream data. Each stage's writer tool (`write_stage0_output`, `write_stage1_output`, `write_stage2_vectors`) also takes real structured tool-call arguments — lists and objects — rather than a single JSON-encoded string parameter, removing an extra layer of serialization a local model previously had to get right in one shot.
 
 ### Stage 0 — Reverse IPB
 
@@ -1387,6 +1390,7 @@ The current test suite includes coverage for:
 * The structured Stage 4 execution-plan writer, deterministic Stage 3 test-binding validation (categories, Stage 2 vectors, KCAG path, technique IDs, criteria inheritance across split actions), structured Phase 0 safety-gate coverage, and prose/JSON cross-artifact consistency
 * The Purple Team compiler's run trust boundary (Stage 4 `PASS`, a passing validation report, cross-run/cross-corpus stamp rejection), structured compilation into one record per Stage 4 action, the Atomic Red Team crosswalk, the isolated legacy Markdown parser (never triggered automatically), and the Sigma generator's run-scoped manifest — none of these tests perform live network or LLM calls
 * The Streamlit dashboard's run selector, and its three views reading real, compiled run-scoped Purple Team artifacts (via `streamlit.testing.v1.AppTest`, which runs the actual app code in a simulated session) — including the coverage-map status-color mapping and graceful handling of a run with no Purple artifacts yet
+* The structured (non-stringified-JSON) tool-call arguments for `write_stage0_output`, `write_stage1_output`, and `write_stage2_vectors`, and the Stage 0 / Stage 1 / Stage 2 crew split — including a real, end-to-end mocked pipeline run confirming a stage whose crew ran but never actually wrote its structured artifact halts before the next stage's crew is even constructed
 
 The live model pipeline is significantly more expensive and less deterministic than the unit tests. Use mocked or fixture-based tests for routine development wherever practical.
 

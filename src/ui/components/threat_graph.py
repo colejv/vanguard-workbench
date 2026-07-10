@@ -1,31 +1,36 @@
 import streamlit as st
-import json
 from streamlit_agraph import agraph, Node, Edge, Config
 
-def render_threat_graph():
-    try:
-        with open("outputs/kcag_data.json", "r") as f:
-            graph_data = json.load(f)
-    except FileNotFoundError:
-        st.error("kcag_data.json not found.")
-        return None
+from src import run_context
 
-    # Debug: Print the raw node data to the dashboard to inspect it
-    # st.write("Debug Node Data:", graph_data["nodes"])
+
+def render_threat_graph():
+    """Render the Purple Team action graph for the active run. Node IDs
+    are Stage 4 action IDs (e.g. 'ACT-001') -- not the old sequential
+    phase-index strings ('0', '1', ...) the legacy kcag_data.json used.
+    Returns the clicked node's action_id string, or None if nothing was
+    clicked. Callers must NOT int()-cast the return value; the old
+    dashboard.py did, which assumed node IDs were numeric phase indices."""
+    try:
+        graph_data = run_context.read_stamped_json(run_context.artifact_path("purple_graph.json"))
+    except FileNotFoundError:
+        st.error("purple_graph.json not found for this run. Run the Purple Team compiler first.")
+        return None
+    except Exception as e:
+        st.error(f"Could not read purple_graph.json: {e}")
+        return None
 
     nodes = []
     for n in graph_data.get("nodes", []):
-        # Explicitly pull the color; fallback to a distinct "debug" color 
-        # so you can see if it's hitting the fallback or the data
-        color_val = n.get("color", "#FFA500") 
+        color_val = n.get("color", "#FFA500")
         nodes.append(Node(
-            id=n["id"], 
-            label=n["label"], 
-            color=color_val, 
-            size=30
+            id=n["id"],
+            label=n["label"],
+            color=color_val,
+            size=30,
         ))
-    
+
     edges = [Edge(source=e["source"], target=e["target"]) for e in graph_data.get("edges", [])]
-    
+
     config = Config(height=400, width=700, directed=True, physics=False, clickToFocus=True)
     return agraph(nodes=nodes, edges=edges, config=config)

@@ -1,199 +1,513 @@
 """
-Vanguard Purple Team Compiler
-Parses Stage 4 MDMP plans, crosswalks techniques against the published
-Atomic Red Team index, and generates an engagement scaffold.
-"""
+Vanguard Purple Team Compiler.
 
-import re
+Default path: compiles Purple Team defensive artifacts directly from the
+verified, run-scoped structured Stage 4 execution plan
+(stage4_execution_plan.json) -- which has already passed deterministic
+referential validation against Stage 3 (stage4_execution_plan_validation.json)
+before this tool will touch it. No prose parsing occurs in this path.
+
+Legacy path (--legacy-markdown, explicit only): the original
+formatting-sensitive Markdown regex parser (parse_legacy_mdmp_plan),
+preserved unchanged for compatibility with runs that predate structured
+Stage 4. It is never triggered automatically -- a missing or invalid
+structured plan is an error, not a silent fallback trigger. That
+automatic-fallback behavior would defeat the entire point of the new
+trust boundary.
+
+    Purple Team output must derive from the exact structured Stage 4
+    plan that passed deterministic validation for the selected run --
+    not from a copied, regex-parsed prose file.
+"""
+import argparse
 import json
 import os
+import re
 import urllib.request
+import warnings
+from dataclasses import dataclass, asdict, field
+from typing import Optional
+
 import yaml
-from dataclasses import dataclass, asdict
-from typing import List, Dict
+
+from src import run_context
+from src.schemas import StageStatus
+from src.stage4_schema import Stage4ExecutionPlan
+from src.state import load_assessment_state, run_output_dir
 
 ART_INDEX_URL = "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/Indexes/index.yaml"
 CACHE_DIR = "corpus-index"
 CACHE_FILE = os.path.join(CACHE_DIR, "art_index.json")
 
+ATTACK_TECHNIQUE_PATTERN = re.compile(r"^T\d{4}(?:\.\d{3})?$", re.IGNORECASE)
+
+
+# ============================================================================
+#  Atomic Red Team index -- plain function, not a side effect of
+#  constructing anything. The original PurplePlanCompiler.__init__ fetched
+#  this unconditionally (real network I/O on every `PurplePlanCompiler(...)`
+#  call, including in tests); this is the fix for that specific problem.
+# ============================================================================
+
+def load_art_index(*, refresh: bool = False) -> dict:
+    """Load the cached Atomic Red Team index, fetching and flattening it
+    if the cache is absent or refresh=True. Same fetch/flatten logic as
+    the original implementation, unchanged, just no longer implicit in
+    an object constructor."""
+    if os.path.exists(CACHE_FILE) and not refresh:
+        with open(CACHE_FILE) as f:
+            return json.load(f)
+
+    print("Fetching live Atomic Red Team index...")
+    try:
+        with urllib.request.urlopen(ART_INDEX_URL, timeout=30) as r:
+            raw = yaml.safe_load(r.read())
+    except Exception as e:
+        print(f"ERROR fetching ART index: {e}")
+        return {}
+
+    flat = {}
+    for tactic, techniques in raw.items():
+        if not isinstance(techniques, dict):
+            continue
+        for tid, entry in techniques.items():
+            tests = entry.get("atomic_tests", []) or []
+            flat[tid.upper()] = {
+                "technique_name": entry.get("technique", {}).get("name", ""),
+                "tactic": tactic,
+                "test_count": len(tests),
+                "test_names": [t.get("name", "") for t in tests],
+            }
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(flat, f, indent=2)
+    return flat
+
+
+# ============================================================================
+#  Run trust boundary
+# ============================================================================
+
+@dataclass(frozen=True)
+class PurpleRunContext:
+    run_id: str
+    out_dir: str
+    state: object
+    execution_plan: dict
+    validation_report: dict
+
+
+def load_structured_stage4_run(run_id: str, *, base: str = "outputs") -> PurpleRunContext:
+    """Establish the run trust boundary before any compilation happens.
+
+    Requires: Stage 4 state == PASS, AND the structured validation
+    report == PASS, AND the structured artifact's run/corpus stamp
+    matches the active run (the last of these is enforced automatically
+    by run_context.read_stamped_json -- it raises on any run_id or
+    corpus_manifest_hash mismatch, not just directory placement).
+
+    This protects against: running Purple compilation before the
+    assessment finishes; compiling a rejected Stage 4 plan; manually
+    copying an artifact from another run; replacing the structured file
+    after validation; using an artifact from a different corpus.
+    """
+    try:
+        state = load_assessment_state(run_id, base=base)
+    except FileNotFoundError:
+        raise RuntimeError(f"No assessment_state.json found for run '{run_id}' under {base}/.")
+
+    stage4_record = state.stages.get("stage4")
+    if stage4_record is None:
+        raise RuntimeError(f"Run '{run_id}' has no Stage 4 state record.")
+    if stage4_record.status != StageStatus.PASS:
+        raise RuntimeError(
+            f"Run '{run_id}' Stage 4 status is {stage4_record.status.value}; PASS is "
+            f"required before Purple Team compilation."
+        )
+
+    out_dir = run_output_dir(run_id, base)
+    run_context.set_active_run(run_id, state.corpus_manifest_hash, out_dir)
+
+    plan_path = run_context.artifact_path("stage4_execution_plan.json")
+    validation_path = run_context.artifact_path("stage4_execution_plan_validation.json")
+
+    try:
+        plan = run_context.read_stamped_json(plan_path)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{plan_path} not found. Structured Stage 4 JSON is required and this tool "
+            f"never silently falls back to Markdown parsing — pass --legacy-markdown "
+            f"explicitly if this run predates structured Stage 4."
+        )
+    try:
+        validation = run_context.read_stamped_json(validation_path)
+    except FileNotFoundError:
+        raise RuntimeError(f"{validation_path} not found. Cannot confirm Stage 4 passed validation.")
+
+    if not validation.get("is_valid"):
+        raise RuntimeError(
+            f"Run '{run_id}' stage4_execution_plan_validation.json does not report "
+            f"is_valid=True. Purple Team compilation refuses a rejected Stage 4 plan."
+        )
+
+    # Defense in depth against schema drift or a manually edited file
+    # between validation time and now -- re-validate against the CURRENT
+    # schema, don't just trust the stamp.
+    Stage4ExecutionPlan.model_validate(plan)
+
+    return PurpleRunContext(run_id=run_id, out_dir=out_dir, state=state,
+                            execution_plan=plan, validation_report=validation)
+
+
+# ============================================================================
+#  Structured compilation -- default path, no prose parsing
+# ============================================================================
+
 @dataclass
-class EngagementPhase:
+class PurpleActionRecord:
+    """One record per Stage 4 action (not one per phase, as the legacy
+    EngagementPhase did) -- structured Stage 4 supports multiple actions
+    per phase, and collapsing that back down to one record per phase
+    would lose the provenance chain from Stage 2 vector, through the
+    Stage 3 test concept, through the Stage 4 binding, to this specific
+    action."""
+    phase_id: str
+    phase_sequence: int
     phase_name: str
-    action: str
-    technique_ids: List[str]
-    blue_team_telemetry: str
-    blue_team_alert: str
-    test_references: List[Dict[str, str]]
+    phase_purpose: str
+    action_id: str
+    action_summary: str
 
-class PurplePlanCompiler:
-    def __init__(self, plan_path: str):
-        self.plan_path = plan_path
-        self.art_index = self._fetch_art_index()
-        
-    def _fetch_art_index(self, force=False):
-        """Fetch and cache the published ART index."""
-        if os.path.exists(CACHE_FILE) and not force:
-            with open(CACHE_FILE, 'r') as f:
-                return json.load(f)
+    categories: list = field(default_factory=list)
+    stage2_vector_ids: list = field(default_factory=list)
+    kcag_path: list = field(default_factory=list)
+    technique_ids: list = field(default_factory=list)
 
-        print("Fetching live Atomic Red Team index...")
-        try:
-            with urllib.request.urlopen(ART_INDEX_URL, timeout=30) as r:
-                raw = yaml.safe_load(r.read())
-        except Exception as e:
-            print(f"ERROR fetching ART index: {e}")
-            return {}
+    responsible_roles: list = field(default_factory=list)
+    preconditions: list = field(default_factory=list)
+    success_criteria: list = field(default_factory=list)
+    abort_criteria: list = field(default_factory=list)
+    rollback_or_recovery_steps: list = field(default_factory=list)
 
-        flat = {}
-        for tactic, techniques in raw.items():
-            if not isinstance(techniques, dict):
-                continue
-            for tid, entry in techniques.items():
-                tests = entry.get("atomic_tests", []) or []
-                flat[tid.upper()] = {
-                    "technique_name": entry.get("technique", {}).get("name", ""),
-                    "tactic": tactic,
-                    "test_count": len(tests),
-                    "test_names": [t.get("name", "") for t in tests],
-                }
+    telemetry_requirements: list = field(default_factory=list)
+    alert_triggers: list = field(default_factory=list)
+    opsec_measures: list = field(default_factory=list)
 
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(CACHE_FILE, "w") as f:
-            json.dump(flat, f, indent=2)
-        return flat
+    atomic_test_references: list = field(default_factory=list)
+    test_id: Optional[str] = None
+    provenance_status: str = "STRUCTURED"
 
-    def parse_mdmp_plan(self) -> List[EngagementPhase]:
-        """Parses the Stage 4 MDMP output into structured phase objects."""
-        try:
-            with open(self.plan_path, "r") as f:
-                content = f.read()
-        except FileNotFoundError:
-            print(f"ERROR: Could not find {self.plan_path}")
-            return []
 
-        phases = []
-        # BUG 1 FIX: Match exact Stage 4 header formatting
-        phase_blocks = re.split(r'###\s+\*\*Phase\s+\d+:', content)[1:] 
-        
-        for block in phase_blocks:
-            # Clean up the phase name extraction
-            phase_name_raw = block.split('\n')[0]
-            phase_name = phase_name_raw.replace('**', '').strip()
-            
-            # BUG 3 FIX: Robust regex for Action, Telemetry, and Alerts
-            action_match = re.search(r'\*\s+\*\*Action:\*\*\s+(.*?)\n\*', block, re.DOTALL)
-            action = action_match.group(1).strip() if action_match else "Unknown"
-            
-            mitre_section = re.search(r'\*\s+\*\*MITRE ATT&CK Mapping:\*\*(.*?)(?=\n\*\s+\*\*Execution Timeline)', block, re.DOTALL)
-            ids = []
-            if mitre_section:
-                ids = re.findall(r'(T\d{4}(?:\.\d{3})?|CAPEC-\d+)', mitre_section.group(1))
-            
-            telemetry_match = re.search(r'\*\s+\*\*Telemetry:\*\*\s+(.*?)\n', block)
-            alert_match = re.search(r'\*\s+\*\*Alert Trigger:\*\*\s+(.*?)(?=\n|$)', block)
-            
-            telemetry = telemetry_match.group(1).strip() if telemetry_match else ""
-            alert = alert_match.group(1).strip() if alert_match else ""
-            
-            phases.append(EngagementPhase(
-                phase_name=phase_name,
-                action=action,
-                technique_ids=ids,
-                blue_team_telemetry=telemetry,
-                blue_team_alert=alert,
-                test_references=[]
+def compile_structured_plan(plan: dict) -> list:
+    """Build one PurpleActionRecord per Stage 4 action, directly from the
+    verified structured plan -- no Markdown, no regex.
+
+    The structured Stage 4 validator (src/stage4_validation.py) has
+    already proven, for any plan that reached PASS, that every action's
+    test_id has a real binding, and that binding's categories, Stage 2
+    vector IDs, KCAG path, and technique IDs agree exactly with Stage 3.
+    This function consumes that already-proven result rather than
+    reimplementing Stage 4 validation -- the RuntimeError below is
+    defense in depth for a plan that somehow reached this function
+    without actually passing that gate (e.g. a hand-edited file), not
+    the primary enforcement mechanism.
+    """
+    bindings = {b["test_id"]: b for b in plan["test_bindings"]}
+    records = []
+    phases = sorted(plan["phases"], key=lambda p: p["sequence"])
+    for phase in phases:
+        for action in phase["actions"]:
+            test_id = action["test_id"]
+            binding = bindings.get(test_id)
+            if binding is None:
+                raise RuntimeError(
+                    f"Action {action['action_id']} references unbound test "
+                    f"'{test_id}'. This should be impossible for a plan that "
+                    f"passed validate_stage4_execution_plan() -- refusing to "
+                    f"compile rather than guess."
+                )
+            records.append(PurpleActionRecord(
+                phase_id=phase["phase_id"], phase_sequence=phase["sequence"],
+                phase_name=phase["name"], phase_purpose=phase["purpose"],
+                action_id=action["action_id"], action_summary=action["action_summary"],
+                categories=list(binding["categories"]),
+                stage2_vector_ids=list(binding["stage2_vector_ids"]),
+                kcag_path=list(binding["kcag_path"]),
+                technique_ids=list(binding["technique_ids"]),
+                responsible_roles=list(action["responsible_roles"]),
+                preconditions=list(action["preconditions"]),
+                success_criteria=list(action["success_criteria"]),
+                abort_criteria=list(action["abort_criteria"]),
+                rollback_or_recovery_steps=list(action["rollback_or_recovery_steps"]),
+                telemetry_requirements=list(action["telemetry_requirements"]),
+                alert_triggers=list(action["alert_triggers"]),
+                opsec_measures=list(action["opsec_measures"]),
+                test_id=test_id,
+                provenance_status="STRUCTURED",
             ))
-            
-        return phases
+    return records
 
-    def perform_crosswalk(self, phases: List[EngagementPhase]) -> List[EngagementPhase]:
-        """Maps extracted techniques to the published test index."""
-        for phase in phases:
-            for tid in phase.technique_ids:
-                t = tid.upper()
-                if t.startswith("T") and t in self.art_index:
-                    rec = self.art_index[t]
-                    phase.test_references.append({
-                        "id": tid,
-                        "status": "VETTED",
-                        "framework": "Atomic Red Team",
-                        "technique_name": rec["technique_name"],
-                        "test_count": rec["test_count"]
-                    })
-                else:
-                    # BUG 2 FIX: Correctly flag non-ATT&CK and missing IDs as coverage gaps
-                    reason = "Non-ATT&CK framework" if not t.startswith("T") else "No published atomic"
-                    phase.test_references.append({
-                        "id": tid,
-                        "status": "COVERAGE GAP",
-                        "framework": "None",
-                        "technique_name": reason,
-                        "test_count": 0
-                    })
-        return phases
 
-    def export_graph_data(self, phases: List[EngagementPhase], output_path: str = "outputs/kcag_data.json"):
-        nodes = []
-        edges = []
-        
-        for i, phase in enumerate(phases):
-            # DIAGNOSTIC: Print the status to the terminal to confirm we see it
-            # print(f"Phase {i} ({phase.phase_name}) tests: {phase.test_references}")
-            
-            # This logic only works if phase.test_references is populated 
-            # by the perform_crosswalk() method BEFORE this is called.
-            has_gap = any(ref["status"] == "COVERAGE GAP" for ref in phase.test_references)
-            node_color = "#FF4B4B" if has_gap else "#00FF00"
-            
-            nodes.append({
-                "id": str(i), 
-                "label": phase.phase_name,
-                "color": node_color
+# ============================================================================
+#  Atomic Red Team crosswalk
+# ============================================================================
+
+def crosswalk_techniques(records: list, art_index: dict) -> list:
+    """Annotate each record's technique_ids against the Atomic Red Team
+    index. Does not modify the source plan -- only the derived
+    PurpleActionRecord objects passed in.
+
+    VETTED_REFERENCE_AVAILABLE means a published Atomic Red Team test
+    exists for this technique ID. It does NOT mean the test is approved,
+    safe, applicable, or ready for this specific environment -- the
+    Purple operator still decides that. (Deliberately not named just
+    "VETTED", which the original implementation used and which
+    overstates what this check actually establishes.)
+    """
+    for record in records:
+        references = []
+        for technique_id in record.technique_ids:
+            normalized = technique_id.upper()
+
+            if not ATTACK_TECHNIQUE_PATTERN.fullmatch(normalized):
+                references.append({
+                    "id": technique_id, "status": "COVERAGE_GAP", "framework": "NON_ATTACK",
+                    "reason": "Atomic Red Team crosswalk applies only to ATT&CK technique IDs.",
+                    "test_count": 0, "test_names": [],
+                })
+                continue
+
+            entry = art_index.get(normalized)
+            if entry is None:
+                references.append({
+                    "id": technique_id, "status": "COVERAGE_GAP", "framework": "Atomic Red Team",
+                    "reason": "No published Atomic Red Team entry was found.",
+                    "test_count": 0, "test_names": [],
+                })
+                continue
+
+            references.append({
+                "id": technique_id, "status": "VETTED_REFERENCE_AVAILABLE", "framework": "Atomic Red Team",
+                "technique_name": entry.get("technique_name", ""),
+                "test_count": entry.get("test_count", 0),
+                "test_names": entry.get("test_names", []),
             })
-            
-            if i < len(phases) - 1:
-                edges.append({"source": str(i), "target": str(i+1)})
-                
-        with open(output_path, "w") as f:
-            json.dump({"nodes": nodes, "edges": edges}, f, indent=2)
-            
-    def print_coverage_map(self, phases: List[EngagementPhase]):
-        """Renders the immediate coverage map for the Purple Team."""
-        print("\n" + "="*60)
-        print("PURPLE TEAM COVERAGE MAP: SUT ENGAGEMENT")
-        print("="*60)
-        
-        for i, phase in enumerate(phases, 1):
-            print(f"\n[PHASE {i}] {phase.phase_name}")
-            print(f"Action: {phase.action}")
-            print("-" * 40)
-            
-            for ref in phase.test_references:
-                if ref["status"] == "VETTED":
-                    print(f"  [✓] {ref['id']}: {ref['test_count']} published test(s) — {ref['technique_name']}")
-                else:
-                    print(f"  [!] {ref['id']}: {ref['status']} — {ref['technique_name']}")
+        record.atomic_test_references = references
+    return records
+
+
+def build_coverage_summary(records: list) -> dict:
+    total = vetted = gap = 0
+    for record in records:
+        for ref in record.atomic_test_references:
+            total += 1
+            if ref["status"] == "VETTED_REFERENCE_AVAILABLE":
+                vetted += 1
+            else:
+                gap += 1
+    return {"total_technique_references": total, "vetted_reference_available": vetted, "coverage_gap": gap}
+
+
+# ============================================================================
+#  Purple graph -- action-level nodes, replaces the old phase-level
+#  export_graph_data()/kcag_data.json (misleadingly named -- it was never
+#  the KCAG).
+# ============================================================================
+
+def build_purple_graph(records: list) -> dict:
+    nodes = []
+    for record in records:
+        has_gap = any(ref["status"] == "COVERAGE_GAP" for ref in record.atomic_test_references)
+        nodes.append({
+            "id": record.action_id,
+            "label": f"{record.action_id} — {record.test_id}" if record.test_id else record.action_id,
+            "phase_id": record.phase_id,
+            "test_id": record.test_id,
+            "coverage_status": "COVERAGE_GAP" if has_gap else "FULLY_CROSSWALKED",
+            "color": "#FF4B4B" if has_gap else "#00A86B",
+        })
+
+    edges = []
+    for i in range(len(records) - 1):
+        source, target = records[i], records[i + 1]
+        transition_type = "WITHIN_PHASE" if source.phase_id == target.phase_id else "PHASE_TRANSITION"
+        edges.append({"source": source.action_id, "target": target.action_id, "transition_type": transition_type})
+
+    return {"nodes": nodes, "edges": edges}
+
+
+# ============================================================================
+#  Legacy Markdown parser -- ISOLATED, UNCHANGED regex logic, preserved for
+#  compatibility with runs that predate structured Stage 4. Only reachable
+#  via --legacy-markdown; never an automatic fallback.
+# ============================================================================
+
+def parse_legacy_mdmp_plan(plan_path: str) -> list:
+    """DEPRECATED. The original formatting-sensitive Markdown regex
+    parser (previously PurplePlanCompiler.parse_mdmp_plan), preserved
+    unchanged for compatibility with runs that predate structured
+    Stage 4. Structured provenance (test_id, categories, Stage 2 vector
+    IDs, KCAG path) is unavailable for a legacy-parsed run -- those
+    fields are left as explicit empty lists / None with
+    provenance_status='LEGACY_PARTIAL', never invented values.
+    """
+    warnings.warn(
+        "Legacy Markdown parsing is deprecated and format-sensitive. "
+        "Structured Stage 4 JSON is preferred.",
+        DeprecationWarning, stacklevel=2,
+    )
+    try:
+        with open(plan_path) as f:
+            content = f.read()
+    except FileNotFoundError:
+        print(f"ERROR: Could not find {plan_path}")
+        return []
+
+    records = []
+    # Unchanged from the original parse_mdmp_plan().
+    phase_blocks = re.split(r'###\s+\*\*Phase\s+\d+:', content)[1:]
+
+    for i, block in enumerate(phase_blocks, 1):
+        phase_name_raw = block.split('\n')[0]
+        phase_name = phase_name_raw.replace('**', '').strip()
+
+        action_match = re.search(r'\*\s+\*\*Action:\*\*\s+(.*?)\n\*', block, re.DOTALL)
+        action_summary = action_match.group(1).strip() if action_match else "Unknown"
+
+        mitre_section = re.search(
+            r'\*\s+\*\*MITRE ATT&CK Mapping:\*\*(.*?)(?=\n\*\s+\*\*Execution Timeline)', block, re.DOTALL)
+        technique_ids = []
+        if mitre_section:
+            technique_ids = re.findall(r'(T\d{4}(?:\.\d{3})?|CAPEC-\d+)', mitre_section.group(1))
+
+        telemetry_match = re.search(r'\*\s+\*\*Telemetry:\*\*\s+(.*?)\n', block)
+        alert_match = re.search(r'\*\s+\*\*Alert Trigger:\*\*\s+(.*?)(?=\n|$)', block)
+        telemetry = telemetry_match.group(1).strip() if telemetry_match else ""
+        alert = alert_match.group(1).strip() if alert_match else ""
+
+        records.append(PurpleActionRecord(
+            phase_id=f"PHASE-{i:02d}", phase_sequence=i, phase_name=phase_name, phase_purpose="",
+            action_id=f"ACT-{i:03d}", action_summary=action_summary,
+            technique_ids=technique_ids,
+            telemetry_requirements=[telemetry] if telemetry else [],
+            alert_triggers=[alert] if alert else [],
+            test_id=None,
+            provenance_status="LEGACY_PARTIAL",
+        ))
+    return records
+
+
+# ============================================================================
+#  Artifact writing
+# ============================================================================
+
+def write_purple_artifacts(context: Optional[PurpleRunContext], records: list, art_index: dict,
+                           *, legacy: bool = False, legacy_path: Optional[str] = None) -> tuple:
+    records = crosswalk_techniques(records, art_index)
+    coverage_summary = build_coverage_summary(records)
+    graph = build_purple_graph(records)
+
+    if legacy:
+        source = {
+            "format": "legacy_markdown",
+            "artifact": legacy_path,
+            "warning": "Generated through deprecated formatting-sensitive compatibility mode.",
+        }
+        safety = {"execution_authorization": None, "phase0_execution_release": None}
+    else:
+        source = {
+            "format": "stage4_execution_plan",
+            "artifact": "stage4_execution_plan.json",
+            "validation_artifact": "stage4_execution_plan_validation.json",
+            "run_id": context.run_id,
+        }
+        safety = {
+            "execution_authorization": context.execution_plan["execution_authorization"],
+            "phase0_execution_release": context.execution_plan["phase0_safety_gate"]["execution_release"],
+        }
+
+    scaffold = {
+        "schema_version": 2,
+        "source": source,
+        "safety": safety,
+        "coverage_summary": coverage_summary,
+        "actions": [asdict(r) for r in records],
+    }
+
+    run_context.write_stamped_json(run_context.artifact_path("purple_scaffold.json"), scaffold, schema_version="2")
+    run_context.write_stamped_json(run_context.artifact_path("purple_graph.json"), graph, schema_version="1")
+
+    return scaffold, graph
+
+
+def print_coverage_map(records: list) -> None:
+    print("\n" + "=" * 60)
+    print("PURPLE TEAM COVERAGE MAP: SUT ENGAGEMENT")
+    print("=" * 60)
+    for record in records:
+        print(f"\n[{record.phase_id}] {record.phase_name}")
+        print(f"[{record.action_id}] {record.action_summary}" +
+              (f" (test {record.test_id})" if record.test_id else ""))
+        print("-" * 40)
+        for ref in record.atomic_test_references:
+            if ref["status"] == "VETTED_REFERENCE_AVAILABLE":
+                print(f"  [\u2713] {ref['id']}: {ref['test_count']} published test(s) — {ref['technique_name']}")
+            else:
+                print(f"  [!] {ref['id']}: {ref['status']} — {ref.get('reason', '')}")
+
+
+# ============================================================================
+#  CLI
+# ============================================================================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Compile a completed Vanguard Stage 4 plan into run-scoped Purple Team defensive artifacts."
+    )
+    parser.add_argument("--run-id", required=True, help="Completed Vanguard assessment run ID.")
+    parser.add_argument(
+        "--legacy-markdown", default=None,
+        help=("Explicit compatibility mode for an older run that lacks stage4_execution_plan.json. "
+             "No automatic fallback occurs."),
+    )
+    parser.add_argument("--refresh-art-index", action="store_true", help="Refresh the cached Atomic Red Team index.")
+    return parser
+
+
+def main(argv=None) -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    art_index = load_art_index(refresh=args.refresh_art_index)
+    print(f"Loaded {len(art_index)} technique(s) from the Atomic Red Team index.")
+
+    if args.legacy_markdown:
+        out_dir = run_output_dir(args.run_id)
+        corpus_hash = "sha256:legacy-unknown"
+        try:
+            state = load_assessment_state(args.run_id)
+            corpus_hash = state.corpus_manifest_hash
+        except FileNotFoundError:
+            pass
+        run_context.set_active_run(args.run_id, corpus_hash, out_dir)
+
+        print(f"Parsing legacy Markdown plan: {args.legacy_markdown}")
+        records = parse_legacy_mdmp_plan(args.legacy_markdown)
+        scaffold, graph = write_purple_artifacts(None, records, art_index,
+                                                 legacy=True, legacy_path=args.legacy_markdown)
+    else:
+        print(f"Loading structured Stage 4 plan for run: {args.run_id}")
+        context = load_structured_stage4_run(args.run_id)
+        records = compile_structured_plan(context.execution_plan)
+        scaffold, graph = write_purple_artifacts(context, records, art_index, legacy=False)
+
+    print_coverage_map(records)
+    print(f"\nCompiled {len(records)} Purple Team action record(s).")
+    print(f"Coverage summary: {scaffold['coverage_summary']}")
+    print(f"Scaffold written to {run_context.artifact_path('purple_scaffold.json')}")
+    print(f"Graph written to {run_context.artifact_path('purple_graph.json')}")
+
 
 if __name__ == "__main__":
-    compiler = PurplePlanCompiler("outputs/stage4_mission_plan.md")
-    
-    print(f"Loaded {len(compiler.art_index)} techniques from index.")
-    print("Parsing MDMP Plan...")
-    parsed_phases = compiler.parse_mdmp_plan()
-    
-    print("Executing Index Crosswalk...")
-    mapped_phases = compiler.perform_crosswalk(parsed_phases)
-    
-    compiler.print_coverage_map(mapped_phases)
-    
-    # 1. The Coverage Scaffold for the UI
-    scaffold_path = "outputs/purple_scaffold.json"
-    with open(scaffold_path, "w") as f:
-        json.dump([asdict(p) for p in mapped_phases], f, indent=2)
-    print(f"Scaffold exported to {scaffold_path}")
-        
-    # 2. Export the Graph Data (This contains the color logic!)
-    # We remove the manual dictionary creation and call the method instead
-    compiler.export_graph_data(mapped_phases, "outputs/kcag_data.json")
-    
-    print(f"Graph data exported to outputs/kcag_data.json")
+    main()

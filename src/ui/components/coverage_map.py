@@ -1,43 +1,56 @@
 import streamlit as st
 import pandas as pd
-import json
 
-def render_coverage_map(phase_idx=None): # <--- Add the argument here
-    scaffold_path = "outputs/purple_scaffold.json"
-    
+from src import run_context
+
+
+def _color_for_status(val: str) -> str:
+    # VETTED_REFERENCE_AVAILABLE means a published Atomic Red Team test
+    # exists for this technique ID -- not that it is approved, safe,
+    # applicable, or ready for this environment.
+    return "color: green" if val == "VETTED_REFERENCE_AVAILABLE" else "color: red"
+
+
+def render_coverage_map(action_id=None):
+    """Render the Atomic Red Team coverage table for the active run's
+    Purple Team scaffold. Filters to one action when action_id is given
+    (e.g. from a threat-graph click), otherwise shows every action.
+
+    Reads the current scaffold shape: a versioned object with an
+    'actions' list (one record per Stage 4 action), not the legacy bare
+    list of phase-level records with a 'test_references' key.
+    """
     try:
-        with open(scaffold_path, "r") as f:
-            data = json.load(f)
-            
-        # If a phase_idx is provided, filter the data
-        if phase_idx is not None and phase_idx < len(data):
-        # We now have the option to show only one, or show all. 
-        # Let's keep it to only the selected one for the "Drill Down" effect.
-            data = [data[phase_idx]]
-            
-        rows = []
-        for phase in data:
-            for ref in phase["test_references"]:
-                rows.append({
-                    "Phase": phase["phase_name"],
-                    "Technique": ref["id"],
-                    "Status": ref["status"],
-                    "Framework": ref["framework"],
-                    "Test Count": ref["test_count"]
-                })
-        
-        df = pd.DataFrame(rows)
-        
-        def color_status(val):
-            color = 'green' if val == 'VETTED' else 'red'
-            return f'color: {color}'
-            
-        # Remove the previous st.dataframe call and replace it with this:
-        st.dataframe(
-            df.style.map(color_status, subset=['Status']),
-            width=None, # Clear any previous width references
-            use_container_width=True # Ensure this is the only width-related toggle
-        )
-        
+        scaffold = run_context.read_stamped_json(run_context.artifact_path("purple_scaffold.json"))
     except FileNotFoundError:
-        st.error("Purple scaffold not found.")
+        st.error("purple_scaffold.json not found for this run. Run the Purple Team compiler first.")
+        return
+    except Exception as e:
+        st.error(f"Could not read purple_scaffold.json: {e}")
+        return
+
+    actions = scaffold.get("actions", [])
+    if action_id is not None:
+        actions = [a for a in actions if a.get("action_id") == action_id]
+
+    rows = []
+    for action in actions:
+        for ref in action.get("atomic_test_references", []):
+            rows.append({
+                "Phase": action.get("phase_name", ""),
+                "Action": action.get("action_id", ""),
+                "Technique": ref["id"],
+                "Status": ref["status"],
+                "Framework": ref["framework"],
+                "Test Count": ref.get("test_count", 0),
+            })
+
+    if not rows:
+        st.info("No technique references to display for the current selection.")
+        return
+
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df.style.map(_color_for_status, subset=["Status"]),
+        width="stretch",
+    )

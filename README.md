@@ -1233,68 +1233,58 @@ A noncompliant result prevents the run from completing successfully.
 
 Vanguard includes a separate Purple Team workflow for:
 
-* Parsing the Stage 4 plan
-* Extracting ATT&CK technique identifiers
-* Crosswalking them with Atomic Red Team
+* Compiling the verified, run-scoped structured Stage 4 execution plan into defensive artifacts
+* Crosswalking ATT&CK technique references against Atomic Red Team
 * Identifying coverage gaps
-* Creating defensive scaffolds
 * Generating draft Sigma rules
 
-### Current run-isolation compatibility step
+No prose parsing occurs in the default path. The compiler reads `stage4_execution_plan.json` directly — the same structured artifact the deterministic Stage 4 validator already checked against Stage 3 before the run could reach `PASS`.
 
-The Purple Team scripts currently read legacy flat paths under `outputs/`, while the main assessment pipeline now writes Stage 4 under `outputs/<run_id>/`.
-
-Select the run you want to process:
-
-```bash
-export VANGUARD_RUN_ID=vaf_20260709_143022
-```
-
-Copy its Stage 4 plan to the current Purple Team compatibility path:
-
-```bash
-cp \
-  "outputs/${VANGUARD_RUN_ID}/stage4_mission_plan.md" \
-  outputs/stage4_mission_plan.md
-```
+> [!IMPORTANT]
+> **Purple Team output must derive from the exact structured Stage 4 plan that passed deterministic validation for the selected run — not from a copied, regex-parsed prose file.** The compiler enforces this: it requires Stage 4 status `PASS`, requires `stage4_execution_plan_validation.json` to report `is_valid: true`, and (via the same stamped-JSON mechanism used throughout the pipeline) refuses an artifact copied in from a different run or a different corpus. A missing or invalid structured plan is an error — the compiler never silently falls back to Markdown parsing.
 
 ### Run the Purple Team compiler
 
 ```bash
-python src/purple/purple_compiler.py
+python -m src.purple.purple_compiler --run-id vaf_20260709_143022
 ```
 
-The compiler currently:
+For each Stage 4 action, the compiler:
 
-* Downloads or loads a cached Atomic Red Team index
-* Parses Stage 4 phases
-* Extracts ATT&CK and CAPEC identifiers
-* Marks published Atomic Red Team coverage
-* Flags coverage gaps
-* Writes dashboard artifacts
+* Restates that action's Stage 3 test binding (categories, Stage 2 vector IDs, KCAG path, technique IDs) directly from the verified structured plan
+* Crosswalks its technique IDs against the Atomic Red Team index (cached at `corpus-index/art_index.json`, fetched and cached automatically if absent)
+* Records `VETTED_REFERENCE_AVAILABLE` where a published Atomic Red Team test exists, or `COVERAGE_GAP` otherwise — a vetted reference means a published test exists, not that it is approved, safe, or ready for this specific environment; the Purple operator still decides that
 
 Outputs:
 
 ```text
-outputs/purple_scaffold.json
-outputs/kcag_data.json
+outputs/<run_id>/purple_scaffold.json
+outputs/<run_id>/purple_graph.json
 ```
 
-The Atomic Red Team index is cached at:
+`purple_scaffold.json` is a versioned, run-stamped object (one record per Stage 4 action, plus a `coverage_summary` and the propagated `execution_authorization: NOT_GRANTED` / Phase 0 execution-release disposition) — not a bare list. `purple_graph.json` (renamed from the earlier `kcag_data.json`, which was never actually the KCAG) is a node/edge graph over actions, with edges labeled `WITHIN_PHASE` or `PHASE_TRANSITION`.
 
-```text
-corpus-index/art_index.json
+Refresh the cached Atomic Red Team index explicitly if needed:
+
+```bash
+python -m src.purple.purple_compiler --run-id vaf_20260709_143022 --refresh-art-index
 ```
+
+### Legacy Markdown compatibility
+
+A run predating structured Stage 4 has no `stage4_execution_plan.json`. For that case only, pass the prose plan explicitly:
+
+```bash
+python -m src.purple.purple_compiler \
+  --run-id vaf_20260709_143022 \
+  --legacy-markdown outputs/vaf_20260709_143022/stage4_mission_plan.md
+```
+
+This is never triggered automatically. It emits a deprecation warning, still writes into the selected run's directory, and marks every resulting record `provenance_status: LEGACY_PARTIAL` — structured fields unavailable from prose (test ID, Stage 2 vectors, KCAG path, safety disposition) are left as explicit empty values, never invented ones.
 
 ### Generate Sigma-rule scaffolds
 
-The current Sigma generator uses:
-
-```text
-gemma4:12b-mlx
-```
-
-Install it first:
+The Sigma generator uses `gemma4:12b-mlx`:
 
 ```bash
 ollama pull gemma4:12b-mlx
@@ -1303,16 +1293,21 @@ ollama pull gemma4:12b-mlx
 Then run:
 
 ```bash
-python src/purple/sigma_generator.py
+python -m src.purple.sigma_generator --run-id vaf_20260709_143022
 ```
 
-Outputs are written under:
+One rule is generated per Stage 4 action that has at least one telemetry requirement or alert trigger, drafted from that action's structured `telemetry_requirements`, `alert_triggers`, `action_summary`, Stage 3 `test_id`, and `technique_ids` — not a concatenated prose phase parsed from Markdown.
+
+Outputs:
 
 ```text
-outputs/sigma_rules/
+outputs/<run_id>/sigma_rules/ACT-001_RT-001.yml
+outputs/<run_id>/sigma_rules_manifest.json
 ```
 
-Generated rules are scaffolds, not production-ready detections.
+The manifest is run-stamped and binds every generated (or failed) rule file to its action and test ID. An LLM call that fails (e.g. Ollama unreachable) is recorded as `GENERATION_FAILED` in the manifest rather than silently omitted or reported as success.
+
+Generated rules are drafts, not production-ready detections.
 
 Before deployment, validate:
 
@@ -1343,13 +1338,15 @@ streamlit run src/ui/dashboard.py
 
 The dashboard contains views for:
 
-* Threat surface
-* Purple Team coverage
-* Defensive validation
+* Threat surface (an interactive action graph)
+* Coverage map (Atomic Red Team crosswalk per technique reference)
+* Defensive validation (generated Sigma rules)
 
-The dashboard currently expects the legacy Purple Team output files under the root `outputs/` directory.
+A sidebar run selector lists every directory under `outputs/` that has an `assessment_state.json`, most recent first. Selecting a run establishes it as the active run (`run_context.set_active_run`) for the rest of the session, and all three views read that run's stamped `purple_scaffold.json`, `purple_graph.json`, and `sigma_rules/` directly — no flat compatibility paths, no copying required.
 
-Run the Purple Team compiler and Sigma generator before expecting all dashboard views to contain data.
+Clicking a node in the threat-surface graph drills the Coverage Map and Defensive Validation tabs down to that specific Stage 4 action; "Reset View (Show All)" in the sidebar clears the filter. Graph nodes are Stage 4 action IDs (e.g. `ACT-001`), not the sequential phase indices the legacy graph used.
+
+If a selected run hasn't had the Purple Team compiler or Sigma generator run against it yet, each view reports that plainly rather than showing stale or empty data silently.
 
 ---
 
@@ -1386,6 +1383,8 @@ The current test suite includes coverage for:
 * The Stage 3 prose safety gate (`check_stage3_safety_gate`)
 * The structured Stage 3 test-plan writer, deterministic referential validation against the real Stage 2 graph/KCAG report/technique index, and prose/JSON cross-artifact consistency
 * The structured Stage 4 execution-plan writer, deterministic Stage 3 test-binding validation (categories, Stage 2 vectors, KCAG path, technique IDs, criteria inheritance across split actions), structured Phase 0 safety-gate coverage, and prose/JSON cross-artifact consistency
+* The Purple Team compiler's run trust boundary (Stage 4 `PASS`, a passing validation report, cross-run/cross-corpus stamp rejection), structured compilation into one record per Stage 4 action, the Atomic Red Team crosswalk, the isolated legacy Markdown parser (never triggered automatically), and the Sigma generator's run-scoped manifest — none of these tests perform live network or LLM calls
+* The Streamlit dashboard's run selector, and its three views reading real, compiled run-scoped Purple Team artifacts (via `streamlit.testing.v1.AppTest`, which runs the actual app code in a simulated session) — including the coverage-map status-color mapping and graceful handling of a run with no Purple artifacts yet
 
 The live model pipeline is significantly more expensive and less deterministic than the unit tests. Use mocked or fixture-based tests for routine development wherever practical.
 
@@ -1472,9 +1471,8 @@ Current limitations include:
 * The final defense-in-depth safety check still runs after the Stage 4 human-input prompt, so it cannot intercept that specific approval (the pre-Stage-4 gate is what actually runs before it, and does intercept).
 * The attribution-boundary check is advisory rather than blocking.
 * The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
-* The Purple Team tools still use flat compatibility paths under `outputs/`.
-* The Purple Team compiler still parses `stage4_mission_plan.md` prose with formatting-sensitive regular expressions rather than consuming the new run-scoped `stage4_execution_plan.json`; that migration is planned as a separate follow-on commit.
-* The Purple Team compiler retrieves the Atomic Red Team index from the internet.
+* `VETTED_REFERENCE_AVAILABLE` in the Purple Team crosswalk means a published Atomic Red Team test exists for that technique ID — it does not mean the test is approved, safe, applicable, or ready for this specific environment. The Purple operator still decides that.
+* The Purple Team compiler retrieves the Atomic Red Team index from the internet when no local cache exists.
 * The project has not been qualified for safety-critical or operational deployment.
 
 ---
@@ -1664,33 +1662,31 @@ outputs/<run_id>/phase0_safety_check.md
 
 Do not satisfy the checker by adding keywords without completing the underlying safety, authorization, abort, and rollback review.
 
-### Purple Team compiler cannot find Stage 4
+### Purple Team compiler rejects a run
 
-Copy the selected run's Stage 4 plan into the current compatibility path:
+The compiler enforces the same trust boundary the structured Stage 4 gate exists to create: Stage 4 status must be `PASS`, and `stage4_execution_plan_validation.json` must report `is_valid: true`. Its error message names exactly which of these failed.
 
-```bash
-export VANGUARD_RUN_ID=<run_id>
-
-cp \
-  "outputs/${VANGUARD_RUN_ID}/stage4_mission_plan.md" \
-  outputs/stage4_mission_plan.md
-```
-
-Then run:
+For a run that predates structured Stage 4 (no `stage4_execution_plan.json` at all), use the explicit legacy compatibility flag rather than trying to work around the check:
 
 ```bash
-python src/purple/purple_compiler.py
+python -m src.purple.purple_compiler \
+  --run-id <run_id> \
+  --legacy-markdown "outputs/<run_id>/stage4_mission_plan.md"
 ```
 
-### Dashboard is empty
+There is no automatic fallback to Markdown parsing — a missing or invalid structured plan is always an error unless `--legacy-markdown` is passed explicitly.
 
-Confirm that the Purple Team artifacts exist:
+### Dashboard shows no data for a run
+
+Confirm the Purple Team compiler and Sigma generator have both been run for the run selected in the dashboard's sidebar:
 
 ```bash
-ls -l outputs/purple_scaffold.json
-ls -l outputs/kcag_data.json
-find outputs/sigma_rules -type f
+ls -l outputs/<run_id>/purple_scaffold.json
+ls -l outputs/<run_id>/purple_graph.json
+find outputs/<run_id>/sigma_rules -type f
 ```
+
+Each dashboard view reports plainly (not silently) when its underlying artifact is missing for the selected run. If the run doesn't appear in the sidebar selector at all, confirm `outputs/<run_id>/assessment_state.json` exists — that's what the selector uses to discover runs.
 
 Then start:
 
@@ -1783,7 +1779,7 @@ The current development priorities are:
 
 * Make the Quantitative KCAG review's disposition enforceable (a human-approved blocking path when it recommends Stage 2 regeneration, rather than advisory-only)
 * Convert Stage 3 into structured test-plan drafting (structured JSON schema, deterministic referential validation, and prose/JSON consistency checking are already implemented — `src/stage3_schema.py`, `src/stage3_validation.py`)
-* Update Purple Team tools to consume run-scoped artifacts directly
+* Convert Stage 4 into a structured execution plan with the same treatment (done — `src/stage4_schema.py`, `src/stage4_validation.py`), and migrate the Purple Team compiler, Sigma generator, and dashboard to consume it directly (done — `src/purple/purple_compiler.py`, `src/purple/sigma_generator.py`, `src/ui/dashboard.py` and its components)
 
 The project's intended direction is:
 

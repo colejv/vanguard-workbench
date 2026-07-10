@@ -23,11 +23,21 @@ import json
 import os
 import runpy
 import sys
+from pathlib import Path
 
 import pytest
 import crewai
 
 from src import run_context
+
+# Captured at module import time, before any test's monkeypatch.chdir() can
+# run -- resolves to the real repo root regardless of whose machine this
+# runs on. The earlier version of this fixture hardcoded an absolute path
+# into a specific development sandbox (/home/claude/split_test_final/...),
+# which only ever worked in that one environment. This is the actual fix,
+# not a workaround: no path in this file should ever be specific to any
+# one machine again.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 STAGE0_SIGNATURES = [{"signature_id": "S-T-01", "category": "technical", "description": "x",
                       "confidence": "HIGH", "deceive_candidate": False, "is_gap": False}]
@@ -148,8 +158,40 @@ def pipeline_workspace(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("sources", exist_ok=True)
     os.makedirs("collection", exist_ok=True)
-    shutil.copytree("/home/claude/split_test_final/corpus-index", "corpus-index")
-    shutil.copytree("/home/claude/split_test_final/config", "config")
+    os.makedirs("corpus-index", exist_ok=True)
+    os.makedirs("config", exist_ok=True)
+
+    # Constructed inline rather than copied from anywhere -- the mocked
+    # pipeline's fixtures only ever reference technique ID T1078, so a
+    # full copy of the real (much larger) technique_index.json would be
+    # both unnecessary and another way for this test to depend on
+    # something outside itself. Read via a relative file path
+    # (verify_stage2_vectors), so this is resolved against the real,
+    # current OS-level cwd (tmp_path, after chdir above) -- unlike a
+    # Python import, a plain file open() genuinely does follow chdir.
+    json.dump(
+        {"T1078": {"id": "T1078", "name": "Valid Accounts", "description": "existing credentials"}},
+        open("corpus-index/technique_index.json", "w"),
+    )
+
+    # config/llm.py is NOT recreated here. It's resolved via `from
+    # config.llm import light_llm, reason_llm` inside src/agents.py --
+    # a Python import, which depends on sys.path, not the OS-level cwd.
+    # pytest already puts the real repo root (where config/llm.py
+    # actually, permanently lives) on sys.path at collection time;
+    # writing a second copy into tmp_path after chdir would only be
+    # reachable by relative *file* lookups, never by `import config.llm`
+    # itself, so it was dead code that happened to look like it worked.
+
+    # bbn_priors.json genuinely needs its real content -- Annex C runs an
+    # actual BBN computation against it during the mocked pipeline run.
+    # Read via a relative file path (bbn_threat_score's own default),
+    # so -- like technique_index.json above -- this one correctly
+    # depends on cwd and must be physically present under tmp_path.
+    # Copied from the real repo, located relative to this test file's
+    # own path rather than any hardcoded machine-specific one.
+    shutil.copy(_REPO_ROOT / "config" / "bbn_priors.json", "config/bbn_priors.json")
+
     content = "# PAI Finding\nLTC Brinkman serves as 25ID S6 lead.\n"
     open("sources/pai_signal.md", "w").write(content)
     manifest = {

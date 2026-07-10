@@ -10,7 +10,8 @@ import hashlib
 
 from src import run_context
 from src.bbn_model import evaluate_bbn_model
-from src.bbn_sensitivity import run_bbn_sensitivity, canonical_json_sha256
+from src.bbn_sensitivity import run_bbn_sensitivity
+from src.state import canonical_json_sha256
 from src.bbn_validation import (
     validate_bbn_assessment_config,
     validate_bbn_priors_document,

@@ -9,10 +9,8 @@ already established for load_art_index's network fetch and the LLM call
 in generate_sigma_rule -- both are designed to be pure functions of their
 inputs once the network/LLM boundary is injected out.
 
-I have not seen this project's existing tests/ directory or its fixture
-conventions -- this file uses plain pytest with no external fixtures, so
-it should drop in cleanly, but import paths or naming may need a small
-adjustment to match whatever conventions are already established there.
+This file is integrated into the project's tests/ directory and uses its
+real fixtures and modules directly.
 """
 import copy
 import json
@@ -23,7 +21,8 @@ import pytest
 
 from src import run_context
 from src.schemas import StageStatus
-from src.state import init_assessment_state, save_assessment_state, set_stage_status, run_output_dir
+from src.state import (init_assessment_state, save_assessment_state, set_stage_status, run_output_dir,
+                       canonical_json_sha256, load_assessment_state)
 from src.purple.purple_compiler import (
     load_structured_stage4_run,
     compile_structured_plan,
@@ -34,6 +33,7 @@ from src.purple.purple_compiler import (
     write_purple_artifacts,
     PurpleActionRecord,
     build_arg_parser as build_compiler_arg_parser,
+    main as compiler_main,
 )
 from src.purple.sigma_generator import (
     generate_rules_for_run,
@@ -70,8 +70,15 @@ FAKE_ART_INDEX = {
 }
 
 
+MINIMAL_STAGE3_PLAN_FOR_HASHING = {
+    "schema_version": 1, "plan_title": "Minimal Stage 3 Plan",
+    "test_concepts": [], "assessment_safety_review": {"category_2_3_present": False, "covered_test_ids": []},
+}
+
+
 def _setup_run(tmp_path, run_id="vaf-test", *, stage4_status=StageStatus.PASS,
-               plan=None, validation_is_valid=True, corpus_hash="sha256:testcorpus"):
+               plan=None, validation_is_valid=True, corpus_hash="sha256:testcorpus",
+               stage3_plan=None, include_source_identity=True, matching_hashes=True):
     base = str(tmp_path / "outputs")
     out_dir = run_output_dir(run_id, base)
     run_context.set_active_run(run_id, corpus_hash, out_dir)
@@ -81,8 +88,15 @@ def _setup_run(tmp_path, run_id="vaf-test", *, stage4_status=StageStatus.PASS,
     save_assessment_state(state, run_id, base=base)
     if plan is not None:
         run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan.json"), plan)
-        run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan_validation.json"),
-                                       {"is_valid": validation_is_valid})
+        s3_plan = stage3_plan if stage3_plan is not None else MINIMAL_STAGE3_PLAN_FOR_HASHING
+        run_context.write_stamped_json(run_context.artifact_path("stage3_test_plan.json"), s3_plan)
+        validation_report = {"is_valid": validation_is_valid}
+        if include_source_identity:
+            validation_report["source_identity"] = {
+                "stage4_execution_plan_sha256": canonical_json_sha256(plan if matching_hashes else {"different": True}),
+                "stage3_test_plan_sha256": canonical_json_sha256(s3_plan if matching_hashes else {"different": True}),
+            }
+        run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan_validation.json"), validation_report)
     run_context.reset_active_run()
     return base, out_dir
 
@@ -168,6 +182,53 @@ def test_cross_corpus_execution_plan_is_rejected(tmp_path):
 def test_failed_stage4_validation_report_is_rejected(tmp_path):
     base, _ = _setup_run(tmp_path, plan=VALID_STAGE4_PLAN, validation_is_valid=False)
     with pytest.raises(RuntimeError, match="is_valid=True"):
+        load_structured_stage4_run("vaf-test", base=base)
+
+
+def test_validation_report_binds_exact_stage4_plan(tmp_path):
+    """A validation report with no source_identity at all must be
+    rejected -- an unbound report can't prove it validated THIS plan."""
+    base, _ = _setup_run(tmp_path, plan=VALID_STAGE4_PLAN, include_source_identity=False)
+    with pytest.raises(RuntimeError, match="does not identify the execution plan"):
+        load_structured_stage4_run("vaf-test", base=base)
+
+
+def test_same_run_rewritten_stage4_plan_is_rejected(tmp_path):
+    """The actual swap attack: a validated plan is replaced, same run,
+    same corpus stamp, still schema-valid -- but the content differs
+    from what the (stale) validation report actually checked."""
+    base, out_dir = _setup_run(tmp_path, plan=VALID_STAGE4_PLAN)
+    run_context.set_active_run("vaf-test", "sha256:testcorpus", out_dir)
+    swapped_plan = copy.deepcopy(VALID_STAGE4_PLAN)
+    swapped_plan["plan_title"] = "SWAPPED -- NOT WHAT WAS VALIDATED"
+    run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan.json"), swapped_plan)
+    run_context.reset_active_run()
+    with pytest.raises(RuntimeError, match="has changed since deterministic Stage 4 validation"):
+        load_structured_stage4_run("vaf-test", base=base)
+
+
+def test_validation_report_binds_stage3_source_plan(tmp_path):
+    base, _ = _setup_run(tmp_path, plan=VALID_STAGE4_PLAN, include_source_identity=False)
+    # include_source_identity=False already covers the "no source_identity at
+    # all" case above; here, confirm the specific stage3 sub-key matters too.
+    base2, out_dir2 = _setup_run(tmp_path, run_id="vaf-test2", plan=VALID_STAGE4_PLAN)
+    run_context.set_active_run("vaf-test2", "sha256:testcorpus", out_dir2)
+    report = run_context.read_stamped_json(run_context.artifact_path("stage4_execution_plan_validation.json"))
+    del report["source_identity"]["stage3_test_plan_sha256"]
+    run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan_validation.json"), report)
+    run_context.reset_active_run()
+    with pytest.raises(RuntimeError, match="does not identify.*Stage 3 test plan"):
+        load_structured_stage4_run("vaf-test2", base=base2)
+
+
+def test_same_run_rewritten_stage3_plan_is_rejected(tmp_path):
+    base, out_dir = _setup_run(tmp_path, plan=VALID_STAGE4_PLAN)
+    run_context.set_active_run("vaf-test", "sha256:testcorpus", out_dir)
+    swapped_stage3 = dict(MINIMAL_STAGE3_PLAN_FOR_HASHING)
+    swapped_stage3["plan_title"] = "SWAPPED STAGE 3 PLAN"
+    run_context.write_stamped_json(run_context.artifact_path("stage3_test_plan.json"), swapped_stage3)
+    run_context.reset_active_run()
+    with pytest.raises(RuntimeError, match="stage3_test_plan.json has changed"):
         load_structured_stage4_run("vaf-test", base=base)
 
 
@@ -438,6 +499,36 @@ def test_missing_structured_plan_does_not_auto_fallback(tmp_path):
         load_structured_stage4_run("vaf-test", base=base)
 
 
+def test_legacy_mode_requires_existing_assessment_state(tmp_path, monkeypatch):
+    """--legacy-markdown compensates for a missing stage4_execution_plan.json,
+    not for a run ID with no real assessment_state.json at all."""
+    import src.purple.purple_compiler as pc
+    monkeypatch.setattr(pc, "load_art_index", lambda refresh=False: {})
+    monkeypatch.chdir(tmp_path)
+    prose_path = tmp_path / "legacy.md"
+    prose_path.write_text(LEGACY_PROSE)
+    with pytest.raises(RuntimeError, match="No assessment_state.json found"):
+        compiler_main(["--run-id", "vaf-nonexistent", "--legacy-markdown", str(prose_path)])
+
+
+def test_legacy_mode_uses_state_corpus_hash(tmp_path, monkeypatch):
+    import src.purple.purple_compiler as pc
+    monkeypatch.setattr(pc, "load_art_index", lambda refresh=False: {})
+    monkeypatch.chdir(tmp_path)
+
+    run_context.set_active_run("vaf-legacy-real", "sha256:the-real-corpus-hash", str(tmp_path / "outputs" / "vaf-legacy-real"))
+    state = init_assessment_state("vaf-legacy-real", "sha256:the-real-corpus-hash")
+    save_assessment_state(state, "vaf-legacy-real")
+    run_context.reset_active_run()
+
+    prose_path = tmp_path / "legacy.md"
+    prose_path.write_text(LEGACY_PROSE)
+    compiler_main(["--run-id", "vaf-legacy-real", "--legacy-markdown", str(prose_path)])
+
+    written = json.load(open(tmp_path / "outputs" / "vaf-legacy-real" / "purple_scaffold.json"))
+    assert written["_meta"]["corpus_manifest_hash"] == "sha256:the-real-corpus-hash"
+
+
 def test_legacy_parser_requires_explicit_flag():
     """Structural confirmation: parse_legacy_mdmp_plan is never called by
     load_structured_stage4_run or compile_structured_plan -- the only
@@ -596,6 +687,30 @@ def test_sigma_skips_actions_without_detection_criteria(tmp_path):
 
     manifest = generate_rules_for_run("vaf-test", base=base, rule_generator=_fake_rule_generator)
     assert len(manifest["rules"]) == 0
+
+
+def test_sigma_generation_failure_writes_error_txt_not_yml(tmp_path):
+    """A failed LLM call must never produce a .yml file -- downstream
+    tooling that globs sigma_rules/*.yml could otherwise mistake
+    'ERROR generating rule: ...' text for a real detection rule."""
+    base, out_dir = _setup_run(tmp_path, plan=VALID_STAGE4_PLAN)
+    ctx = load_structured_stage4_run("vaf-test", base=base)
+    records = compile_structured_plan(ctx.execution_plan)
+    write_purple_artifacts(ctx, records, FAKE_ART_INDEX, legacy=False)
+    run_context.reset_active_run()
+
+    def failing_generator(**kwargs):
+        return "ERROR generating rule: connection refused"
+
+    manifest = generate_rules_for_run("vaf-test", base=base, rule_generator=failing_generator)
+    assert manifest["rules"][0]["status"] == "GENERATION_FAILED"
+    assert manifest["rules"][0]["path"].endswith(".error.txt")
+    assert not manifest["rules"][0]["path"].endswith(".yml")
+
+    rules_dir = os.path.join(out_dir, "sigma_rules")
+    written_files = os.listdir(rules_dir)
+    assert not any(f.endswith(".yml") for f in written_files)
+    assert any(f.endswith(".error.txt") for f in written_files)
 
 
 # ---------------------------------------------------------------------------

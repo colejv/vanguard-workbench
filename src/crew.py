@@ -15,7 +15,8 @@ from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status,
                         finalize_stage4_state, enforce_stage3_safety_gate,
-                        enforce_stage3_test_plan_validation, enforce_stage4_execution_plan_validation)
+                        enforce_stage3_test_plan_validation, enforce_stage4_execution_plan_validation,
+                        canonical_json_sha256)
 from src import run_context
 from src.heartbeat import heartbeat
 
@@ -719,6 +720,19 @@ if __name__ == "__main__":
                                                       execution_plan=stage4_plan)
     stage4_validation_report = {
         "is_valid": plan_validation4["is_valid"] and consistency4["is_consistent"],
+        "source_identity": {
+            # Binds this report to the EXACT plan contents it validated --
+            # canonical (sorted-key) content hash, not a Python repr, so
+            # the check below can't be defeated by re-serializing the
+            # same data with different key order. Without this, a
+            # same-run Plan A -> Plan B swap after validation would pass
+            # every check load_structured_stage4_run() previously ran
+            # (state PASS, stamps matching, current schema valid) while
+            # Plan B's Stage 3 bindings/inherited criteria/safety
+            # controls were never actually checked against anything.
+            "stage4_execution_plan_sha256": canonical_json_sha256(stage4_plan),
+            "stage3_test_plan_sha256": canonical_json_sha256(stage3_plan),
+        },
         "plan_validation": plan_validation4,
         "artifact_consistency": consistency4,
     }

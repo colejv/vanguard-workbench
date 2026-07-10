@@ -46,6 +46,19 @@ def hash_file(path: str) -> str:
     return f"sha256:{digest}"
 
 
+def canonical_json_sha256(value: object) -> str:
+    """sha256:<hex> of canonical (sorted-key, compact) JSON -- not a
+    Python repr, and not dependent on key insertion order. Two
+    structurally-identical dicts always hash identically. Used to bind
+    a validation report to the exact in-memory artifact it validated
+    (e.g. stage4_execution_plan_validation.json's source_identity),
+    the same way hash_file() above binds a report to an exact file on
+    disk."""
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 def init_assessment_state(run_id: str, corpus_manifest_hash: str) -> AssessmentState:
     """Create a fresh AssessmentState for a new run. Does not write to disk —
     call save_assessment_state() separately, same two-step pattern as

@@ -33,7 +33,7 @@ import yaml
 from src import run_context
 from src.schemas import StageStatus
 from src.stage4_schema import Stage4ExecutionPlan
-from src.state import load_assessment_state, run_output_dir
+from src.state import load_assessment_state, run_output_dir, canonical_json_sha256
 
 ART_INDEX_URL = "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/Indexes/index.yaml"
 CACHE_DIR = "corpus-index"
@@ -103,14 +103,17 @@ def load_structured_stage4_run(run_id: str, *, base: str = "outputs") -> PurpleR
 
     Requires: Stage 4 state == PASS, AND the structured validation
     report == PASS, AND the structured artifact's run/corpus stamp
-    matches the active run (the last of these is enforced automatically
-    by run_context.read_stamped_json -- it raises on any run_id or
-    corpus_manifest_hash mismatch, not just directory placement).
+    matches the active run (enforced automatically by
+    run_context.read_stamped_json), AND the current
+    stage4_execution_plan.json and stage3_test_plan.json hash exactly to
+    the values the validation report recorded when it ran.
 
     This protects against: running Purple compilation before the
     assessment finishes; compiling a rejected Stage 4 plan; manually
-    copying an artifact from another run; replacing the structured file
-    after validation; using an artifact from a different corpus.
+    copying an artifact from another run; using an artifact from a
+    different corpus; and -- the hash checks specifically -- a same-run
+    swap where a validated Plan A is replaced by a merely schema-valid
+    Plan B that was never actually checked against Stage 3.
     """
     try:
         state = load_assessment_state(run_id, base=base)
@@ -151,9 +154,59 @@ def load_structured_stage4_run(run_id: str, *, base: str = "outputs") -> PurpleR
             f"is_valid=True. Purple Team compilation refuses a rejected Stage 4 plan."
         )
 
-    # Defense in depth against schema drift or a manually edited file
-    # between validation time and now -- re-validate against the CURRENT
-    # schema, don't just trust the stamp.
+    # ---- Bind this exact plan to the exact plan the report validated ----
+    # Without this, a same-run swap is possible: Plan A passes full Stage
+    # 3 referential validation and gets a passing report written; Plan A
+    # is then replaced by a DIFFERENT, merely schema-valid Plan B; Plan B
+    # still satisfies Stage4ExecutionPlan's Pydantic shape, still carries
+    # the same run/corpus stamp, and the (stale) report still says
+    # is_valid=True -- none of the checks above would catch that Plan B's
+    # Stage 3 bindings, inherited criteria, or safety controls were never
+    # actually checked against anything. A hash mismatch here is not a
+    # corruption warning; it means the plan on disk is not the plan that
+    # was validated, and compiling it would defeat the entire point of
+    # the structured Stage 4 trust boundary.
+    source_identity = validation.get("source_identity") or {}
+    expected_plan_hash = source_identity.get("stage4_execution_plan_sha256")
+    if not expected_plan_hash:
+        raise RuntimeError(
+            f"Run '{run_id}' stage4_execution_plan_validation.json does not identify "
+            f"the execution plan it validated (missing source_identity.stage4_execution_"
+            f"plan_sha256). Refusing to trust an unbound validation report."
+        )
+    actual_plan_hash = canonical_json_sha256(plan)
+    if actual_plan_hash != expected_plan_hash:
+        raise RuntimeError(
+            f"Run '{run_id}' stage4_execution_plan.json has changed since deterministic "
+            f"Stage 4 validation ran (hash mismatch). Refusing to compile an execution "
+            f"plan that does not match its own validation report."
+        )
+
+    stage3_plan_path = run_context.artifact_path("stage3_test_plan.json")
+    try:
+        stage3_plan = run_context.read_stamped_json(stage3_plan_path)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{stage3_plan_path} not found. A run that reached Stage 4 PASS must have "
+            f"a Stage 3 test plan -- refusing to compile without it."
+        )
+    expected_stage3_hash = source_identity.get("stage3_test_plan_sha256")
+    if not expected_stage3_hash:
+        raise RuntimeError(
+            f"Run '{run_id}' stage4_execution_plan_validation.json does not identify "
+            f"the Stage 3 test plan it validated against (missing source_identity."
+            f"stage3_test_plan_sha256). Refusing to trust an unbound validation report."
+        )
+    if canonical_json_sha256(stage3_plan) != expected_stage3_hash:
+        raise RuntimeError(
+            f"Run '{run_id}' stage3_test_plan.json has changed since deterministic "
+            f"Stage 4 validation ran (hash mismatch). Refusing to compile against a "
+            f"Stage 3 test plan that does not match what Stage 4 was actually validated "
+            f"against."
+        )
+
+    # Defense in depth against schema drift -- re-validate against the
+    # CURRENT schema, don't just trust the stamp and the hash match.
     Stage4ExecutionPlan.model_validate(plan)
 
     return PurpleRunContext(run_id=run_id, out_dir=out_dir, state=state,
@@ -484,13 +537,15 @@ def main(argv=None) -> None:
 
     if args.legacy_markdown:
         out_dir = run_output_dir(args.run_id)
-        corpus_hash = "sha256:legacy-unknown"
         try:
             state = load_assessment_state(args.run_id)
-            corpus_hash = state.corpus_manifest_hash
         except FileNotFoundError:
-            pass
-        run_context.set_active_run(args.run_id, corpus_hash, out_dir)
+            raise RuntimeError(
+                f"No assessment_state.json found for run '{args.run_id}'. "
+                f"--legacy-markdown compensates for a missing stage4_execution_plan.json, "
+                f"not for a run ID that doesn't belong to a real Vanguard assessment."
+            )
+        run_context.set_active_run(args.run_id, state.corpus_manifest_hash, out_dir)
 
         print(f"Parsing legacy Markdown plan: {args.legacy_markdown}")
         records = parse_legacy_mdmp_plan(args.legacy_markdown)

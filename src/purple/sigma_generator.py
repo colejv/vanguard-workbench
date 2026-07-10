@@ -125,13 +125,27 @@ def generate_rules_for_run(run_id: str, *, base: str = "outputs",
         )
         sigma_yaml = sigma_yaml.replace("```yaml", "").replace("```", "").strip()
 
-        filename = f"{_safe_filename_component(action_id)}_{_safe_filename_component(test_id or 'unbound')}.yml"
-        rule_path = os.path.join(rules_dir, filename)
-        with open(rule_path, "w") as f:
-            f.write(sigma_yaml)
-        print(f" -> Saved to {rule_path}")
+        base_filename = f"{_safe_filename_component(action_id)}_{_safe_filename_component(test_id or 'unbound')}"
+        failed = sigma_yaml.startswith("ERROR generating rule")
 
-        status = "GENERATED" if not sigma_yaml.startswith("ERROR generating rule") else "GENERATION_FAILED"
+        if failed:
+            # Write the failure to a .error.txt, never a .yml -- a YAML
+            # file containing "ERROR generating rule: ..." can look like
+            # a real rule to downstream tooling that just globs
+            # sigma_rules/*.yml, even though it isn't one.
+            filename = f"{base_filename}.error.txt"
+            rule_path = os.path.join(rules_dir, filename)
+            with open(rule_path, "w") as f:
+                f.write(sigma_yaml)
+            print(f" -> Generation failed; details saved to {rule_path}")
+        else:
+            filename = f"{base_filename}.yml"
+            rule_path = os.path.join(rules_dir, filename)
+            with open(rule_path, "w") as f:
+                f.write(sigma_yaml)
+            print(f" -> Saved to {rule_path}")
+
+        status = "GENERATION_FAILED" if failed else "GENERATED"
         manifest_rules.append({
             "action_id": action_id, "test_id": test_id,
             "path": f"sigma_rules/{filename}", "status": status,

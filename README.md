@@ -1202,6 +1202,8 @@ After Stage 4 completes, Vanguard deterministically validates the structured exe
 
 This necessarily runs after Stage 4's own human-input approval — both Stage 4 artifacts are products of that task and cannot exist before it — so it cannot intercept that review. It can, and does, prevent the run from completing on top of a plan that silently dropped, altered, or invented a Stage 3 test concept.
 
+The validation report records `source_identity` — canonical content hashes of the exact `stage4_execution_plan.json` and `stage3_test_plan.json` it validated. This is what the Purple Team compiler later checks to confirm the plan it's about to compile is the exact plan this validation ran against, not a same-run replacement — see [Purple Team Workflow](#purple-team-workflow).
+
 Output:
 
 ```text
@@ -1241,7 +1243,7 @@ Vanguard includes a separate Purple Team workflow for:
 No prose parsing occurs in the default path. The compiler reads `stage4_execution_plan.json` directly — the same structured artifact the deterministic Stage 4 validator already checked against Stage 3 before the run could reach `PASS`.
 
 > [!IMPORTANT]
-> **Purple Team output must derive from the exact structured Stage 4 plan that passed deterministic validation for the selected run — not from a copied, regex-parsed prose file.** The compiler enforces this: it requires Stage 4 status `PASS`, requires `stage4_execution_plan_validation.json` to report `is_valid: true`, and (via the same stamped-JSON mechanism used throughout the pipeline) refuses an artifact copied in from a different run or a different corpus. A missing or invalid structured plan is an error — the compiler never silently falls back to Markdown parsing.
+> **Purple Team output must derive from the exact structured Stage 4 plan that passed deterministic validation for the selected run — not from a copied, regex-parsed prose file.** The compiler enforces this: it requires Stage 4 status `PASS`, requires `stage4_execution_plan_validation.json` to report `is_valid: true`, and (via the same stamped-JSON mechanism used throughout the pipeline) refuses an artifact copied in from a different run or a different corpus. It also hashes the current `stage4_execution_plan.json` and `stage3_test_plan.json` and compares them against the content hashes the validation report recorded when it ran — a plan that was replaced *after* validation, even within the same run and with matching stamps, is rejected, since a same-run swap to a merely schema-valid plan would otherwise defeat the entire point of this boundary. A missing or invalid structured plan is an error — the compiler never silently falls back to Markdown parsing.
 
 ### Run the Purple Team compiler
 

@@ -22,7 +22,8 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from src import run_context
-from src.state import init_assessment_state, save_assessment_state, set_stage_status, run_output_dir
+from src.state import (init_assessment_state, save_assessment_state, set_stage_status, run_output_dir,
+                       canonical_json_sha256)
 from src.schemas import StageStatus
 from src.purple.purple_compiler import load_structured_stage4_run, compile_structured_plan, write_purple_artifacts
 from src.purple.sigma_generator import generate_rules_for_run
@@ -59,6 +60,10 @@ VALID_STAGE4_PLAN = {
 }
 
 FAKE_ART_INDEX = {"T1078": {"technique_name": "Valid Accounts", "test_count": 3, "test_names": ["A", "B", "C"]}}
+MINIMAL_STAGE3_PLAN_FOR_HASHING = {
+    "schema_version": 1, "plan_title": "Minimal Stage 3 Plan",
+    "test_concepts": [], "assessment_safety_review": {"category_2_3_present": False, "covered_test_ids": []},
+}
 
 
 def _fake_rule_generator(**kwargs):
@@ -85,7 +90,14 @@ def full_run(tmp_path, monkeypatch):
     set_stage_status(state, "stage4", StageStatus.PASS)
     save_assessment_state(state, "vaf-dashboard-test")
     run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan.json"), VALID_STAGE4_PLAN)
-    run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan_validation.json"), {"is_valid": True})
+    run_context.write_stamped_json(run_context.artifact_path("stage3_test_plan.json"), MINIMAL_STAGE3_PLAN_FOR_HASHING)
+    run_context.write_stamped_json(run_context.artifact_path("stage4_execution_plan_validation.json"), {
+        "is_valid": True,
+        "source_identity": {
+            "stage4_execution_plan_sha256": canonical_json_sha256(VALID_STAGE4_PLAN),
+            "stage3_test_plan_sha256": canonical_json_sha256(MINIMAL_STAGE3_PLAN_FOR_HASHING),
+        },
+    })
     run_context.reset_active_run()
 
     ctx = load_structured_stage4_run("vaf-dashboard-test")

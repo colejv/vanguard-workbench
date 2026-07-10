@@ -14,12 +14,12 @@ error margins, standard deviations, or credible intervals. Do not describe
 them that way anywhere in this module or its output.
 """
 import copy
-import hashlib
 import json
 import math
 from typing import Any
 
 from src.bbn_model import evaluate_bbn_model, BBNEvaluation
+from src.state import canonical_json_sha256
 from src.bbn_validation import (
     validate_bbn_assessment_config,
     validate_bbn_priors_document,
@@ -104,15 +104,6 @@ def total_variation_distance(baseline: list, scenario: list) -> float:
     """0.5 * L1 distance between two discrete distributions of equal
     length. Descriptive only -- no LOW/MEDIUM/HIGH label is assigned."""
     return 0.5 * sum(abs(c - o) for o, c in zip(baseline, scenario))
-
-
-def canonical_json_sha256(value: Any) -> str:
-    """Hash canonical (sorted-key, compact) JSON, not a Python repr --
-    two structurally-identical dicts always hash identically regardless
-    of key insertion order."""
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"),
-                         ensure_ascii=False, allow_nan=False).encode("utf-8")
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def _round_list(values: list, ndigits: int = 4) -> list:

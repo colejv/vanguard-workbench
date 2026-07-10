@@ -273,3 +273,49 @@ def enforce_stage3_test_plan_validation(
         f"Stage 4 was not constructed. Run audit trail: "
         f"{run_output_dir(run_id, base)}/assessment_state.json"
     )
+
+
+def enforce_stage4_execution_plan_validation(
+    state: AssessmentState,
+    run_id: str,
+    *,
+    is_valid: bool,
+    summary: str,
+    base: str = "outputs",
+) -> None:
+    """
+    Single production implementation of the structured Stage 4
+    execution-plan gate's state transition. Runs BEFORE the existing
+    final Phase 0 prose check and finalize_stage4_state() in crew.py's
+    real wiring, but necessarily AFTER stage4_crew.kickoff() and its
+    human_input approval -- both Stage 4 artifacts are products of that
+    task and cannot exist before it, so this gate cannot intercept the
+    human review itself, only prevent the run from completing on top of
+    a plan that silently dropped, altered, or invented a Stage 3 test
+    concept, weakened an inherited requirement, or weakened the approved
+    Category 2/3 termination time or approving roles.
+
+    Deliberately does NOT mark Stage 4 PASS on success -- only FAIL, on
+    failure. finalize_stage4_state() remains the single place that owns
+    the transition to PASS (and to current_stage='complete'); this
+    function's job is narrower: block final completion on a structural
+    or cross-artifact failure, without pre-empting that later decision.
+    Exact mirror of enforce_stage3_test_plan_validation's separation of
+    concerns relative to enforce_stage3_safety_gate.
+
+    Does NOT call validate_stage4_execution_plan() or
+    check_stage4_artifact_consistency() itself and does NOT write the
+    stamped validation report artifact -- the caller (crew.py) computes
+    is_valid from those checks and writes the report BEFORE calling this.
+    """
+    if is_valid:
+        return
+
+    set_stage_status(state, "stage4", StageStatus.FAIL)
+    state.current_stage = "stage4"
+    save_assessment_state(state, run_id, base)
+    raise RuntimeError(
+        f"Stage 4 structured execution-plan validation FAILED: {summary} "
+        f"Run was not finalized. Run audit trail: "
+        f"{run_output_dir(run_id, base)}/assessment_state.json"
+    )

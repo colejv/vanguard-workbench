@@ -6,7 +6,8 @@ from src.agents import (researcher, decomposer, mapper,
                         modeler, red_team_lead, orchestrator)
 from src.tools import (lookup_technique, kcag_min_cut, bbn_threat_score,
                        extract_to_scratch, read_scratch, write_stage2_vectors,
-                       write_stage0_output, write_stage1_output, write_stage3_test_plan)
+                       write_stage0_output, write_stage1_output, write_stage3_test_plan,
+                       write_stage4_execution_plan)
 
 
 def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
@@ -566,11 +567,41 @@ def build_stage4_task(out_dir: str, stage3_content: str, stage3_test_plan: dict)
             "'NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED.' Do not simply omit the "
             "section — its absence must always be a deliberate, stated conclusion, never a silent gap. "
             "A deterministic check reads this output for exactly this language after you finish; an "
-            "omitted or ambiguous safety-gate statement on a Category 2/3 payload set will halt the run."
+            "omitted or ambiguous safety-gate statement on a Category 2/3 payload set will halt the run.\n\n"
+            "CRITICAL INSTRUCTION — STRUCTURED STAGE 4 PLAN: after drafting the human-readable MDMP plan "
+            "above, call `write_stage4_execution_plan` exactly once. The Markdown and structured JSON must "
+            "describe the same phases, actions, test concepts, safety disposition, telemetry requirements, "
+            "and abort controls — do not add a phase or action to one and omit it from the other.\n"
+            "  The structured Stage 3 test plan (embedded above) remains authoritative for test IDs, "
+            "categories, Stage 2 vector references, KCAG paths, execution technique references, success "
+            "criteria, abort criteria, recovery requirements, telemetry requirements, and Category 2/3 "
+            "safety controls. You may sequence and elaborate those concepts across one or more actions, "
+            "but you may not add a new test concept, remove an approved concept, weaken an inherited abort "
+            "or recovery requirement, invent a framework ID, or change a test's category.\n"
+            "  Every Stage 4 action must: have a unique ACT-NNN identifier; reference exactly one existing "
+            "RT-NNN test concept; identify responsible roles; state preconditions; carry measurable success "
+            "criteria; carry explicit abort criteria; carry rollback or recovery steps; identify telemetry "
+            "requirements; identify one or more alert triggers; identify OPSEC measures. Every Stage 3 test "
+            "concept requires at least one action — a concept may be split across multiple actions or phases "
+            "as long as their combined fields still cover everything Stage 3 required for that concept.\n"
+            "  Each phase requires a unique PHASE-NN identifier, and phase sequence numbers must be "
+            "contiguous starting at 1. The plan itself requires a unique MP-NNN plan_id.\n"
+            "  The JSON must state exactly: `\"artifact_role\": \"HUMAN_REVIEWED_MISSION_PLAN_DRAFT\"` and "
+            "`\"execution_authorization\": \"NOT_GRANTED\"` — this artifact is a planning product and does "
+            "not authorize execution.\n"
+            "  A deterministic gate re-checks every Stage 3 binding, inherited requirement, and Phase 0 "
+            "disposition against the real Stage 3 test plan after this crew finishes — a plan that silently "
+            "drops, alters, or invents a test concept, or weakens the approved maximum termination time or "
+            "required approving roles, will fail that gate even though the writer tool itself may accept "
+            "it now."
         ),
-        expected_output="MDMP-format red team mission plan with phased ATT&CK mapping and Blue Team assessment criteria.",
+        expected_output=(
+            "A human-reviewed MDMP mission plan in stage4_mission_plan.md and confirmation that the "
+            "matching structured execution plan was written to stage4_execution_plan.json."
+        ),
         agent=red_team_lead,
         context=[],
+        tools=[write_stage4_execution_plan],
         human_input=True,
         output_file=f"{out_dir}/stage4_mission_plan.md",
     )

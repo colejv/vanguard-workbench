@@ -104,6 +104,8 @@ Deterministic pre-Stage-4 safety gate
         ↓
 Stage 4 — MDMP-style mission plan
         ↓
+Deterministic structured Stage 4 execution-plan validation
+        ↓
 Final defense-in-depth safety check
         ↓
 Purple Team defensive validation
@@ -659,8 +661,9 @@ The pipeline will:
 18. Validate the structured Stage 3 test plan against the real Stage 2 graph, KCAG report, and technique index. Halt before the pre-Stage-4 safety gate if it fails.
 19. Run the deterministic pre-Stage-4 safety gate. Halt before Stage 4 is even constructed if it fails.
 20. Request human review for Stage 4 — only reached if the gate above passed.
-21. Run the final defense-in-depth Phase 0 safety-language check.
-22. Preserve the artifacts in the run directory.
+21. Validate the structured Stage 4 execution plan against the real Stage 3 test plan. Halt before the final safety check if it fails.
+22. Run the final defense-in-depth Phase 0 safety-language check.
+23. Preserve the artifacts in the run directory.
 
 ### Human-input prompts
 
@@ -791,6 +794,8 @@ outputs/vaf_20260709_143022/
 ├── stage3_test_plan_validation.json
 ├── stage3_safety_gate.json
 ├── stage4_mission_plan.md
+├── stage4_execution_plan.json
+├── stage4_execution_plan_validation.json
 └── phase0_safety_check.md
 ```
 
@@ -1180,17 +1185,34 @@ Stage 4 produces a phased mission plan containing:
 * Detection criteria
 * Safety-gate language where required
 
+Alongside the prose, Stage 4 also writes a structured, machine-checkable execution plan via `write_stage4_execution_plan` — the same phases and actions (phase/action identifiers, one Stage 3 test binding per concept, responsible roles, preconditions, success/abort criteria, recovery steps, telemetry requirements, alert triggers, OPSEC measures, and the Phase 0 safety disposition) in a closed Pydantic schema (`src/stage4_schema.py`). The schema fixes `"execution_authorization": "NOT_GRANTED"` — this artifact is a planning product, and human review of a CrewAI task is not equivalent to signed operational authorization.
+
 Output:
 
 ```text
 stage4_mission_plan.md
+stage4_execution_plan.json
 ```
 
 Stage 4 requires human input. This prompt is only reached if the pre-Stage-4 safety gate above passed.
 
+### Structured Stage 4 validation
+
+After Stage 4 completes, Vanguard deterministically validates the structured execution plan against the real, already-verified Stage 3 test plan (`src/stage4_validation.py`) — every Stage 3 test concept has exactly one binding, and that binding's categories, Stage 2 vector references, KCAG path, and technique references exactly restate what Stage 3 already declared; every Stage 3 concept is assigned to at least one Stage 4 action (a concept may be split across several actions or phases, as long as their combined fields still cover everything Stage 3 required for it — success criteria, abort criteria, recovery steps, telemetry requirements, and preconditions); every action independently carries a responsible role, an alert trigger, and an OPSEC measure; and for a Category 2/3 concept, Stage 4's Phase 0 safety gate cannot weaken the approved maximum termination time or drop a required approving role or assessment-level abort criterion. A separate check confirms the structured plan and the prose describe the same phases and actions, and that the Phase 0 disposition agrees between them.
+
+This necessarily runs after Stage 4's own human-input approval — both Stage 4 artifacts are products of that task and cannot exist before it — so it cannot intercept that review. It can, and does, prevent the run from completing on top of a plan that silently dropped, altered, or invented a Stage 3 test concept.
+
+Output:
+
+```text
+stage4_execution_plan_validation.json
+```
+
+A failing result halts the run before the final defense-in-depth safety check below ever runs.
+
 ### Final defense-in-depth safety check
 
-After Stage 4 completes, Vanguard runs a second, independent check confirming the generated mission plan carries forward the required Phase 0 safety-gate language and does not contradict the already-approved Stage 3 assessment.
+After the structured Stage 4 validation above passes, Vanguard runs a third, independent check confirming the generated mission plan **prose** carries forward the required Phase 0 safety-gate language and does not contradict the already-approved Stage 3 assessment.
 
 Output:
 
@@ -1201,9 +1223,9 @@ phase0_safety_check.md
 A noncompliant result prevents the run from completing successfully.
 
 > [!WARNING]
-> This second check runs after the Stage 4 human-input prompt, so it cannot intercept that approval — it can prevent the run from finalizing, but a human will have already seen and approved the Stage 4 draft by the time it runs.
+> This third check runs after the Stage 4 human-input prompt, so it cannot intercept that approval — it can prevent the run from finalizing, but a human will have already seen and approved the Stage 4 draft by the time it runs.
 >
-> The pre-Stage-4 gate above is the check that actually runs before that prompt. This one exists as defense in depth: it also catches the case where Stage 3 and Stage 4 directly contradict each other (e.g. Stage 3 declares Category 2/3 concepts but Stage 4 claims none apply).
+> The pre-Stage-4 gate is the check that actually runs before that prompt. The structured Stage 4 validation above and this prose check both exist as defense in depth after it: the structured check catches a plan that silently drops or alters a Stage 3 test concept or weakens an approved safety control; this prose check catches the case where Stage 3 and Stage 4 directly contradict each other in the human-readable artifacts (e.g. Stage 3 declares Category 2/3 concepts but Stage 4's prose claims none apply).
 
 ---
 
@@ -1363,6 +1385,7 @@ The current test suite includes coverage for:
 * Deterministic BBN sensitivity analysis (`src/bbn_sensitivity.py`) — scenario generation, evidence masking, driver ranking, and fail-closed behavior on an unexpected scenario failure
 * The Stage 3 prose safety gate (`check_stage3_safety_gate`)
 * The structured Stage 3 test-plan writer, deterministic referential validation against the real Stage 2 graph/KCAG report/technique index, and prose/JSON cross-artifact consistency
+* The structured Stage 4 execution-plan writer, deterministic Stage 3 test-binding validation (categories, Stage 2 vectors, KCAG path, technique IDs, criteria inheritance across split actions), structured Phase 0 safety-gate coverage, and prose/JSON cross-artifact consistency
 
 The live model pipeline is significantly more expensive and less deterministic than the unit tests. Use mocked or fixture-based tests for routine development wherever practical.
 
@@ -1450,6 +1473,7 @@ Current limitations include:
 * The attribution-boundary check is advisory rather than blocking.
 * The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
 * The Purple Team tools still use flat compatibility paths under `outputs/`.
+* The Purple Team compiler still parses `stage4_mission_plan.md` prose with formatting-sensitive regular expressions rather than consuming the new run-scoped `stage4_execution_plan.json`; that migration is planned as a separate follow-on commit.
 * The Purple Team compiler retrieves the Atomic Red Team index from the internet.
 * The project has not been qualified for safety-critical or operational deployment.
 

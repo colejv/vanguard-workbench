@@ -2201,3 +2201,151 @@ def write_stage3_test_plan(test_plan_json: str) -> str:
     return (f"WRITTEN: {output_path} | {len(plan.test_concepts)} test concept(s). "
            f"Deeper referential validation (Stage 2 vectors, KCAG path, technique index) "
            f"runs after this crew completes, not here.")
+
+
+# ============================================================================
+#  write_stage4_execution_plan: structured, machine-readable Stage 4
+#  execution plan (stage4_execution_plan.json), alongside the existing
+#  free-form stage4_mission_plan.md.
+#
+#  Writer-time checks here are deliberately SHALLOW (schema shape, size
+#  ceiling, duplicate IDs, placeholder values) -- the deep, referential
+#  validation against the real, already-verified Stage 3 test plan happens
+#  later, in src/stage4_validation.py, run once by crew.py after
+#  stage4_crew completes (both Stage 4 artifacts are products of that
+#  human-input task and cannot exist before it) and before the existing
+#  final Phase 0 prose check and finalize_stage4_state().
+# ============================================================================
+from src.stage4_schema import Stage4ExecutionPlan
+
+MAX_STAGE4_PHASES = 12
+MAX_STAGE4_ACTIONS = 40
+MAX_STAGE4_LIST_ITEMS_PER_FIELD = 20
+MAX_STAGE4_TEXT_FIELD_LENGTH = 2_000
+
+_STAGE4_ACTION_REQUIRED_STRING_FIELDS = ("action_summary",)
+_STAGE4_ACTION_REQUIRED_LIST_FIELDS = (
+    "responsible_roles", "preconditions", "success_criteria", "abort_criteria",
+    "rollback_or_recovery_steps", "telemetry_requirements", "alert_triggers", "opsec_measures",
+)
+
+
+def _stage4_find_placeholder(plan):
+    if plan.plan_title.strip().lower() in STAGE3_INVALID_VALUES:
+        return f"plan_title is a placeholder value ('{plan.plan_title}')."
+    for phase in plan.phases:
+        if phase.name.strip().lower() in STAGE3_INVALID_VALUES:
+            return f"phases[{phase.phase_id}].name is a placeholder value ('{phase.name}')."
+        if phase.purpose.strip().lower() in STAGE3_INVALID_VALUES:
+            return f"phases[{phase.phase_id}].purpose is a placeholder value ('{phase.purpose}')."
+        for action in phase.actions:
+            for field in _STAGE4_ACTION_REQUIRED_STRING_FIELDS:
+                value = getattr(action, field)
+                if value.strip().lower() in STAGE3_INVALID_VALUES:
+                    return (f"phases[{phase.phase_id}].actions[{action.action_id}].{field} is a "
+                           f"placeholder value ('{value}').")
+            for field in _STAGE4_ACTION_REQUIRED_LIST_FIELDS:
+                for item in getattr(action, field):
+                    if item.strip().lower() in STAGE3_INVALID_VALUES:
+                        return (f"phases[{phase.phase_id}].actions[{action.action_id}].{field} contains "
+                               f"a placeholder value ('{item}').")
+    return None
+
+
+def _stage4_oversized_field(plan):
+    for phase in plan.phases:
+        if len(phase.actions) > MAX_STAGE4_LIST_ITEMS_PER_FIELD:
+            return (f"phases[{phase.phase_id}].actions has {len(phase.actions)} items, exceeding the "
+                   f"{MAX_STAGE4_LIST_ITEMS_PER_FIELD}-item ceiling.")
+        for action in phase.actions:
+            for field in _STAGE4_ACTION_REQUIRED_LIST_FIELDS:
+                values = getattr(action, field)
+                if len(values) > MAX_STAGE4_LIST_ITEMS_PER_FIELD:
+                    return (f"phases[{phase.phase_id}].actions[{action.action_id}].{field} has "
+                           f"{len(values)} items, exceeding the {MAX_STAGE4_LIST_ITEMS_PER_FIELD}-item ceiling.")
+    return None
+
+
+@tool("write_stage4_execution_plan")
+def write_stage4_execution_plan(execution_plan_json: str) -> str:
+    """Validate and write the structured Stage 4 execution plan to
+    stage4_execution_plan.json, alongside the existing
+    stage4_mission_plan.md prose. Call this exactly once, after drafting
+    the human-readable MDMP plan, with a JSON object matching the
+    Stage4ExecutionPlan schema (src/stage4_schema.py): schema_version,
+    plan_id (MP-NNN), plan_title, artifact_role
+    ("HUMAN_REVIEWED_MISSION_PLAN_DRAFT"), execution_authorization
+    ("NOT_GRANTED" — this artifact is a planning product and does not
+    authorize execution), source_stage3_test_ids, phase0_safety_gate,
+    test_bindings (one per Stage 3 test concept — categories,
+    stage2_vector_ids, kcag_path, and technique_ids must exactly restate
+    what that concept already declared in Stage 3, and
+    assigned_action_ids must exactly match the real actions below that
+    reference it), and phases (each with phase_id in PHASE-NN format,
+    a contiguous sequence starting at 1, and one or more actions, each
+    with action_id in ACT-NNN format, exactly one test_id, responsible
+    roles, preconditions, success/abort criteria, recovery steps,
+    telemetry requirements, alert triggers, and OPSEC measures).
+
+    The structured Stage 3 test plan remains authoritative for test IDs,
+    categories, Stage 2 vector references, KCAG paths, execution
+    technique references, success/abort criteria, recovery requirements,
+    telemetry requirements, and Category 2/3 safety controls. Stage 4
+    may sequence and elaborate those concepts across one or more
+    actions, but may not add a new test concept, remove an approved
+    concept, weaken an inherited abort/recovery/telemetry requirement,
+    invent a framework ID, or change a test's category.
+
+    This performs only shallow, writer-time checks (schema shape, size
+    ceiling, duplicate phase/action IDs, placeholder values). It does
+    NOT verify that test_bindings agree with the real Stage 3 test plan,
+    that every Stage 3 concept has an action, or that inherited criteria
+    are actually preserved — that deeper, referential validation runs
+    once, later, against the final artifacts, and is a hard gate before
+    the run can complete. An invented-looking reference or a silently
+    dropped Stage 3 requirement will fail that later gate even though
+    this tool accepts it now.
+    """
+    from pydantic import ValidationError
+
+    try:
+        plan = Stage4ExecutionPlan.model_validate_json(execution_plan_json)
+    except (ValidationError, ValueError) as exc:
+        return f"REJECTED: Stage 4 execution plan failed schema validation.\n{exc}"
+
+    if not plan.phases:
+        return "REJECTED: At least one execution phase is required."
+
+    if len(plan.phases) > MAX_STAGE4_PHASES:
+        return f"REJECTED: Too many phases ({len(plan.phases)}). Maximum is {MAX_STAGE4_PHASES}."
+
+    action_count = sum(len(phase.actions) for phase in plan.phases)
+    if action_count > MAX_STAGE4_ACTIONS:
+        return f"REJECTED: Too many actions ({action_count}). Maximum is {MAX_STAGE4_ACTIONS}."
+    if action_count == 0:
+        return "REJECTED: At least one action is required."
+
+    phase_ids = [p.phase_id for p in plan.phases]
+    if len(phase_ids) != len(set(phase_ids)):
+        dupes = sorted({p for p in phase_ids if phase_ids.count(p) > 1})
+        return f"REJECTED: duplicate phase_id(s): {dupes}."
+
+    action_ids = [a.action_id for phase in plan.phases for a in phase.actions]
+    if len(action_ids) != len(set(action_ids)):
+        dupes = sorted({a for a in action_ids if action_ids.count(a) > 1})
+        return f"REJECTED: duplicate action_id(s): {dupes}."
+
+    placeholder = _stage4_find_placeholder(plan)
+    if placeholder:
+        return f"REJECTED: {placeholder} Nothing written."
+    oversized = _stage4_oversized_field(plan)
+    if oversized:
+        return f"REJECTED: {oversized} Nothing written."
+
+    payload = plan.model_dump(mode="json")
+    output_path = run_context.artifact_path("stage4_execution_plan.json")
+    run_context.write_stamped_json(output_path, payload)
+
+    return (f"WRITTEN: {output_path} | {len(plan.phases)} phase(s), {action_count} action(s). "
+           f"Deeper referential validation (Stage 3 test bindings, criteria inheritance, "
+           f"structured Phase 0 coverage) runs after this crew completes, not here.")

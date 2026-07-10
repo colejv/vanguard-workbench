@@ -10,11 +10,12 @@ from src.tools import (extract_to_scratch, verify_corpus_lock_gate,
                        check_stage3_safety_gate, verify_stage2_vectors,
                        validate_kcag)
 from src.stage3_validation import validate_stage3_test_plan, check_stage3_artifact_consistency
+from src.stage4_validation import validate_stage4_execution_plan, check_stage4_artifact_consistency
 from src.schemas import StageStatus
 from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         save_assessment_state, commit_stage_output, set_stage_status,
                         finalize_stage4_state, enforce_stage3_safety_gate,
-                        enforce_stage3_test_plan_validation)
+                        enforce_stage3_test_plan_validation, enforce_stage4_execution_plan_validation)
 from src import run_context
 from src.heartbeat import heartbeat
 
@@ -686,16 +687,71 @@ if __name__ == "__main__":
             pass
     run_context.stamp_prose_file(stage4_prose_path)
 
+    # ---- VERIFY BOTH STRUCTURED AND PROSE STAGE 4 ARTIFACTS EXIST ----
+    # Both are products of t_stage4's own human_input task and cannot
+    # exist before it -- this check necessarily runs AFTER
+    # stage4_crew.kickoff() above, so it cannot intercept that human
+    # approval, only prevent the run from completing on top of a missing
+    # or invalid structured plan.
+    stage4_plan_path = run_context.artifact_path("stage4_execution_plan.json")
+    for required_path in (stage4_prose_path, stage4_plan_path):
+        if not os.path.exists(required_path):
+            set_stage_status(state, "stage4", StageStatus.FAIL)
+            state.current_stage = "stage4"
+            save_assessment_state(state, run_id)
+            raise RuntimeError(
+                f"Stage 4 did not produce {required_path} — the run cannot "
+                f"be finalized. Run audit trail: {out_dir}/assessment_state.json"
+            )
+    stage4_plan = run_context.read_stamped_json(stage4_plan_path)
+
+    # ---- STRUCTURED STAGE 4 VALIDATION (deterministic, HARD BLOCK) ----
+    # A plan that silently drops, alters, or invents a Stage 3 test
+    # concept, weakens an inherited abort/recovery/telemetry requirement,
+    # or weakens the approved Category 2/3 termination time or approving
+    # roles must never let the run reach PASS merely because its prose
+    # reads convincingly. write_stage4_execution_plan() (the writer tool)
+    # only performed shallow, writer-time checks; this is the actual
+    # referential check, run once, here, against the final artifacts.
+    stage4_prose_for_validation = run_context.read_stamped_prose(stage4_prose_path)
+    plan_validation4 = validate_stage4_execution_plan(plan=stage4_plan, stage3_test_plan=stage3_plan)
+    consistency4 = check_stage4_artifact_consistency(stage4_text=stage4_prose_for_validation,
+                                                      execution_plan=stage4_plan)
+    stage4_validation_report = {
+        "is_valid": plan_validation4["is_valid"] and consistency4["is_consistent"],
+        "plan_validation": plan_validation4,
+        "artifact_consistency": consistency4,
+    }
+    stage4_validation_path = run_context.artifact_path("stage4_execution_plan_validation.json")
+    run_context.write_stamped_json(stage4_validation_path, stage4_validation_report)
+    print(f"Stage 4 structured execution-plan validation: "
+          f"{'PASS' if stage4_validation_report['is_valid'] else 'FAIL'} — "
+          f"{plan_validation4['summary']} {consistency4['summary']}")
+
+    # enforce_stage4_execution_plan_validation raises RuntimeError (after
+    # persisting FAIL state) on an invalid result -- nothing below this
+    # call is reachable on the failure path. It does NOT mark Stage 4
+    # PASS on success: finalize_stage4_state below remains the single
+    # place that transition happens, same separation of concerns as
+    # enforce_stage3_test_plan_validation/enforce_stage3_safety_gate.
+    enforce_stage4_execution_plan_validation(
+        state, run_id,
+        is_valid=stage4_validation_report["is_valid"],
+        summary=f"{plan_validation4['summary']} {consistency4['summary']}",
+    )
+
     # ---- FINAL PHASE 0 SAFETY CHECK: DEFENSE IN DEPTH ----
     # Stage 3 has already passed the deterministic pre-Stage-4 gate above
-    # (enforce_stage3_safety_gate) before Stage 4 was ever constructed.
-    # This second check confirms that the generated Stage 4 mission plan
-    # carries forward the required safety-gate language and does not
-    # contradict the already-approved Stage 3 assessment. It still fires
-    # after t_stage4's own human_input=True approval inside
-    # stage4_crew.kickoff() above, so it cannot intercept THAT approval —
-    # only the pre-Stage-4 gate can do that, and it already ran.
-    stage4_text = run_context.read_stamped_prose(stage4_prose_path) if os.path.exists(stage4_prose_path) else ""
+    # (enforce_stage3_safety_gate) before Stage 4 was ever constructed, and
+    # the structured Stage 4 plan has already passed its own deterministic
+    # gate immediately above. This third check confirms that the generated
+    # Stage 4 mission plan PROSE carries forward the required safety-gate
+    # language and does not contradict the already-approved Stage 3
+    # assessment. It still fires after t_stage4's own human_input=True
+    # approval inside stage4_crew.kickoff() above, so it cannot intercept
+    # THAT approval — only the pre-Stage-4 gate can do that, and it
+    # already ran.
+    stage4_text = stage4_prose_for_validation
     safety = check_phase0_safety_gate(stage3_text, stage4_text)
     phase0_check_path = run_context.artifact_path("phase0_safety_check.md")
     with open(phase0_check_path, "w") as f:

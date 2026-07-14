@@ -1,0 +1,9 @@
+# Army Accelerates Next-Gen Command Transport Prototyping
+
+<!-- source: https://www.linkedin.com/posts/cpec2in_armyc2transformation-armytransformation-activity-7439758026904891392-k7sP -->
+
+The CMOSS Mounted Form Factor (CMFF) capabilities managed by Product Manager Multi-Mission Tactical Transport (PdM M2T2), under Project Manager Command and Control (C2) Transport, received authority to move forward with multiple competitive prototyping efforts that will accelerate deployment of critical Next-Generation Command and Control (NGC2) transport components. This prototyping effort will focus on four critical technology areas designed to increase flexibility though an open, standards-based approach to mounted transport including Software-Defined Radio Cards and cryptographic components. This card-based architecture will include a Digital Radio Head and an Audio Adapter for vehicle integration aimed to converge standalone hardware into a single CMOSS compliant form factor. “This modular open-standards approach provides a level of flexibility and adaptability that the Army requires to complete a diverse set of mission essential tasks while significantly reducing the size, weight, and power (SWaP) in our vehicles,” said Mr. Jack Wilson, Project Manager for C2 Transport. “The capabilities developed in this program will provide scalable, resilient software-defined C2 transport capabilities that can be used across the Army’s mounted formations.” #ArmyC2Transformation #ArmyTransformation U.S. Army Acquisition Support Center (USAASC) ASA(ALT)
+Sounds promising. I wonder if the cryptographic components will be equipped to onboard CNSA 2.0 PQC cryptographic algorithms.
+Awesome system. Used to work with CMFF
+Gary Will you be at the Satellite Show next week? Ameripack will be in Booth 1842
+Awesomeness! ❤️

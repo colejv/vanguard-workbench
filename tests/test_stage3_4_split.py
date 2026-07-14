@@ -38,7 +38,7 @@ def test_build_tasks_does_not_return_stage4():
     tasks = build_tasks("/tmp/test-output-does-not-need-to-exist")
     assert "t_stage4" not in tasks
     assert set(tasks.keys()) == {
-        "t_research", "t_synthesize_stage0", "t_stage1", "t_stage2",
+        "t_research", "t_synthesize_stage0", "t_stage1", "t_stage1_write", "t_stage2",
         "t_annexB", "t_annexC", "t_stage3",
     }
 

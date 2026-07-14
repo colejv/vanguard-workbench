@@ -305,6 +305,7 @@ if __name__ == "__main__":
     t_research = tasks["t_research"]
     t_synthesize_stage0 = tasks["t_synthesize_stage0"]
     t_stage1 = tasks["t_stage1"]
+    t_stage1_write = tasks["t_stage1_write"]
     t_stage2 = tasks["t_stage2"]
     t_annexB = tasks["t_annexB"]
     t_annexC = tasks["t_annexC"]
@@ -380,7 +381,7 @@ if __name__ == "__main__":
     save_assessment_state(state, run_id)
 
     # ---- STAGE 1 CREW: three-layer decomposition ----
-    stage1_tasks = [] if stage1_done else [t_stage1]
+    stage1_tasks = [] if stage1_done else [t_stage1, t_stage1_write]
 
     if stage1_tasks:
         print(f"stage1_crew will run {len(stage1_tasks)} task(s): "

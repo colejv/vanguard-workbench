@@ -1,0 +1,23 @@
+# LM Accelerates NGC2 Capabilities and Real-Time Decision Making ...
+
+<!-- source: https://www.asdnews.com/news/defense/2026/01/23/lm-accelerates-ngc2-capabilities-realtime-decision-making-at-lightning-surge-1 -->
+
+In collaboration with the 25th Infantry Division (25ID), CPE C3N, multiple U.S. Army stakeholders and several industry partners including Raft and Accelint, Lockheed Martin delivered and successfully demonstrated the first iteration of a Next Generation Command and Control (NGC2) prototype at Lightning Surge 1 (LS1). The 25th Infantry Division is one of two Army Divisions selected to experiment with NGC2 capabilities.
+Why It Matters 
+NGC2 is the U.S. Army’s effort to fundamentally change how digital mission command is conducted, utilizing a common data layer to provide a continuous common operating picture with a single, integrated view of the battlefield to enable swift and decisive action.   
+Lockheed Martin is leading an NGC2 prototype effort to provide the Army with warfighting data for decision dominance by unifying it in a single common data layer.
+Lockheed Martin’s NGC2 prototype will operate on the 25ID’s existing transport and compute environment, which will extend across echelons, from Division to Platoon and from cloud to edge.
+What We Accomplished 
+During Lightning Surge 1, the Lockheed Martin team showcased the rapid deployment of prototype capability, only one month after representative NGC2 hardware was delivered and installed to the 25ID’s Home Station Mission Command Lab. 
+To enable commanders and warfighters to make decisions more rapidly, the Lockheed Martin team delivered the foundation of the 25ID’s NGC2 prototype with a common data layer augmented by artificial intelligence (AI) tools, one of which enables voice and chat natural language processing for spot reporting.
+The common data layer provides the U.S. Army with improved command and control capabilities. Once information is updated in the data layer, it is updated everywhere, in real time, with no more “swivel chair” manual processes. When seconds matter most, that time difference is critical.
+“Our goal during the NGC2 Lightning Surge events is to prove speed and warfighter centered development at every step,” said Chandra Marshall, vice president at Lockheed Martin. “Our team is focused on strong collaboration with the Army and the best of industry partners, while remaining flexible, iterating in real time and accelerating the delivery of capability.”
+Open by Design 
+Lockheed Martin serves as the U.S. Army’s Team Lead for the 25th Infantry Division NGC2 prototype, collaborating with several best-of-breed industry partners, such as Raft and Accelint, and continuously expanding the team by identifying compelling new capabilities to onboard and scale.
+By working with industry partners and combining our strengths, we are establishing a solid framework and foundation that enables integration and promotes connectivity.
+“One of the greatest strengths of the NGC2 team has been the ease of collaboration,” said Shubhi Mishra, chief executive officer of Raft. “This effort reflects a true partnership where all members of the team work together with mutual respect, transparency, and a shared commitment to delivering the best possible capability to the Army. As part of the team, Raft is delivering the data layer and AI engine that will enable commanders to see, decide and act faster than any adversary across every domain."
+"Our contribution to NGC2 is about giving commanders a clear picture of what is happening across all levels of the fight," said Brian Morrison, chief executive officer of Accelint. "NGC2 has been a truly collaborative effort. By working closely with the Army, Lockheed Martin and other partners, we have been able to pull data from multiple sensors and systems into a mission command interface built for operators. That enables teams to make faster, more confident decisions, stay ahead of evolving threats and maintain a lethal edge in large-scale operations.”
+What’s Next in the Surge? 
+Each Lightning Surge exercise will add new functionality onto the existing data foundation, demonstrating iterative continuous growth, informed by constant soldier feedback, within the modular architecture that scales from joint fires to multi-domain lethality.  
+Lightning Surge 2 is already on the calendar in February 2026, and will focus on a fires mission thread supporting the 25ID mission.
+Throughout the Lightning Surge exercises, Lockheed Martin, Raft and Accelint are committed to working with the U.S. Army’s 25ID, along with multiple stakeholders and industry partners to provide warfighters with the integrated data they need to make faster decisions and ensure lethality across multiple domains.

@@ -143,60 +143,93 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
             "where the adversary can traverse a trust relationship.\n\n"
             "ATTRIBUTION DISCIPLINE: every node id must correspond to a Stage 0 signature "
             "or a scratchpad finding. Do not invent components.\n\n"
-            "Flag missing elements with [GAP].\n\n"
-            "CRITICAL INSTRUCTION — STRUCTURED NODE INVENTORY (REQUIRED FOR STAGE 2):\n"
-            "After writing the prose decomposition, you MUST call `write_stage1_output` exactly "
-            "once with four real structured list arguments — technical_nodes, procedural_nodes, "
-            "cognitive_nodes, and trust_boundaries — passed directly as the tool's arguments, "
-            "never assembled into a single JSON string yourself. Stage 2 reads this file to verify "
-            "every attack-graph node traces to a real Stage 1 component; without it Stage 2 cannot "
-            "be checked.\n\n"
-            "SIZE DISCIPLINE — these lists are generated in a single tool call and WILL be "
-            "rejected if too large:\n"
-            "  - Cap each layer at roughly 8-10 of the most architecturally significant components "
-            "(not every item from the scratchpad) — technical components that are real attack "
-            "surface, procedural elements with real exploitable timing/process gaps, cognitive "
-            "stages with a real corruption path. Aim for a total around 25-30 nodes across all "
-            "three layers combined, not 40+.\n"
-            "  - Keep information_flows, feeds, corrupts, and downstream_effect to ONE short phrase "
-            "each (under ~10 words) — these are index labels for Stage 2 to reference, not summary "
-            "paragraphs. Save fuller explanation for the prose decomposition.\n"
-            "  - Cap trust_boundaries at roughly 5-8 entries — the boundaries with the clearest "
-            "adversary-traversable trust relationship, not every possible pairing.\n\n"
-            "Argument shape and field rules:\n"
-            "  - Four separate list arguments: technical_nodes=[...], procedural_nodes=[...], "
-            "cognitive_nodes=[...], trust_boundaries=[...] — pass each as its own real list "
-            "argument to the tool call, not as a combined JSON string.\n"
-            "  - technical_nodes / procedural_nodes entries: component_id (C-T-NN / C-P-NN), "
-            "layer (\"technical\" or \"procedural\" — MUST match the list you put it in), name, "
-            "asset_control_levels (list), information_flows, downstream_dependencies (list).\n"
-            "  - cognitive_nodes entries: component_id (C-C-NN), hierarchy_stage (one of Data, "
-            "Information, Knowledge, Understanding, Decision, Behavior), feeds, corrupts, "
-            "downstream_effect, detection_probability (HIGH|MEDIUM|LOW), is_center_of_gravity "
-            "(true for any cognitive node you consider a candidate touchpoint worth flagging "
-            "within this layer — NOTE: this is advisory and layer-scoped only. Per JP 5-0/ADP 3-0, "
-            "COG is domain-agnostic and is not necessarily cognitive; the operational COG is "
-            "computed graph-theoretically in Annex B from min-cut size and betweenness centrality "
-            "over the full attack graph, and may land on a Technical or Procedural node instead — "
-            "e.g. a C2 chokepoint. Do not force a flag here if no cognitive node is a standout; "
-            "zero flagged is a valid and often correct outcome).\n"
-            "  - trust_boundaries entries: boundary_id (TB-NN), from_component, to_component, "
-            "description.\n"
-            "  - component_id must be unique across all three layers combined.\n"
-            "  - Set is_gap=true for [GAP] placeholder entries instead of inventing a component_id."
+            "Flag missing elements with [GAP]."
         ),
         expected_output=(
             "Three-layer decomposition (Technical / Procedural / Cognitive) with a "
             "structured node inventory (component_id, layer, asset_control_levels, "
             "information_flows, downstream_dependencies) and a trust-boundary inventory. "
-            "This node inventory is the required input to Annex B (Stage 2 edge list). "
-            "AND confirmation that a curated structured node inventory (~25-30 nodes total) was "
-            "written via the write_stage1_output tool."
+            "This node inventory is the required input to Annex B (Stage 2 edge list)."
         ),
         agent=decomposer,
         context=[] if "t_stage1" in resume_context else [t_synthesize_stage0],
-        tools=[read_scratch, write_stage1_output],
+        tools=[read_scratch],
         output_file=f"{out_dir}/stage1.md",
+    )
+
+    # ---- Separate, single-purpose task for the structured write ----
+    # Split out of t_stage1 above after a real observed failure: t_stage1's
+    # combined prompt (write three full prose layers, THEN remember a
+    # trailing four-argument tool call almost 70 lines later) let the model
+    # treat a complete-looking prose Final Answer as satisfying the whole
+    # task -- confirmed directly in a debug log with ZERO Action/tool-call
+    # attempts for write_stage1_output, not a rejected or malformed one.
+    # A short, freshly-started task whose ONLY job is the tool call is much
+    # more reliable for actually getting that call made than a trailing
+    # instruction buried at the end of a long compound one -- same
+    # reasoning as the Stage 0/1/2 crew split itself, one level down.
+    t_stage1_write = Task(
+        description=(
+            "You have just completed the Stage 1 three-layer decomposition above. "
+            "Your ONLY job now is to call `write_stage1_output` exactly once, "
+            "translating that decomposition into four real structured list "
+            "arguments — technical_nodes, procedural_nodes, cognitive_nodes, and "
+            "trust_boundaries — passed directly as the tool's arguments, never "
+            "assembled into a single JSON string yourself. Do not rewrite or "
+            "re-summarize the prose narrative. This task is not complete until the "
+            "tool has actually been called and returned a WRITTEN confirmation — "
+            "describing what you would write is not the same as writing it.\n\n"
+            "Stage 2 reads this file to verify every attack-graph node traces to a "
+            "real Stage 1 component; without it Stage 2 cannot be checked.\n\n"
+            "SIZE DISCIPLINE — this list is generated in a single tool call and "
+            "WILL be rejected if too large:\n"
+            "  - Cap each layer at roughly 8-10 of the most architecturally "
+            "significant components (not every item from the decomposition above) "
+            "— technical components that are real attack surface, procedural "
+            "elements with real exploitable timing/process gaps, cognitive stages "
+            "with a real corruption path. Aim for a total around 25-30 nodes across "
+            "all three layers combined, not 40+.\n"
+            "  - Keep information_flows, feeds, corrupts, and downstream_effect to "
+            "ONE short phrase each (under ~10 words) — these are index labels for "
+            "Stage 2 to reference, not summary paragraphs.\n"
+            "  - Cap trust_boundaries at roughly 5-8 entries — the boundaries with "
+            "the clearest adversary-traversable trust relationship, not every "
+            "possible pairing.\n\n"
+            "Argument shape and field rules:\n"
+            "  - Four separate list arguments: technical_nodes=[...], "
+            "procedural_nodes=[...], cognitive_nodes=[...], trust_boundaries=[...] "
+            "— pass each as its own real list argument to the tool call, not as a "
+            "combined JSON string.\n"
+            "  - technical_nodes / procedural_nodes entries: component_id "
+            "(C-T-NN / C-P-NN), layer (\"technical\" or \"procedural\" — MUST match "
+            "the list you put it in), name, asset_control_levels (list), "
+            "information_flows, downstream_dependencies (list).\n"
+            "  - cognitive_nodes entries: component_id (C-C-NN), hierarchy_stage "
+            "(one of Data, Information, Knowledge, Understanding, Decision, "
+            "Behavior), feeds, corrupts, downstream_effect, detection_probability "
+            "(HIGH|MEDIUM|LOW), is_center_of_gravity (true for any cognitive node "
+            "you consider a candidate touchpoint worth flagging within this layer "
+            "— NOTE: this is advisory and layer-scoped only. Per JP 5-0/ADP 3-0, "
+            "COG is domain-agnostic and is not necessarily cognitive; the "
+            "operational COG is computed graph-theoretically in Annex B from "
+            "min-cut size and betweenness centrality over the full attack graph, "
+            "and may land on a Technical or Procedural node instead — e.g. a C2 "
+            "chokepoint. Do not force a flag here if no cognitive node is a "
+            "standout; zero flagged is a valid and often correct outcome).\n"
+            "  - trust_boundaries entries: boundary_id (TB-NN), from_component, "
+            "to_component, description.\n"
+            "  - component_id must be unique across all three layers combined.\n"
+            "  - Set is_gap=true for [GAP] placeholder entries instead of "
+            "inventing a component_id."
+        ),
+        expected_output=(
+            "Confirmation that a curated structured node inventory (~25-30 nodes "
+            "total) was written via the write_stage1_output tool, quoting the "
+            "tool's own WRITTEN result message verbatim."
+        ),
+        agent=decomposer,
+        context=[t_stage1],
+        tools=[write_stage1_output],
     )
 
     _stage2_resume_prefix = (
@@ -487,6 +520,7 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
         "t_research": t_research,
         "t_synthesize_stage0": t_synthesize_stage0,
         "t_stage1": t_stage1,
+        "t_stage1_write": t_stage1_write,
         "t_stage2": t_stage2,
         "t_annexB": t_annexB,
         "t_annexC": t_annexC,

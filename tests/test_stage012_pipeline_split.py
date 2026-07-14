@@ -76,6 +76,7 @@ def _build_mock_kickoff(captured, *, stage1_should_fail=False):
 
         if kind == "stage1":
             captured.setdefault("crews_run", []).append("stage1")
+            captured["stage1_crew_task_count"] = len(self.tasks)
             open(run_context.artifact_path("stage1.md"), "w").write("# Stage 1\n")
             if stage1_should_fail:
                 return "mock stage1_crew (writer never succeeded, no artifact produced)"
@@ -230,6 +231,22 @@ def test_full_pipeline_succeeds_with_split_stage012_crews(pipeline_workspace):
     result, captured, _ = _run_pipeline("happy_run")
     assert result == "SUCCESS", result
     assert captured["crews_run"] == ["stage0", "stage1", "stage2", "analysis", "stage4"]
+
+
+def test_stage1_crew_is_split_into_prose_and_write_tasks(pipeline_workspace):
+    """Stage 1's prompt used to combine three prose layers plus a trailing
+    four-argument tool call in one task -- observed directly to let the
+    model treat a complete-looking prose answer as finishing the whole
+    task, with the write_stage1_output call never even attempted. Splitting
+    it into a prose task and a separate, single-purpose write task is the
+    actual fix; this asserts the split is real (stage1_crew is constructed
+    with 2 tasks), not just present in the task description text."""
+    result, captured, _ = _run_pipeline("split_check_run")
+    assert result == "SUCCESS", result
+    assert captured.get("stage1_crew_task_count") == 2, (
+        f"expected stage1_crew to be constructed with 2 tasks (prose + write), "
+        f"got {captured.get('stage1_crew_task_count')}"
+    )
 
 
 def test_missing_stage1_artifact_prevents_stage2(pipeline_workspace):

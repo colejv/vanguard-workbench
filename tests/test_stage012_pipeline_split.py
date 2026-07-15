@@ -126,6 +126,12 @@ def _build_mock_kickoff(captured, *, stage1_should_fail=False):
         })
         open(run_context.artifact_path("annexB_kcag.md"), "w").write("# annexB\n")
         open(run_context.artifact_path("annexC_bbn.md"), "w").write("# annexC\n")
+        # Annex C completed with a PASS status so the Annex C -> Stage 3
+        # transition gate allows Stage 3 (the happy path). Tests that exercise
+        # the blocked/waiver paths do so directly against evaluate_stage3_transition.
+        run_context.write_stamped_json(run_context.artifact_path("bbn_report.json"), {
+            "status": "PASS", "threat_score": 0.5, "phase_estimate": "SHAPE",
+        })
         open(run_context.artifact_path("stage3.md"), "w").write(
             "# STAGE 3\n\n### RT-001 — Test\n**Category:** 1\nx\n\n"
             "## PRE-STAGE-4 SAFETY REVIEW\nNO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED.\n")

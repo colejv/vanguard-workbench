@@ -11,6 +11,16 @@ import os
 import pytest
 
 from src import run_context
+
+
+# In-memory stamped-json store for the identity-baseline persistence params.
+_mem_store = {}
+def _mem_read(p):
+    if p not in _mem_store:
+        raise FileNotFoundError(p)
+    return _mem_store[p]
+def _mem_write(p, payload):
+    _mem_store[p] = payload
 from src.stage3_flow import (
     compile_stage3_until_valid, stage3_is_semantically_complete,
     _format_semantic_feedback,
@@ -19,6 +29,7 @@ from src.stage3_flow import (
 
 @pytest.fixture(autouse=True)
 def _run(tmp_path):
+    _mem_store.clear()
     run_context.reset_active_run()
     run_context.set_active_run("test-run", "sha256:test", str(tmp_path / "out"))
     yield
@@ -57,6 +68,9 @@ def test_returns_on_first_pass():
         compile_candidate=compile_candidate,
         validate_candidate=_valid_report,
         write_validation_report=lambda r: open(rep, "w").write(json.dumps(r)),
+        read_candidate=lambda: {"test_concepts": []},
+        identity_baseline_path="baseline_key",
+        read_stamped_json=_mem_read, write_stamped_json=_mem_write,
         artifact_path=art, validation_report_path=rep,
     )
     assert report["is_valid"] is True
@@ -90,6 +104,9 @@ def test_candidate_2_receives_candidate_1_errors():
         compile_candidate=compile_candidate,
         validate_candidate=validate_candidate,
         write_validation_report=lambda r: open(rep, "w").write(json.dumps(r)),
+        read_candidate=lambda: {"test_concepts": []},
+        identity_baseline_path="baseline_key",
+        read_stamped_json=_mem_read, write_stamped_json=_mem_write,
         artifact_path=art, validation_report_path=rep,
     )
     assert report["is_valid"] is True
@@ -111,6 +128,9 @@ def test_rejected_candidates_are_archived():
         compile_candidate=compile_candidate,
         validate_candidate=lambda: next(reports),
         write_validation_report=lambda r: open(rep, "w").write(json.dumps(r)),
+        read_candidate=lambda: {"test_concepts": []},
+        identity_baseline_path="baseline_key",
+        read_stamped_json=_mem_read, write_stamped_json=_mem_write,
         artifact_path=art, validation_report_path=rep,
     )
     # The attempt-1 rejected candidate + report were archived.
@@ -132,6 +152,9 @@ def test_fails_closed_and_removes_invalid_candidate():
             compile_candidate=compile_candidate,
             validate_candidate=lambda: _invalid_report([{"message": "always bad"}]),
             write_validation_report=lambda r: open(rep, "w").write(json.dumps(r)),
+            read_candidate=lambda: {"test_concepts": []},
+        identity_baseline_path="baseline_key",
+        read_stamped_json=_mem_read, write_stamped_json=_mem_write,
             artifact_path=art, validation_report_path=rep,
             max_semantic_attempts=3,
         )
@@ -158,6 +181,9 @@ def test_feedback_accumulates_across_semantic_attempts():
         compile_candidate=compile_candidate,
         validate_candidate=lambda: next(reports),
         write_validation_report=lambda r: open(rep, "w").write(json.dumps(r)),
+        read_candidate=lambda: {"test_concepts": []},
+        identity_baseline_path="baseline_key",
+        read_stamped_json=_mem_read, write_stamped_json=_mem_write,
         artifact_path=art, validation_report_path=rep,
     )
     # Attempt 3's feedback must contain BOTH prior errors (accumulated).
@@ -231,3 +257,41 @@ def test_semantically_complete_false_when_no_report():
     assert stage3_is_semantically_complete(
         artifact_path=art, validation_report_path=rep,
         current_candidate_hash=stage3_candidate_hash({"schema_version": 1})) is False
+
+
+def test_orchestrator_aborts_on_identity_mutation_mid_repair():
+    """End-to-end in the orchestrator: candidate 1 is the correct AML.T0099
+    binding but fails deep validation (incomplete KCAG path); candidate 2
+    tries to 'fix' it by swapping to CAPEC-628. The orchestrator must abort
+    with SemanticIdentityMutation, NOT accept the mutated plan."""
+    from src.stage3_identity import SemanticIdentityMutation
+    art, rep = _paths()
+
+    plans = iter([
+        # Candidate 1: correct technique, but will fail deep validation.
+        {"test_concepts": [{"test_id": "RT-003", "categories": [1, 4],
+                            "target_node_ids": ["AML.T0099"], "stage2_vector_ids": ["V-03"],
+                            "execution_techniques": [{"technique_id": "AML.T0099", "vector_id": "V-03"}]}]},
+        # Candidate 2: technique swapped to close the path — the forbidden move.
+        {"test_concepts": [{"test_id": "RT-003", "categories": [1, 4],
+                            "target_node_ids": ["CAPEC-628"], "stage2_vector_ids": ["V-02"],
+                            "execution_techniques": [{"technique_id": "CAPEC-628", "vector_id": "V-02"}]}]},
+    ])
+    current = {"plan": None}
+
+    def compile_candidate(*, external_feedback):
+        current["plan"] = next(plans)
+        open(art, "w").write(json.dumps(current["plan"]))
+
+    with pytest.raises(SemanticIdentityMutation, match="AML.T0099"):
+        compile_stage3_until_valid(
+            compile_candidate=compile_candidate,
+            validate_candidate=lambda: _invalid_report([{"message": "KCAG path unresolved"}]),
+            write_validation_report=lambda r: open(rep, "w").write(json.dumps(r)),
+            read_candidate=lambda: current["plan"],
+            identity_baseline_path="baseline_key",
+            read_stamped_json=_mem_read, write_stamped_json=_mem_write,
+            artifact_path=art, validation_report_path=rep,
+        )
+    # The mutated candidate must NOT remain as an authoritative artifact.
+    assert not os.path.exists(art)

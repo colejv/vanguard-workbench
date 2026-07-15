@@ -94,6 +94,10 @@ def compile_stage3_until_valid(
     compile_candidate: CandidateCompiler,
     validate_candidate: CandidateValidator,
     write_validation_report: Callable[[dict], None],
+    read_candidate: Callable[[], dict],
+    identity_baseline_path: str,
+    read_stamped_json: Callable[[str], dict],
+    write_stamped_json: Callable[[str, dict], None],
     artifact_path: str,
     validation_report_path: str,
     max_semantic_attempts: int = 3,
@@ -112,8 +116,19 @@ def compile_stage3_until_valid(
       write_validation_report(report: dict) -> None
           Persists the validation report (hash-bound) to
           validation_report_path.
+      read_candidate() -> dict
+          Reads the candidate plan now on disk (for the semantic-identity
+          check). Injected so this module imports no reader directly.
       artifact_path, validation_report_path
           Authoritative candidate + report paths.
+
+    SEMANTIC IDENTITY: the FIRST compiled candidate establishes a signed
+    per-concept identity baseline (technique_ids, vectors, targets,
+    categories). If a later repaired candidate MUTATES that identity, repair
+    stops with a hard SemanticIdentityMutation error — repair may fix
+    structure and fill omissions, but may never change what a concept IS to
+    close a KCAG path. That is an analytical failure to be surfaced, not a
+    retry to be optimized away.
 
     Returns the passing validation report on success. Raises RuntimeError,
     fail-closed, if no semantic attempt produces a valid candidate — after
@@ -121,8 +136,12 @@ def compile_stage3_until_valid(
     from the authoritative path so no downstream/resume logic can mistake
     it for a completed artifact.
     """
+    from src.stage3_identity import (
+        load_or_capture_baseline, assert_identity_preserved,
+    )
+
     feedback = ""
-    last_report = None
+    identity_baseline = None
 
     for attempt in range(1, max_semantic_attempts + 1):
         print(f"Stage 3 semantic attempt {attempt}/{max_semantic_attempts}...",
@@ -134,9 +153,40 @@ def compile_stage3_until_valid(
         #    on disk, or raises if it can't get there.
         compile_candidate(external_feedback=feedback)
 
+        candidate_plan = read_candidate()
+
+        # 1b. Signed semantic-identity baseline. The FIRST compiled candidate
+        #     sets it and it is PERSISTED, so a resumed run loads the original
+        #     baseline instead of re-capturing from an already-repaired
+        #     candidate. Every later candidate must preserve it. A mutation
+        #     (e.g. a technique swap to force a KCAG path) is a HARD stop, not
+        #     a retry — the candidate is archived and the error surfaced.
+        if identity_baseline is None:
+            identity_baseline = load_or_capture_baseline(
+                plan=candidate_plan,
+                baseline_path=identity_baseline_path,
+                read_stamped_json=read_stamped_json,
+                write_stamped_json=write_stamped_json,
+            )
+            # A persisted baseline from an earlier process must be enforced
+            # against this candidate immediately — otherwise a resume whose
+            # first candidate is already mutated would slip through.
+            try:
+                assert_identity_preserved(identity_baseline, candidate_plan)
+            except Exception:
+                _archive_rejected(validation_report_path, attempt)
+                _archive_rejected(artifact_path, attempt)
+                raise
+        else:
+            try:
+                assert_identity_preserved(identity_baseline, candidate_plan)
+            except Exception:
+                _archive_rejected(validation_report_path, attempt)
+                _archive_rejected(artifact_path, attempt)
+                raise
+
         # 2. Deep-validate the candidate now on disk.
         report = validate_candidate()
-        last_report = report
         write_validation_report(report)
 
         if report.get("is_valid"):

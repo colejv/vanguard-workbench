@@ -320,8 +320,40 @@ def _normalize_requirement(
     )
 
 
+def _authoritative_termination_seconds(
+    review: dict[str, Any],
+    safety_timeline_contract: Any,
+) -> Any:
+    """
+    Return the single authoritative signal-cessation bound.
+
+    With a validated contract, the contract's canonical
+    ACTIVE_SIGNAL_CESSATION value wins -- it is the value that survived
+    cross-artifact consistency enforcement. Without a contract (or when
+    the contract carries no signal-cessation timeline), fall back to the
+    review's own value, which at that point is the only source.
+
+    This function never chooses between conflicting values: a
+    contradiction is raised by SafetyTimelineContract.require_consistent()
+    before compilation begins, so anything reaching here is already
+    single-valued.
+    """
+    if safety_timeline_contract is not None:
+        try:
+            return safety_timeline_contract.canonical_seconds(
+                "ACTIVE_SIGNAL_CESSATION"
+            )
+        except KeyError:
+            pass
+    return review.get(
+        "maximum_termination_seconds"
+    )
+
+
 def build_stage4_phase0_gate(
     stage3_test_plan: dict[str, Any],
+    *,
+    safety_timeline_contract: Any = None,
 ) -> dict[str, Any]:
     """
     Derive phase0_safety_gate deterministically from the validated
@@ -330,6 +362,15 @@ def build_stage4_phase0_gate(
     Governance values are copied verbatim. The overlay never invents
     replacements. Incomplete required governance remains the deep
     validator's responsibility.
+
+    safety_timeline_contract: when supplied it MUST already have passed
+    require_consistent(). maximum_termination_seconds is then taken from
+    the contract's single authoritative ACTIVE_SIGNAL_CESSATION value
+    rather than propagated blindly from the review. This closes the
+    defect where one of two conflicting authoritative timelines (15s
+    signal cessation vs 900s termination) was silently propagated. The
+    caller (crew.py) builds the contract and hard-fails on contradiction
+    or ambiguity before this function is ever reached.
     """
     plan = _unwrap_stamped_data(
         stage3_test_plan
@@ -400,8 +441,9 @@ def build_stage4_phase0_gate(
             )
             or []
         ),
-        "maximum_termination_seconds": review.get(
-            "maximum_termination_seconds"
+        "maximum_termination_seconds": _authoritative_termination_seconds(
+            review,
+            safety_timeline_contract,
         ),
         "rollback_or_recovery_procedure": review.get(
             "rollback_or_recovery_procedure"
@@ -1326,13 +1368,19 @@ def build_stage4_test_bindings(
 def _apply_phase0_overlay(
     parsed: dict[str, Any],
     stage3_test_plan: dict[str, Any],
+    safety_timeline_contract: Any = None,
 ) -> None:
     """
     Replace model-generated Phase 0 data with validated Stage 3 data.
+
+    When a validated safety-timeline contract is supplied, the gate's
+    termination bound comes from its single authoritative
+    signal-cessation value rather than from the review directly.
     """
     parsed["phase0_safety_gate"] = (
         build_stage4_phase0_gate(
-            stage3_test_plan
+            stage3_test_plan,
+            safety_timeline_contract=safety_timeline_contract,
         )
     )
 
@@ -1498,6 +1546,7 @@ def _generate_stage4_plan_json(
     llm: Any,
     correction_feedback: str = "",
     timeout_seconds: int = 600,
+    safety_timeline_contract: Any = None,
 ) -> str:
     """
     Request one Stage 4 candidate, enforce the approved multi-test action
@@ -1590,6 +1639,7 @@ def _generate_stage4_plan_json(
     _apply_phase0_overlay(
         parsed,
         stage3_test_plan,
+        safety_timeline_contract,
     )
 
     # Enforce the complete approved action set and canonicalize legacy
@@ -1632,6 +1682,7 @@ def compile_stage4_structured_output(
     artifact_path: str,
     max_retries: int = STAGE4_WRITE_MAX_RETRIES,
     external_feedback: str = "",
+    safety_timeline_contract: Any = None,
 ) -> None:
     """
     Generate a schema-valid Stage 4 execution plan and invoke the
@@ -1695,6 +1746,9 @@ def compile_stage4_structured_output(
                     llm=llm,
                     correction_feedback=(
                         correction_feedback
+                    ),
+                    safety_timeline_contract=(
+                        safety_timeline_contract
                     ),
                 )
             )

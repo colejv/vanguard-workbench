@@ -27,6 +27,9 @@ class StageStatus(str, Enum):
     PENDING = "PENDING"      # agent produced output, not yet gated/verified
     PASS = "PASS"            # deterministic gate confirmed the output
     FAIL = "FAIL"            # deterministic gate rejected the output
+    BLOCKED = "BLOCKED"      # a prerequisite transition gate was not satisfied
+    #                          (missing/blocked input) -- NOT an analytical
+    #                          failure of this stage's own output
 
 
 STAGE_NAMES = ("stage0", "stage1", "stage2", "stage3", "stage4")
@@ -235,6 +238,7 @@ class AssessmentState(BaseModel):
         default_factory=lambda: {name: StageRecord() for name in STAGE_NAMES}
     )
     gap_log: list[GapLogEntry] = Field(default_factory=list)
+    gate_decisions: list[dict] = Field(default_factory=list)
 
     def unresolved_gaps(self) -> list[GapLogEntry]:
         return [g for g in self.gap_log if not g.resolved]

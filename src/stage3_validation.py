@@ -34,6 +34,13 @@ from src.tools import (
 
 STAGE3_TEST_HEADING = re.compile(r"^#{2,6}\s+(RT-\d{3})\b.*$", re.IGNORECASE | re.MULTILINE)
 
+# Framework technique IDs as they appear in prose: ATT&CK (T1234[.001]),
+# ATLAS (AML.T0099[.000]), CAPEC (CAPEC-628), EMB3D (EMB.T-xxxx),
+# SPARTA (SV-xx-x). Deterministic extraction — no NL equivalence judgment.
+STAGE3_TECHNIQUE_IN_PROSE = re.compile(
+    r"\b(AML\.T\d{4}(?:\.\d{3})?|CAPEC-\d+|EMB\.T-?\d+|SV-\d+-\d+|T\d{4}(?:\.\d{3})?)\b"
+)
+
 
 def stage3_candidate_hash(plan: dict) -> str:
     """sha256:<hex> of the Stage 3 plan's canonical (sorted-key, compact)
@@ -369,6 +376,38 @@ def check_stage3_artifact_consistency(*, stage3_text: str, test_plan: dict) -> d
             errors.append(_err(f"test_concepts[{test_id}].categories", "CATEGORY_MISMATCH",
                                f"Prose declares categories {sorted(prose_categories)} but JSON declares "
                                f"{sorted(json_categories)} for {test_id}."))
+
+        # Per-concept technique-ID agreement (prose vs JSON). This catches the
+        # RT-003 failure: prose said AML.T0099 while JSON said CAPEC-628, yet
+        # consistency previously passed. Deterministic exact comparison — no
+        # LLM equivalence judgment. Every technique the JSON concept binds
+        # must actually appear in that concept's prose section, and every
+        # framework technique ID mentioned in the prose section must be one
+        # the JSON concept binds. A disagreement is a hard failure.
+        if json_concept is not None:
+            json_techs = set()
+            for et in (json_concept.get("execution_techniques") or []):
+                tid = et.get("technique_id") if isinstance(et, dict) else None
+                if tid and tid != "[UNMAPPED]":
+                    json_techs.add(tid)
+            for t in (json_concept.get("technique_ids") or []):
+                if t:
+                    json_techs.add(t)
+
+            prose_techs = set(STAGE3_TECHNIQUE_IN_PROSE.findall(section_text))
+
+            # Only compare when the prose section actually names techniques;
+            # an absent prose technique line is a separate (documentation)
+            # concern, not a contradiction.
+            if prose_techs:
+                json_not_in_prose = json_techs - prose_techs
+                prose_not_in_json = prose_techs - json_techs
+                if json_not_in_prose or prose_not_in_json:
+                    errors.append(_err(
+                        f"test_concepts[{test_id}].execution_techniques",
+                        "PROSE_JSON_TECHNIQUE_MISMATCH",
+                        f"{test_id} technique bindings disagree between artifacts — "
+                        f"prose: {sorted(prose_techs)}, json: {sorted(json_techs)}."))
 
     json_has_2_3 = any({2, 3} & set(c.get("categories", [])) for c in test_plan.get("test_concepts", []))
     if json_has_2_3 and STAGE3_NO_GATE_REQUIRED.lower() in stripped.lower():

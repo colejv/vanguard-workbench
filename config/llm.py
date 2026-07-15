@@ -73,10 +73,11 @@ reason_llm = LLM(
 # /v1 translation layer, where otherwise-valid tool calls could leak
 # into normal assistant content instead of being surfaced as tool calls.
 reason_llm = LLM(
-    model="ollama/gemma4:12b-mlx",
+    model="ollama/gemma4-12b-tool",
     base_url=OLLAMA_NATIVE,
     temperature=0.1,
     top_p=0.95,
+    max_tokens=16384,
     timeout=LOCAL_LLM_TIMEOUT_SECONDS,
     max_retries=LOCAL_LLM_MAX_RETRIES,
 )

@@ -482,33 +482,33 @@ def build_tasks(out_dir: str, resume_context: dict = None) -> dict:
             "'NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED.' Do not omit the section either way — its "
             "absence is itself a gate failure, never a silent gap. Do not state the not-required sentence if ANY "
             "payload actually carries Category 2 or 3 — that is a direct contradiction and will also fail the gate.\n"
-            "CRITICAL INSTRUCTION 6 — STRUCTURED TEST PLAN: after drafting the human-readable assessment above, "
-            "call `write_stage3_test_plan` exactly once with a JSON object matching the required schema. The "
-            "structured artifact and the prose artifact must describe the SAME test concepts — do not add a "
-            "concept to one and omit it from the other.\n"
-            "  Every concept requires: a unique test_id in RT-NNN format matching a '### RT-NNN — <title>' heading "
-            "in your prose above; objective; one or more existing Stage 2 vector IDs; a complete kcag_path "
-            "beginning at ADV_START and ending at a goal node; whether that path is the Annex B PRIORITY_PATH or "
-            "an ALTERNATE_VALID_PATH (a valid path to a different meaningful objective is acceptable — it does "
-            "not have to be the global priority path, but it must be a real one); target node IDs on that path; "
-            "one or more category numbers 1-4; grounded execution technique references (a real ID from the "
-            "technique index, or exactly `[UNMAPPED]` with a rationale — never an invented-looking ID); defensive "
-            "concepts; preconditions; expected effects; measurable success criteria; explicit abort criteria; "
-            "rollback or recovery steps; required telemetry; and explicit assumptions.\n"
-            "  For a Category 2 or 3 concept, safety_controls is mandatory. For concepts containing neither "
-            "category, safety_controls must be null.\n"
-            "  Do not invent Stage 2 vector IDs, graph nodes, graph paths, framework IDs, assets, approving "
-            "roles, or safety authorities. A deterministic gate re-checks every reference against the real "
-            "Stage 2 graph, KCAG report, and technique index after this crew finishes — an invented-looking "
-            "reference will fail that gate even though the writer tool itself may accept it now."
+            "CRITICAL INSTRUCTION 6 — REFERENTIAL DISCIPLINE: your prose must describe each test "
+            "concept completely enough that a downstream compiler can extract a structured test plan "
+            "from it. For every concept, make explicit in the prose: a unique test_id in RT-NNN format "
+            "as a '### RT-NNN — <title>' heading; objective; one or more existing Stage 2 vector IDs; a "
+            "complete kcag_path beginning at ADV_START and ending at a goal node; whether that path is "
+            "the Annex B PRIORITY_PATH or an ALTERNATE_VALID_PATH (a valid path to a different meaningful "
+            "objective is acceptable — it does not have to be the global priority path, but it must be a "
+            "real one); target node IDs on that path; one or more category numbers 1-4; grounded "
+            "execution technique references (a real ID from the technique index, or exactly `[UNMAPPED]` "
+            "with a rationale — never an invented-looking ID); defensive concepts; preconditions; "
+            "expected effects; measurable success criteria; explicit abort criteria; rollback or recovery "
+            "steps; required telemetry; and explicit assumptions.\n"
+            "  For a Category 2 or 3 concept, safety controls are mandatory and must be stated. For "
+            "concepts containing neither category, state that no safety controls are required.\n"
+            "  Do not invent Stage 2 vector IDs, graph nodes, graph paths, framework IDs, assets, "
+            "approving roles, or safety authorities. A deterministic gate re-checks every reference "
+            "against the real Stage 2 graph, KCAG report, and technique index after the structured plan "
+            "is compiled from this prose — an invented-looking reference will fail that gate."
         ),
         expected_output=(
-            "Human-reviewed Stage 3 test concepts in stage3.md, plus confirmation that a matching "
-            "structured test plan was written to stage3_test_plan.json."
+            "Human-reviewed Stage 3 test concepts in stage3.md, each with a complete RT-NNN heading and "
+            "all the referential detail (vector IDs, kcag_path, categories, technique IDs, criteria) a "
+            "downstream compiler needs to build the structured test plan."
         ),
         agent=red_team_lead,
         context=_stage3_live_context,
-        tools=[lookup_technique, write_stage3_test_plan],
+        tools=[lookup_technique],
         human_input=True,
         output_file=f"{out_dir}/stage3.md",
     )
@@ -792,6 +792,7 @@ def build_analysis_tasks(
     t_stage3,
     annexB_done: bool,
     annexC_done: bool,
+    stage3_prose_done: bool = False,
 ) -> list:
     """
     Pure task-list assembly for analysis_crew -- no I/O, no run_context
@@ -805,6 +806,13 @@ def build_analysis_tasks(
     -- crew.py only constructs it in that branch, since building it
     needs real verified-artifact reads that are wasted work when Annex B
     won't run this invocation anyway.
+
+    stage3_prose_done, when True, skips t_stage3 (the prose task) so a
+    resume that already has stage3.md does not regenerate it. NOTE: this
+    only governs the PROSE task inside the crew; the structured plan is
+    compiled separately outside the crew by crew.py. A pure compile-only
+    resume (prose present, plan missing) bypasses this function entirely
+    -- crew.py detects that case before building analysis_tasks.
     """
     tasks = []
     if not annexB_done:
@@ -812,7 +820,8 @@ def build_analysis_tasks(
         tasks.append(t_annexB)
     if not annexC_done:
         tasks.append(t_annexC)
-    tasks.append(t_stage3)
+    if not stage3_prose_done:
+        tasks.append(t_stage3)
     return tasks
 
 

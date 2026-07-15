@@ -239,6 +239,35 @@ def test_review_skipped_when_annexb_already_done():
     assert tasks == [t_c, t_s3]
 
 
+def test_stage3_prose_task_included_when_prose_not_done():
+    t_b, t_c, t_s3 = (_dummy_task(n) for n in ("b", "c", "s3"))
+    tasks = build_analysis_tasks(t_kcag_review=None, t_annexB=t_b, t_annexC=t_c,
+                                 t_stage3=t_s3, annexB_done=True, annexC_done=True,
+                                 stage3_prose_done=False)
+    assert t_s3 in tasks
+
+
+def test_stage3_prose_task_skipped_when_prose_done():
+    """When stage3.md already exists, its prose task must not be re-added
+    to the crew — the structured plan is compiled separately outside the
+    crew from the existing prose."""
+    t_b, t_c, t_s3 = (_dummy_task(n) for n in ("b", "c", "s3"))
+    tasks = build_analysis_tasks(t_kcag_review=None, t_annexB=t_b, t_annexC=t_c,
+                                 t_stage3=t_s3, annexB_done=True, annexC_done=True,
+                                 stage3_prose_done=True)
+    assert t_s3 not in tasks
+    assert tasks == []
+
+
+def test_stage3_prose_done_defaults_to_included():
+    """Backward-compatible default: omitting stage3_prose_done keeps the
+    prose task in the list (fresh-run behavior)."""
+    t_b, t_c, t_s3 = (_dummy_task(n) for n in ("b", "c", "s3"))
+    tasks = build_analysis_tasks(t_kcag_review=None, t_annexB=t_b, t_annexC=t_c,
+                                 t_stage3=t_s3, annexB_done=True, annexC_done=True)
+    assert t_s3 in tasks
+
+
 def test_review_does_not_replace_stage2_artifact():
     """Immutability: constructing the review task must never touch
     stage2_vectors.json -- the function only ever READS the two dicts

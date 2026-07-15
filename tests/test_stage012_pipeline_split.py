@@ -33,7 +33,7 @@ from src import run_context
 # Captured at module import time, before any test's monkeypatch.chdir() can
 # run -- resolves to the real repo root regardless of whose machine this
 # runs on. The earlier version of this fixture hardcoded an absolute path
-# into a specific development sandbox (/home/claude/split_test_final/...),
+# into a specific development sandbox (an absolute machine-specific path),
 # which only ever worked in that one environment. This is the actual fix,
 # not a workaround: no path in this file should ever be specific to any
 # one machine again.
@@ -78,13 +78,10 @@ def _build_mock_kickoff(captured, *, stage1_should_fail=False):
             captured.setdefault("crews_run", []).append("stage1")
             captured["stage1_crew_task_count"] = len(self.tasks)
             open(run_context.artifact_path("stage1.md"), "w").write("# Stage 1\n")
-            if stage1_should_fail:
-                return "mock stage1_crew (writer never succeeded, no artifact produced)"
-            from src.tools import write_stage1_output
-            result = write_stage1_output.func(
-                technical_nodes=STAGE1_TECHNICAL, procedural_nodes=[], cognitive_nodes=[], trust_boundaries=[],
-            )
-            assert result.startswith("WRITTEN")
+            # NOTE: the structured JSON write no longer happens inside the
+            # crew — it's done by compile_stage1_structured_output() outside
+            # the agent executor (patched separately in _run_pipeline). This
+            # mock only produces the prose artifact, matching the real crew.
             return "mock stage1_crew"
 
         if kind == "stage2":
@@ -132,22 +129,9 @@ def _build_mock_kickoff(captured, *, stage1_should_fail=False):
         open(run_context.artifact_path("stage3.md"), "w").write(
             "# STAGE 3\n\n### RT-001 — Test\n**Category:** 1\nx\n\n"
             "## PRE-STAGE-4 SAFETY REVIEW\nNO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED.\n")
-        from src.tools import write_stage3_test_plan
-        plan3 = {
-            "schema_version": 1, "plan_title": "x",
-            "test_concepts": [{
-                "test_id": "RT-001", "title": "x", "objective": "x", "stage2_vector_ids": ["V-01"],
-                "kcag_path": ["ADV_START", "G1"], "path_relationship": "PRIORITY_PATH", "target_node_ids": [],
-                "categories": [1], "execution_techniques": [{"technique_id": "T1078", "vector_id": "V-01", "rationale": "x"}],
-                "defensive_concepts": ["x"], "mechanism_summary": "x", "preconditions": ["x"], "expected_effects": ["x"],
-                "success_criteria": ["Access confirmed"], "abort_criteria": ["Instability observed"],
-                "rollback_or_recovery_steps": ["x"], "telemetry_requirements": ["x"], "assumptions": ["x"], "safety_controls": None,
-            }],
-            "assessment_safety_review": {"category_2_3_present": False, "covered_test_ids": [],
-                                        "not_required_statement": "NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED."},
-        }
-        result = write_stage3_test_plan.func(test_plan_json=json.dumps(plan3))
-        assert result.startswith("WRITTEN")
+        # The analysis crew now produces PROSE ONLY. The structured Stage 3
+        # test plan is compiled outside the crew by
+        # compile_stage3_structured_output(), patched in _run_pipeline.
         return "mock analysis_crew"
 
     return mock_kickoff
@@ -205,22 +189,93 @@ def pipeline_workspace(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _run_pipeline(run_id_hint, *, stage1_should_fail=False):
+def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=False,
+                  stage3_semantic_recovery=False):
     """run_id_hint is NOT the actual run_id the pipeline will use --
     new_run_id() always generates its own vaf_<timestamp> ID, ignoring
     any pre-created directory name. Returns the REAL run_id discovered
     from outputs/ after the run, so callers can find the real
-    assessment_state.json."""
+    assessment_state.json.
+
+    Both the Stage 1 and Stage 3 structured writes now happen via
+    compile_*_structured_output() outside the CrewAI agent executor,
+    making real HTTP calls to Ollama. We patch both helpers here: on
+    success each writes a minimal valid artifact through the real writer
+    tool; on *_should_fail, each raises RuntimeError exactly as the real
+    helper does after exhausting retries, so the hard gates are
+    exercised."""
+    import src.stage1_writer as stage1_writer_module
+    import src.stage3_writer as stage3_writer_module
+    from src.tools import write_stage1_output, write_stage3_test_plan
+
+    def _fake_compile_stage1(*, stage1_prose, llm, writer_tool, artifact_path, **kwargs):
+        if stage1_should_fail:
+            raise RuntimeError(
+                "Stage 1 structured write failed after 3 attempts. "
+                "See terminal output above for per-attempt details."
+            )
+        result = write_stage1_output.func(
+            technical_nodes=STAGE1_TECHNICAL, procedural_nodes=[],
+            cognitive_nodes=[], trust_boundaries=[],
+        )
+        assert result.startswith("WRITTEN"), result
+
+    _compile_calls = {"stage3": 0}
+
+    def _fake_compile_stage3(*, stage3_prose, referential_context, llm,
+                             writer_tool, artifact_path, **kwargs):
+        if stage3_should_fail:
+            raise RuntimeError(
+                "Stage 3 structured write failed after 3 attempts. "
+                "See terminal output above for per-attempt details."
+            )
+        _compile_calls["stage3"] += 1
+        # In semantic-recovery mode, the FIRST candidate has a bad kcag_path
+        # (deep validation will reject it); the SECOND is valid. This
+        # exercises the stage3_flow semantic-repair loop end-to-end in crew.py.
+        bad_first = stage3_semantic_recovery and _compile_calls["stage3"] == 1
+        plan3 = {
+            "schema_version": 1, "plan_title": "x",
+            "test_concepts": [{
+                "test_id": "RT-001", "title": "x", "objective": "x",
+                "stage2_vector_ids": ["V-01"],
+                "kcag_path": (["ADV_START", "NOT_A_REAL_NODE"] if bad_first
+                              else ["ADV_START", "G1"]),
+                "path_relationship": "PRIORITY_PATH", "target_node_ids": [],
+                "categories": [1],
+                "execution_techniques": [{"technique_id": "T1078", "vector_id": "V-01", "rationale": "x"}],
+                "defensive_concepts": ["x"], "mechanism_summary": "x",
+                "preconditions": ["x"], "expected_effects": ["x"],
+                "success_criteria": ["Access confirmed"], "abort_criteria": ["Instability observed"],
+                "rollback_or_recovery_steps": ["x"], "telemetry_requirements": ["x"],
+                "assumptions": ["x"], "safety_controls": None,
+            }],
+            "assessment_safety_review": {"category_2_3_present": False, "covered_test_ids": [],
+                                        "not_required_statement": "NO CATEGORY 2/3 PAYLOADS — PHASE 0 SAFETY GATE NOT REQUIRED."},
+        }
+        result = write_stage3_test_plan.func(test_plan_json=json.dumps(plan3))
+        assert result.startswith("WRITTEN"), result
+
     captured = {}
     crewai.Crew.kickoff = _build_mock_kickoff(captured, stage1_should_fail=stage1_should_fail)
     os.makedirs("outputs", exist_ok=True)
     before = set(os.listdir("outputs"))
     sys.argv = ["src.crew"]
-    try:
-        runpy.run_module("src.crew", run_name="__main__")
-        result = "SUCCESS"
-    except RuntimeError as e:
-        result = f"RuntimeError: {e}"
+
+    import unittest.mock as _mock
+    # crew.py imports compile_stage1_structured_output inside the function
+    # body (patch the source module) and compile_stage3_structured_output
+    # at module top-level (patch the source module too — the name is looked
+    # up on src.stage3_writer at call time when we patch the attribute
+    # there before crew import resolves it, and crew re-imports src.crew
+    # fresh via runpy each run).
+    with _mock.patch.object(stage1_writer_module, "compile_stage1_structured_output", _fake_compile_stage1), \
+         _mock.patch.object(stage3_writer_module, "compile_stage3_structured_output", _fake_compile_stage3):
+        try:
+            runpy.run_module("src.crew", run_name="__main__")
+            result = "SUCCESS"
+        except RuntimeError as e:
+            result = f"RuntimeError: {e}"
     after = set(os.listdir("outputs"))
     new_dirs = after - before
     real_run_id = new_dirs.pop() if new_dirs else run_id_hint
@@ -233,19 +288,23 @@ def test_full_pipeline_succeeds_with_split_stage012_crews(pipeline_workspace):
     assert captured["crews_run"] == ["stage0", "stage1", "stage2", "analysis", "stage4"]
 
 
-def test_stage1_crew_is_split_into_prose_and_write_tasks(pipeline_workspace):
+def test_stage1_crew_runs_prose_only_with_direct_write_outside_executor(pipeline_workspace):
     """Stage 1's prompt used to combine three prose layers plus a trailing
     four-argument tool call in one task -- observed directly to let the
     model treat a complete-looking prose answer as finishing the whole
-    task, with the write_stage1_output call never even attempted. Splitting
-    it into a prose task and a separate, single-purpose write task is the
-    actual fix; this asserts the split is real (stage1_crew is constructed
-    with 2 tasks), not just present in the task description text."""
+    task, with the write_stage1_output call never even attempted. The fix
+    evolved past a two-task split: the structured write now happens OUTSIDE
+    CrewAI's agent executor entirely, via compile_stage1_structured_output()
+    (Ollama structured output + deterministic writer), because the CrewAI
+    agent executor itself was returning empty native-tool responses for
+    this model. This asserts stage1_crew is now a prose-only crew (1 task),
+    with the write handled by the patched helper in _run_pipeline."""
     result, captured, _ = _run_pipeline("split_check_run")
     assert result == "SUCCESS", result
-    assert captured.get("stage1_crew_task_count") == 2, (
-        f"expected stage1_crew to be constructed with 2 tasks (prose + write), "
-        f"got {captured.get('stage1_crew_task_count')}"
+    assert captured.get("stage1_crew_task_count") == 1, (
+        f"expected stage1_crew to be a prose-only crew (1 task), with the "
+        f"structured write handled outside the executor, got "
+        f"{captured.get('stage1_crew_task_count')}"
     )
 
 
@@ -256,7 +315,10 @@ def test_missing_stage1_artifact_prevents_stage2(pipeline_workspace):
     prose, not silently proceed."""
     result, captured, _ = _run_pipeline("stage1_fail_run", stage1_should_fail=True)
     assert result.startswith("RuntimeError")
-    assert "stage1_output.json" in result
+    # The failure now surfaces from compile_stage1_structured_output()
+    # exhausting its retries, rather than the old in-crew writer-missing
+    # message. Either way, the hard gate must prevent Stage 2.
+    assert "Stage 1 structured write failed" in result or "stage1_output.json" in result
     assert captured["crews_run"] == ["stage0", "stage1"], (
         f"Stage 2 (or later) crew was constructed despite Stage 1's artifact never "
         f"being written: {captured['crews_run']}"
@@ -303,3 +365,42 @@ def test_missing_stage0_artifact_prevents_stage1(pipeline_workspace, monkeypatch
         f"Stage 1 (or later) crew was constructed despite Stage 0's artifact never "
         f"being written: {captured['crews_run']}"
     )
+
+
+def test_stage3_compile_failure_fails_closed_and_blocks_stage4(pipeline_workspace):
+    """When compile_stage3_structured_output exhausts its retries, the
+    pipeline must fail closed at Stage 3 and never construct Stage 4."""
+    result, captured, _ = _run_pipeline("stage3_fail_run", stage3_should_fail=True)
+    assert result.startswith("RuntimeError")
+    assert "Stage 3 structured write failed" in result
+    assert "stage4" not in captured["crews_run"], (
+        f"Stage 4 crew was constructed despite Stage 3 compile failure: "
+        f"{captured['crews_run']}"
+    )
+
+
+def test_stage3_compile_failure_marks_correct_state(pipeline_workspace):
+    result, captured, real_run_id = _run_pipeline("stage3_fail_state_run", stage3_should_fail=True)
+    assert result.startswith("RuntimeError")
+    state = json.load(open(os.path.join("outputs", real_run_id, "assessment_state.json")))
+    assert state["current_stage"] == "stage3"
+    assert state["stages"]["stage3"]["status"] == "FAIL"
+
+
+def test_stage3_semantic_recovery_recompiles_after_deep_validation_failure(pipeline_workspace):
+    """The stage3_flow orchestrator, wired into crew.py: when the FIRST
+    compiled candidate fails deep referential validation (a kcag_path node
+    that isn't in the real graph), the pipeline must archive it, recompile,
+    and succeed on the valid second candidate — reaching Stage 4."""
+    result, captured, real_run_id = _run_pipeline(
+        "stage3_recover_run", stage3_semantic_recovery=True)
+    assert result == "SUCCESS", result
+    assert "stage4" in captured["crews_run"], captured["crews_run"]
+    # The first (invalid) candidate was archived by the semantic loop.
+    out = os.path.join("outputs", real_run_id)
+    archived = [f for f in os.listdir(out) if f.startswith("stage3_test_plan.json.semantic_rejected_")]
+    assert archived, f"expected an archived rejected candidate in {os.listdir(out)}"
+    # The authoritative candidate that remains is the valid one.
+    final_plan = json.load(open(os.path.join(out, "stage3_test_plan.json")))
+    data = final_plan.get("data", final_plan)
+    assert data["test_concepts"][0]["kcag_path"] == ["ADV_START", "G1"]

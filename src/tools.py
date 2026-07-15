@@ -1043,6 +1043,25 @@ KCAG_DIFFICULTIES = frozenset({"LOW", "MEDIUM", "HIGH"})
 KCAG_EFFECTS = frozenset({None, "DECEIVE", "DISRUPT", "DEGRADE", "DESTROY"})
 KCAG_VECTOR_ID_PATTERN = re.compile(r"^V-\d{2,}$")
 
+# Reconciles single-digit vec IDs (V-1) to the canonical zero-padded,
+# two-digit form (V-01) required by KCAG_VECTOR_ID_PATTERN. Deliberately
+# narrow: it ONLY touches the exact pattern V-<one digit>. Anything else —
+# V-01 (already canonical), V-10 (already valid), V-001 (already valid),
+# or a genuinely malformed value like "VEC1" — is returned unchanged so it
+# is still validated/rejected downstream exactly as before. This is a
+# format reconciliation, not a repair-anything net.
+_SINGLE_DIGIT_VEC = re.compile(r"^V-(\d)$")
+
+
+def normalize_vec_id(value: str) -> str:
+    """Zero-pad a single-digit vec ID (V-1 -> V-01). Leaves every other
+    value untouched, including already-canonical, multi-digit, and
+    malformed IDs."""
+    match = _SINGLE_DIGIT_VEC.fullmatch(value)
+    if match:
+        return f"V-0{match.group(1)}"
+    return value
+
 
 @tool("write_stage2_vectors")
 def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> str:
@@ -1072,6 +1091,24 @@ def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]
     if not isinstance(nodes, list) or not isinstance(edges, list):
         return "REJECTED: 'nodes' and 'edges' must both be lists. Nothing written."
 
+    # Normalize single-digit vec IDs (V-1 -> V-01) to the canonical
+    # zero-padded form BEFORE duplicate detection, validation, hashing,
+    # and writing — so the artifact only ever contains canonical IDs and
+    # every downstream exact-string match (Stage 3/4 vector_id references,
+    # Purple compiler bindings) sees the same canonical form. Normalization
+    # can itself CREATE a collision (a payload containing both V-1 and V-01
+    # both become V-01), so duplicate-vec detection runs on the normalized
+    # values below.
+    normalized_edges = []
+    for e in edges:
+        if isinstance(e, dict):
+            ne = dict(e)
+            ne["vec"] = normalize_vec_id(str(ne.get("vec", "")))
+            normalized_edges.append(ne)
+        else:
+            normalized_edges.append(e)
+    edges = normalized_edges
+
     errors = []
     node_ids = set()
     for i, n in enumerate(nodes):
@@ -1088,6 +1125,7 @@ def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]
         if not isinstance(crit, int) or not (1 <= crit <= 10):
             errors.append(f"node '{nid}' criticality must be int 1-10, got {crit}")
 
+    seen_vecs = set()
     for i, e in enumerate(edges):
         if not isinstance(e, dict) or "source" not in e or "target" not in e:
             errors.append(f"edge[{i}] missing source/target"); continue
@@ -1098,6 +1136,13 @@ def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]
         diff = str(e.get("difficulty", "MEDIUM")).upper()
         if diff not in VALID_DIFF:
             errors.append(f"edge[{i}] difficulty '{diff}' invalid (LOW|MEDIUM|HIGH)")
+        # Duplicate vec detection runs on NORMALIZED values, so a payload
+        # containing both V-1 and V-01 (which collide to V-01) is caught.
+        vec_val = e.get("vec")
+        if vec_val in seen_vecs:
+            errors.append(f"edge[{i}] has duplicate vec '{vec_val}' "
+                          f"(possibly a collision created by V-N/V-0N normalization)")
+        seen_vecs.add(vec_val)
 
     goal_nodes = [n["id"] for n in nodes if isinstance(n, dict) and n.get("node_type") == "goal"]
     if not goal_nodes:

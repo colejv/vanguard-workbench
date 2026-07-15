@@ -215,3 +215,44 @@ def read_stamped_prose(path: str) -> str:
             f"corpus snapshot."
         )
     return content[m.end():]
+
+
+def read_or_migrate_legacy_stamped_prose(path: str) -> str:
+    """Like read_stamped_prose, but performs a one-time legacy migration
+    for the SPECIFIC case of a prose artifact written before prose
+    stamping was enforced (no run-isolation header at all).
+
+    Only the missing-header condition is migrated. A header that IS
+    present but belongs to a different run, or was generated against a
+    different corpus, remains a HARD failure — those indicate genuine
+    cross-run/cross-corpus contamination, never a legacy artifact, and
+    must not be silently rewritten.
+
+    Migration preserves the original as <path>.legacy_unstamped (for the
+    audit trail), stamps the file with the active run's header, then
+    re-verifies via read_stamped_prose so a migration that somehow fails
+    to resolve the condition still fails closed.
+    """
+    import shutil
+
+    try:
+        return read_stamped_prose(path)
+    except ValueError as exc:
+        if "has no run-isolation header" not in str(exc):
+            # Wrong run ID, wrong corpus hash, malformed header — NOT a
+            # legacy artifact. Propagate as a hard failure.
+            raise
+
+        backup_path = f"{path}.legacy_unstamped"
+        if not os.path.exists(backup_path):
+            shutil.copy2(path, backup_path)
+
+        print(
+            "Legacy prose migration: preserving the original as "
+            f"{backup_path} and adding the run-isolation header to {path}.",
+            flush=True,
+        )
+        stamp_prose_file(path)
+
+        # Fail closed unless the migrated artifact now verifies cleanly.
+        return read_stamped_prose(path)

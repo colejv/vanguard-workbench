@@ -33,6 +33,39 @@ from src.tools import (
 )
 
 STAGE3_TEST_HEADING = re.compile(r"^#{2,6}\s+(RT-\d{3})\b.*$", re.IGNORECASE | re.MULTILINE)
+
+
+def stage3_candidate_hash(plan: dict) -> str:
+    """sha256:<hex> of the Stage 3 plan's canonical (sorted-key, compact)
+    JSON. Hashes the PLAN DATA, not the stamped file's bytes, so it is
+    stable across re-stamps of identical content (the stamped file's _meta
+    carries a generated_at timestamp that changes on rewrite). This single
+    function is the source of truth for both the hash recorded in the
+    validation report and the hash compared during resume-state checks, so
+    the two can never diverge."""
+    import hashlib
+    import json
+    payload = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def build_stage3_validation_report(
+    *, plan: dict, plan_validation: dict, consistency: dict,
+    artifact_path: str,
+) -> dict:
+    """Assemble the Stage 3 validation report, binding it to the exact
+    candidate it validated via a canonical-JSON hash. A later resume can
+    then confirm report_candidate_hash == current_candidate_hash and refuse
+    to treat a stale passing report as validating a changed candidate."""
+    return {
+        "is_valid": plan_validation["is_valid"] and consistency["is_consistent"],
+        "plan_validation": plan_validation,
+        "artifact_consistency": consistency,
+        "validated_artifact": {
+            "path": artifact_path,
+            "sha256": stage3_candidate_hash(plan),
+        },
+    }
 _TEST_ID_PATTERN = re.compile(r"^RT-\d{3}$")
 _MIN_TEXT_LENGTH = 8
 

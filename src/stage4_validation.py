@@ -53,6 +53,39 @@ def _err(path: str, code: str, message: str) -> dict:
     return {"path": path, "code": code, "message": message}
 
 
+def stage4_candidate_hash(plan: dict) -> str:
+    """sha256:<hex> of the Stage 4 plan's canonical (sorted-key, compact)
+    JSON. Same rationale and format as stage3_candidate_hash and the
+    existing source_identity binding: hashes the plan DATA, stable across
+    re-stamps, so a resume can confirm a passing report describes the
+    candidate actually on disk. Single source of truth for both the report
+    hash and the resume comparison."""
+    import hashlib
+    import json
+    payload = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def build_stage4_validation_report(
+    *, plan: dict, stage3_test_plan: dict,
+    plan_validation: dict, consistency: dict,
+) -> dict:
+    """Assemble the Stage 4 validation report, preserving the existing
+    source_identity binding (both the stage4 plan hash and the stage3 plan
+    hash it was validated against). Extracting this from crew.py lets the
+    semantic-repair orchestrator build the report per candidate inside the
+    loop, using the identical structure crew.py wrote inline before."""
+    return {
+        "is_valid": plan_validation["is_valid"] and consistency["is_consistent"],
+        "source_identity": {
+            "stage4_execution_plan_sha256": stage4_candidate_hash(plan),
+            "stage3_test_plan_sha256": stage4_candidate_hash(stage3_test_plan),
+        },
+        "plan_validation": plan_validation,
+        "artifact_consistency": consistency,
+    }
+
+
 def _is_placeholder(value: str) -> bool:
     return (value or "").strip().lower() in STAGE3_INVALID_VALUES
 

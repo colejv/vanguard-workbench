@@ -180,3 +180,29 @@ def deduplicate_candidates(candidates: list) -> list:
         seen.add(c.candidate_id)
         out.append(c)
     return out
+
+
+# ---- rejection reason taxonomy (deterministic, one code per rejected item) --
+
+REJECT_EMPTY_QUOTE = "EMPTY_QUOTE"
+REJECT_QUOTE_NOT_FOUND = "QUOTE_NOT_FOUND"
+REJECT_UNKNOWN_SOURCE = "UNKNOWN_SOURCE"
+REJECT_SOURCE_HASH_MISMATCH = "SOURCE_HASH_MISMATCH"
+REJECT_DUPLICATE_CANDIDATE = "DUPLICATE_CANDIDATE"
+REJECT_INVALID_PRIOR = "INVALID_PRIOR"
+REJECT_INVALID_CONTROL = "INVALID_CONTROL"
+
+
+def quote_rejection_diagnostic(*, quote: str, chunk, source_file: str) -> dict:
+    """Safe (non-fuzzy) comparison diagnostics for a rejected quote — length
+    and exact-match only. Never used on the acceptance path; diagnostic only,
+    to help distinguish paraphrase/punctuation/OCR drift from a genuinely
+    absent quote during first-run tuning."""
+    normalized = normalize_source_text(quote)
+    return {
+        "quote_length": len(quote or ""),
+        "normalized_quote_length": len(normalized),
+        "exact_match": normalized in chunk.text if normalized else False,
+        "source_file": source_file,
+        "chunk_id": chunk.chunk_id,
+    }

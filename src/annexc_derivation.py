@@ -561,21 +561,40 @@ def load_frozen_corpus_sources(out_dir: str) -> dict:
     return sources
 
 
-def make_prior_proposer(frozen_sources: Mapping, llm) -> Callable[[Mapping], dict]:
+def make_prior_proposer(frozen_sources: Mapping, llm,
+                        live: bool = True,
+                        diagnostics_out_dir: str | None = None) -> Callable[[Mapping], dict]:
     """Return a propose_priors(corpus_sources) callable.
 
-    STUB IMPLEMENTATION: proposes NOTHING, so every prior falls through to
-    its per-prior no-evidence policy (capability/geo DEFAULT, tempo/posture
-    BLOCK). This lets the full two-phase pipeline integration be verified
-    deterministically before adding live-model variability. The live version
-    (an Ollama call that reads corpus chunks and emits evidence-bound prior
-    records) replaces the body here without changing any caller — the
-    injection point and contract stay identical.
+    live=True (default): delegates to the two-phase live proposer
+    (annexc_proposer.propose_priors_from_corpus) -- per-chunk extraction,
+    deterministic quote verification, then per-prior synthesis over verified
+    evidence only. A prior with no verified corpus support is omitted, so the
+    caller's per-prior no-evidence policy applies.
+
+    live=False: proposes NOTHING (every prior -> no-evidence policy). Used to
+    verify the pipeline wiring deterministically without invoking a model.
+
+    diagnostics_out_dir: when supplied (live=True only), the full
+    instrumented-run artifact set is written run-local under
+    <diagnostics_out_dir>/annexc_proposer/ -- see annexc_diagnostics.py. Pass
+    the active run's out_dir so the first live run is fully classifiable.
+
+    The injection point and contract are identical either way, so the caller
+    (derive_annexc_inputs) is unchanged.
     """
-    def _propose(corpus_sources: Mapping) -> dict:
-        # Stub: no evidence proposed -> no-evidence policy applies to all four.
-        return {}
-    return _propose
+    if not live or llm is None:
+        def _propose_stub(corpus_sources: Mapping) -> dict:
+            return {}
+        return _propose_stub
+
+    def _propose_live(corpus_sources: Mapping) -> dict:
+        # Import here so the deterministic core has no hard dependency on the
+        # model-facing module (keeps unit tests of the core model-free).
+        from src.annexc_proposer import propose_priors_from_corpus
+        return propose_priors_from_corpus(frozen_sources=corpus_sources, llm=llm,
+                                          diagnostics_out_dir=diagnostics_out_dir)
+    return _propose_live
 
 
 # ---- two-phase pipeline gate --------------------------------------------
@@ -612,7 +631,8 @@ def run_annexc_derivation_gate(*, state, run_id, out_dir, corpus_manifest_hash,
             reason_llm = None
         derivation = derive_annexc_inputs(
             corpus_sources=frozen_sources, policy=policy,
-            propose_priors=make_prior_proposer(frozen_sources, reason_llm),
+            propose_priors=make_prior_proposer(frozen_sources, reason_llm,
+                                               diagnostics_out_dir=out_dir),
         )
         cfg = compile_bbn_assessment_config(derivation)
         cv = validate_bbn_assessment_config(cfg)

@@ -1675,7 +1675,8 @@ def extract_kcag_objective_score(kcag_report: dict) -> dict:
 
 # --- Annex C: pgmpy five-layer BBN threat inference ---
 @tool("bbn_threat_score")
-def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_priors.json") -> str:
+def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_priors.json",
+                     approved_config_path: str = "") -> str:
     """Construct an evidence-driven Bayesian threat model, run inference, and
     return a threat score, kill-chain phase estimate, and a CPD audit log.
 
@@ -1756,6 +1757,33 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
             cfg = json.loads(cpd_config_json)
         except json.JSONDecodeError as e:
             return f"ERROR: cpd_config_json is not valid JSON ({e}). Refusing to run on undefined input."
+
+    # ---- APPROVED-CONFIG BOUNDARY (fail closed) -----------------------------
+    # When an approved run-scoped Annex C assessment config exists, it is the
+    # ONLY configuration that may be scored. The analyst reviewed and approved
+    # that exact config (bound by review_subject_hash in the approval record).
+    # An agent that hands this tool a DIFFERENT cpd_config_json after approval
+    # must not be able to substitute it -- that would score an unreviewed
+    # configuration. So: load the approved config, and if the agent supplied
+    # one that differs (by canonical hash), refuse; if the agent supplied
+    # nothing, use the approved config. This is the tool-boundary half of the
+    # hash-bound derivation-approval gate enforced in crew.py.
+    if approved_config_path and os.path.exists(approved_config_path):
+        try:
+            approved_cfg = json.load(open(approved_config_path))
+        except (json.JSONDecodeError, OSError) as e:
+            return (f"ERROR: approved config at {approved_config_path} is unreadable "
+                    f"({e}). Refusing to run Annex C scoring.")
+        # The approved artifact may be run-stamped ({"data": {...}}); unwrap.
+        if isinstance(approved_cfg, dict) and "data" in approved_cfg and "_meta" in approved_cfg:
+            approved_cfg = approved_cfg["data"]
+        if cfg:
+            if canonical_json_sha256(cfg) != canonical_json_sha256(approved_cfg):
+                return ("ERROR: SUBSTITUTED_ASSESSMENT_CONFIG — the supplied cpd_config_json "
+                        "does not match the analyst-approved Annex C configuration. Refusing to "
+                        "score an unreviewed configuration. Re-run derivation and obtain approval, "
+                        "or omit cpd_config_json to score the approved config.")
+        cfg = approved_cfg
 
     # ---- Deterministic numeric validation of the per-assessment config,
     # BEFORE any field is read into a calculation. Same validator preflight

@@ -77,12 +77,16 @@ def test_annexb_requires_tool_result_and_heuristic_language():
 
 
 def test_annexc_requires_input_provenance():
+    # The Annex C contract CHANGED: the modeler no longer AUTHORS the config
+    # (that is now the derivation subsystem's job). It must instead score the
+    # analyst-APPROVED config. This test enforces the new contract.
     tasks = build_tasks("/tmp/test-run")
     description = tasks["t_annexC"].description.lower()
-    assert "input provenance" in description
-    assert "do not invent" in description
-    assert "blocking gap" in description
-    assert "analyst judgment" in description
+    assert "approved" in description
+    assert "annexc_assessment_config.json" in description
+    assert "approved_config_path" in description
+    assert "do not supply your own config" in description
+    assert "do not author" in description or "do not author the per-assessment" in description
 
 
 def test_annexb_task_still_assigned_to_modeler_with_unchanged_tools():

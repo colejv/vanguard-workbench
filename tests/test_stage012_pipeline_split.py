@@ -298,6 +298,15 @@ def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=F
     sys.argv = ["src.crew"]
 
     import unittest.mock as _mock
+    import src.annexc_derivation as _annexc_mod
+
+    # The Annex C derivation approval gate is exercised by its own dedicated
+    # tests (test_annexc_derivation.py). Here we bypass it so this pipeline
+    # test stays focused on stage flow: the whole two-phase gate is one
+    # patchable function that we make a no-op (allow).
+    def _bypass_derivation_gate(**kwargs):
+        return None
+
     # crew.py imports compile_stage1_structured_output inside the function
     # body (patch the source module) and compile_stage3_structured_output
     # at module top-level (patch the source module too — the name is looked
@@ -306,7 +315,8 @@ def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=F
     # fresh via runpy each run).
     with _mock.patch.object(stage1_writer_module, "compile_stage1_structured_output", _fake_compile_stage1), \
          _mock.patch.object(stage3_writer_module, "compile_stage3_structured_output", _fake_compile_stage3), \
-         _mock.patch.object(stage4_writer_module, "compile_stage4_structured_output", _fake_compile_stage4):
+         _mock.patch.object(stage4_writer_module, "compile_stage4_structured_output", _fake_compile_stage4), \
+         _mock.patch.object(_annexc_mod, "run_annexc_derivation_gate", _bypass_derivation_gate):
         try:
             runpy.run_module("src.crew", run_name="__main__")
             result = "SUCCESS"

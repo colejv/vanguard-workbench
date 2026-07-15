@@ -16,6 +16,8 @@ from src.stage3_identity import SemanticIdentityMutation
 from src.stage_transition import evaluate_stage3_transition, StageTransitionBlocked
 from src.safety_timeline import (build_safety_timeline_contract,
                                  SafetyTimelineContradiction, SafetyTimelineAmbiguous)
+from src.annexc_derivation import (
+    run_annexc_derivation_gate, DerivationApprovalBlocked)
 from src.stage3_writer import compile_stage3_structured_output, build_referential_context
 from src.stage4_validation import (validate_stage4_execution_plan, check_stage4_artifact_consistency,
                                    build_stage4_validation_report, stage4_candidate_hash)
@@ -695,6 +697,20 @@ if __name__ == "__main__":
               "stage3_test_plan.json missing — compiling the structured "
               "plan from existing prose without rerunning analysis_crew.")
     else:
+        # ---- ANNEX C DERIVATION + APPROVAL GATE (two-phase, fail closed) ----
+        # Before the analysis crew runs t_annexC (which scores the APPROVED
+        # config), the four BBN priors must be derived from the frozen corpus,
+        # validated, compiled, and APPROVED by the analyst. Two-phase human
+        # gate (derive+stop, then approve+resume), same shape as the Annex C
+        # -> Stage 3 block. Delegated to a single module function so the whole
+        # gate is one patchable unit and crew.py stays thin.
+        run_annexc_derivation_gate(
+            state=state, run_id=run_id, out_dir=out_dir,
+            corpus_manifest_hash=corpus_manifest_hash,
+            run_context=run_context, set_stage_status=set_stage_status,
+            save_assessment_state=save_assessment_state, StageStatus=StageStatus,
+        )
+
         analysis_tasks = build_analysis_tasks(
             t_kcag_review=t_kcag_review,
             t_annexB=t_annexB,

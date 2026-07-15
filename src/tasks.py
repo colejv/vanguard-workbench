@@ -616,9 +616,11 @@ def build_stage4_task(out_dir: str, stage3_content: str, stage3_test_plan: dict)
             "A deterministic check reads this output for exactly this language after you finish; an "
             "omitted or ambiguous safety-gate statement on a Category 2/3 payload set will halt the run.\n\n"
             "CRITICAL INSTRUCTION — STRUCTURED STAGE 4 PLAN: after drafting the human-readable MDMP plan "
-            "above, call `write_stage4_execution_plan` exactly once. The Markdown and structured JSON must "
-            "describe the same phases, actions, test concepts, safety disposition, telemetry requirements, "
-            "and abort controls — do not add a phase or action to one and omit it from the other.\n"
+            "above, make the prose COMPLETE and UNAMBIGUOUS enough that a deterministic compiler can build "
+            "the structured execution plan from it after this crew finishes — you do NOT call any writer "
+            "tool yourself. The Markdown you produce must fully describe every phase, action, test concept, "
+            "safety disposition, telemetry requirement, and abort control, so the compiled JSON and the "
+            "prose describe the same plan.\n"
             "  The structured Stage 3 test plan (embedded above) remains authoritative for test IDs, "
             "categories, Stage 2 vector references, KCAG paths, execution technique references, success "
             "criteria, abort criteria, recovery requirements, telemetry requirements, and Category 2/3 "
@@ -643,12 +645,12 @@ def build_stage4_task(out_dir: str, stage3_content: str, stage3_test_plan: dict)
             "it now."
         ),
         expected_output=(
-            "A human-reviewed MDMP mission plan in stage4_mission_plan.md and confirmation that the "
-            "matching structured execution plan was written to stage4_execution_plan.json."
+            "A human-reviewed MDMP mission plan in stage4_mission_plan.md, complete enough for the "
+            "post-crew compiler to build the matching structured execution plan."
         ),
         agent=red_team_lead,
         context=[],
-        tools=[write_stage4_execution_plan],
+        tools=[],
         human_input=True,
         output_file=f"{out_dir}/stage4_mission_plan.md",
     )

@@ -206,7 +206,8 @@ def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=F
     exercised."""
     import src.stage1_writer as stage1_writer_module
     import src.stage3_writer as stage3_writer_module
-    from src.tools import write_stage1_output, write_stage3_test_plan
+    import src.stage4_writer as stage4_writer_module
+    from src.tools import write_stage1_output, write_stage3_test_plan, write_stage4_execution_plan
 
     def _fake_compile_stage1(*, stage1_prose, llm, writer_tool, artifact_path, **kwargs):
         if stage1_should_fail:
@@ -256,6 +257,34 @@ def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=F
         result = write_stage3_test_plan.func(test_plan_json=json.dumps(plan3))
         assert result.startswith("WRITTEN"), result
 
+    def _fake_compile_stage4(*, stage4_prose, referential_context, stage3_test_plan,
+                             llm, writer_tool, artifact_path, **kwargs):
+        # Mirrors the real compiler contract: writes a valid Stage 4 plan via
+        # the real writer tool, deriving the Phase 0 gate from the Stage 3
+        # plan exactly as the production overlay does.
+        from src.stage4_writer import build_stage4_phase0_gate
+        plan4 = {
+            "schema_version": 1, "plan_id": "MP-001", "plan_title": "Test Mission Plan",
+            "artifact_role": "HUMAN_REVIEWED_MISSION_PLAN_DRAFT",
+            "execution_authorization": "NOT_GRANTED",
+            "source_stage3_test_ids": ["RT-001"],
+            "phase0_safety_gate": build_stage4_phase0_gate(stage3_test_plan),
+            "test_bindings": [{"test_id": "RT-001", "categories": [1], "stage2_vector_ids": ["V-01"],
+                               "kcag_path": ["ADV_START", "G1"], "technique_ids": ["T1078"],
+                               "assigned_action_ids": ["ACT-001"]}],
+            "phases": [{"phase_id": "PHASE-01", "sequence": 1, "name": "Recon", "purpose": "x",
+                        "entry_criteria": ["start"], "exit_criteria": ["done"],
+                        "actions": [{"action_id": "ACT-001", "test_id": "RT-001", "action_summary": "x",
+                                     "responsible_roles": ["operator"], "preconditions": ["x"],
+                                     "success_criteria": ["Access confirmed"], "abort_criteria": ["Instability observed"],
+                                     "rollback_or_recovery_steps": ["x"], "telemetry_requirements": ["x"],
+                                     "alert_triggers": ["anomaly"], "opsec_measures": ["encrypted comms"]}]}],
+            "global_opsec_measures": ["minimize footprint"], "assumptions": ["lab environment"],
+            "limitations": ["scope limited to test range"],
+        }
+        result = write_stage4_execution_plan.func(execution_plan_json=json.dumps(plan4))
+        assert result.startswith("WRITTEN"), result
+
     captured = {}
     crewai.Crew.kickoff = _build_mock_kickoff(captured, stage1_should_fail=stage1_should_fail)
     os.makedirs("outputs", exist_ok=True)
@@ -270,7 +299,8 @@ def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=F
     # there before crew import resolves it, and crew re-imports src.crew
     # fresh via runpy each run).
     with _mock.patch.object(stage1_writer_module, "compile_stage1_structured_output", _fake_compile_stage1), \
-         _mock.patch.object(stage3_writer_module, "compile_stage3_structured_output", _fake_compile_stage3):
+         _mock.patch.object(stage3_writer_module, "compile_stage3_structured_output", _fake_compile_stage3), \
+         _mock.patch.object(stage4_writer_module, "compile_stage4_structured_output", _fake_compile_stage4):
         try:
             runpy.run_module("src.crew", run_name="__main__")
             result = "SUCCESS"

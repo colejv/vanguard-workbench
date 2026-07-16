@@ -74,7 +74,7 @@ lxml_html_clean==0.4.5
 Markdown==3.10.2
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3
-mcp==1.26.0
+mcp==1.27.2
 mdit-py-plugins==0.6.1
 mdurl==0.1.2
 mitreattack-python==6.1.0

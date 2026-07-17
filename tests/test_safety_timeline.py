@@ -157,3 +157,64 @@ def test_contradiction_stops_before_any_stage4_compile():
         contract.require_consistent()
         _fake_compile()  # unreachable
     assert compile_called["n"] == 0, "compiler ran despite a timeline contradiction"
+
+def test_maximum_termination_time_is_test_termination():
+    from src.safety_timeline import classify_control
+
+    assert classify_control(
+        "Maximum termination time: 120 minutes"
+    ) == "TEST_TERMINATION"
+
+
+
+def test_active_process_termination_is_test_termination():
+    from src.safety_timeline import classify_control
+
+    assert classify_control(
+        'The Red Team Lead must communicate a "STOP" command '
+        "to all operators; termination of all active processes "
+        "must be confirmed within 15 seconds."
+    ) == "TEST_TERMINATION"
+
+
+def test_terminate_all_active_processes_is_test_termination():
+    from src.safety_timeline import classify_control
+
+    assert classify_control(
+        "Terminate all active processes within 15 seconds."
+    ) == "TEST_TERMINATION"
+
+
+def test_confirmation_of_termination_is_test_termination():
+    from src.safety_timeline import classify_control
+
+    assert classify_control(
+        "Confirmation of termination must be achieved "
+        "in less than 15 seconds."
+    ) == "TEST_TERMINATION"
+
+
+def test_termination_must_be_confirmed_is_test_termination():
+    from src.safety_timeline import classify_control
+
+    assert classify_control(
+        "Termination must be confirmed within 15 seconds."
+    ) == "TEST_TERMINATION"
+
+
+def test_active_process_termination_confirmation():
+    from src.safety_timeline import classify_control
+
+    assert classify_control(
+        "Termination of the active process must be "
+        "confirmed within 15 seconds."
+    ) == "TEST_TERMINATION"
+
+
+def test_all_active_processes_termination_confirmation():
+    from src.safety_timeline import classify_control
+
+    assert classify_control(
+        "Termination of all active processes shall be "
+        "completed within 15 seconds."
+    ) == "TEST_TERMINATION"

@@ -87,6 +87,11 @@ _CONTROL_KEYWORDS = {
         "recover to", "return to baseline",
     ),
     "TEST_TERMINATION": (
+        'termination of all active processes',
+        'terminate all active processes',
+        'all active processes must terminate',
+        'termination of active processes',
+        "maximum termination time",
         "test termination", "terminate the test", "test must terminate",
         "halt the test", "abort the test", "effect chain", "terminate execution",
         "cease the test", "end the test",
@@ -103,6 +108,25 @@ def classify_control(context_text: str) -> str:
     for control, keywords in _CONTROL_KEYWORDS.items():
         if any(kw in ctx for kw in keywords):
             matched.add(control)
+    # Recognize explicit grammatical variants that unambiguously describe
+    # completion of test termination. Do not classify the word
+    # "termination" by itself because it could refer to another control.
+    if not matched and re.search(
+        r"\b(?:"
+        r"confirmation of termination|"
+        r"termination confirmation|"
+        r"termination (?:must|shall|should) be "
+        r"(?:achieved|confirmed|completed)|"
+        r"termination of (?:the )?(?:all )?active "
+        r"process(?:es)? (?:must|shall|should) be "
+        r"(?:achieved|confirmed|completed)|"
+        r"termination (?:was|is) "
+        r"(?:achieved|confirmed|completed)"
+        r")\b",
+        ctx,
+    ):
+        matched.add("TEST_TERMINATION")
+
     if len(matched) == 1:
         return next(iter(matched))
     # Zero or multiple -> we cannot determine the control deterministically.

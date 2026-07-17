@@ -106,3 +106,18 @@ def test_annexb_annexc_context_chain_unchanged():
     tasks = build_tasks("/tmp/test-run")
     assert tasks["t_annexB"].context == [tasks["t_stage2"]]
     assert tasks["t_annexC"].context == [tasks["t_annexB"]]
+
+
+def test_stage2_requires_chained_paths_through_declared_nodes():
+    """Pins the Stage 2 KCAG-connectivity fix: ADV_START must be sole root,
+    every declared node must be used in an edge, and vectors must route
+    THROUGH identified components rather than a flat ADV_START->goal edge
+    that merely mentions a technique. Regression guard for the
+    vaf_20260714_155844 orphan-property-node defect (C-T-02/03/05 declared
+    but never wired into the edge chain)."""
+    tasks = build_tasks("/tmp/test-run")
+    description = tasks["t_stage2"].description.lower()
+    assert "sole entry node" in description
+    assert "must be the source or target of at least one edge" in description
+    assert "intermediate hop" in description
+    assert "not a direct adv_start-to-goal edge" in description

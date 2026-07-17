@@ -2,9 +2,9 @@
 Deterministic, side-effect-explicit functions for the run-level assessment
 state / audit trail.
 
-Mirrors the style of src/tools.py's verify_stage2_vectors / write_stage2_vectors:
-plain functions, explicit file I/O, no hidden global state, dict/model
-return values that crew.py can act on directly.
+Mirrors the style of src/tools.py's verify_stage2_vectors /
+write_stage2_vectors: plain functions, explicit file I/O, no hidden global
+state, dict/model return values that crew.py can act on directly.
 
 crew.py is the ONLY place that sequences a run. Functions here are called
 by crew.py, not by agents/tools — this is orchestration plumbing, not an
@@ -19,71 +19,127 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from src.schemas import AssessmentState, GapLogEntry, StageRecord, StageStatus, STAGE_NAMES
+from src.schemas import (
+    AssessmentState,
+    GapLogEntry,
+    StageRecord,
+    StageStatus,
+    STAGE_NAMES,
+)
 
 
 def new_run_id(now: Optional[datetime] = None) -> str:
     """
-    Generate a run_id of the form vaf_<YYYYMMDD>_<HHMMSS> (UTC).
+    Generate a run_id of the form vaf_<YYYYMMDD>_<HHMMSS> in UTC.
 
-    `now` is injectable for testing; defaults to the actual current UTC time.
+    `now` is injectable for testing; it defaults to the current UTC time.
     """
-    ts = now or datetime.now(timezone.utc)
-    return f"vaf_{ts.strftime('%Y%m%d_%H%M%S')}"
+
+    timestamp = now or datetime.now(timezone.utc)
+    return f"vaf_{timestamp.strftime('%Y%m%d_%H%M%S')}"
 
 
-def run_output_dir(run_id: str, base: str = "outputs") -> str:
-    """outputs/<run_id> — the scoping root for every artifact this run produces."""
+def run_output_dir(
+    run_id: str,
+    base: str = "outputs",
+) -> str:
+    """Return the run-scoped output directory."""
+
     return os.path.join(base, run_id)
 
 
 def hash_file(path: str) -> str:
-    """sha256:<hex> of a file's bytes. Matches the format used by snapshot_corpus
-    in crew.py, minus the 'sha256:' prefix there — we add it here explicitly
-    so output_hash is self-describing in the JSON."""
-    with open(path, "rb") as f:
-        digest = hashlib.sha256(f.read()).hexdigest()
-    return f"sha256:{digest}"
+    """
+    Return the SHA-256 hash of a file's bytes.
+
+    The returned value includes the `sha256:` prefix so artifact identities
+    are self-describing in assessment_state.json.
+    """
+
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+
+    return f"sha256:{digest.hexdigest()}"
 
 
 def canonical_json_sha256(value: object) -> str:
-    """sha256:<hex> of canonical (sorted-key, compact) JSON -- not a
-    Python repr, and not dependent on key insertion order. Two
-    structurally-identical dicts always hash identically. Used to bind
-    a validation report to the exact in-memory artifact it validated
-    (e.g. stage4_execution_plan_validation.json's source_identity),
-    the same way hash_file() above binds a report to an exact file on
-    disk."""
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"),
-                         ensure_ascii=False, allow_nan=False).encode("utf-8")
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
+    """
+    Return the SHA-256 hash of canonical JSON.
+
+    Sorting keys and using compact separators makes the hash independent of
+    dictionary insertion order.
+    """
+
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
-def init_assessment_state(run_id: str, corpus_manifest_hash: str) -> AssessmentState:
-    """Create a fresh AssessmentState for a new run. Does not write to disk —
-    call save_assessment_state() separately, same two-step pattern as
-    write_stage2_vectors + verify_stage2_vectors."""
-    return AssessmentState(run_id=run_id, corpus_manifest_hash=corpus_manifest_hash)
+def init_assessment_state(
+    run_id: str,
+    corpus_manifest_hash: str,
+) -> AssessmentState:
+    """
+    Create a fresh AssessmentState.
+
+    This function does not write to disk. Call save_assessment_state()
+    separately.
+    """
+
+    return AssessmentState(
+        run_id=run_id,
+        corpus_manifest_hash=corpus_manifest_hash,
+    )
 
 
-def save_assessment_state(state: AssessmentState, run_id: str, base: str = "outputs") -> str:
-    """Write assessment_state.json to outputs/<run_id>/. Returns the path written.
-    Bumps updated_at as part of the save, since this is the one place that
-    always precedes a disk write."""
-    state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def save_assessment_state(
+    state: AssessmentState,
+    run_id: str,
+    base: str = "outputs",
+) -> str:
+    """
+    Persist assessment_state.json in the run-scoped output directory.
+
+    Returns the path written.
+    """
+
+    state.updated_at = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
     out_dir = run_output_dir(run_id, base)
     os.makedirs(out_dir, exist_ok=True)
+
     path = os.path.join(out_dir, "assessment_state.json")
-    with open(path, "w") as f:
-        f.write(state.model_dump_json(indent=2))
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(state.model_dump_json(indent=2))
+
     return path
 
 
-def load_assessment_state(run_id: str, base: str = "outputs") -> AssessmentState:
-    """Read assessment_state.json back from outputs/<run_id>/."""
-    path = os.path.join(run_output_dir(run_id, base), "assessment_state.json")
-    with open(path) as f:
-        return AssessmentState.model_validate_json(f.read())
+def load_assessment_state(
+    run_id: str,
+    base: str = "outputs",
+) -> AssessmentState:
+    """Load assessment_state.json for a run."""
+
+    path = os.path.join(
+        run_output_dir(run_id, base),
+        "assessment_state.json",
+    )
+
+    with open(path, encoding="utf-8") as handle:
+        return AssessmentState.model_validate_json(handle.read())
 
 
 def commit_stage_output(
@@ -95,37 +151,105 @@ def commit_stage_output(
     gap_count: int = 0,
 ) -> AssessmentState:
     """
-    Register a stage's output artifact into the assessment state: hashes the
-    file at output_path, stamps committed_at, sets status (default PENDING —
-    caller/gate promotes to PASS/FAIL after verification).
+    Register a stage output in the assessment state.
 
-    Mutates and returns `state`; caller is responsible for calling
-    save_assessment_state() afterward. Kept separate so a caller can batch
-    multiple commits before one disk write, same pattern as pre_crew.kickoff()
-    running multiple tasks before the single verification gate.
+    The output is hashed, its commit timestamp is recorded, and its initial
+    status is set. The caller is responsible for subsequently saving the
+    assessment state.
     """
+
     if stage not in STAGE_NAMES:
-        raise ValueError(f"unknown stage '{stage}' — must be one of {STAGE_NAMES}")
+        raise ValueError(
+            f"unknown stage '{stage}' — must be one of {STAGE_NAMES}"
+        )
+
     if not os.path.exists(output_path):
-        raise FileNotFoundError(f"cannot commit stage '{stage}': {output_path} not found")
+        raise FileNotFoundError(
+            f"cannot commit stage '{stage}': "
+            f"{output_path} not found"
+        )
 
     state.stages[stage] = StageRecord(
         status=status,
         output_path=output_path,
         output_hash=hash_file(output_path),
-        committed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        committed_at=datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
         schema_version=schema_version,
         gap_count=gap_count,
     )
+
     return state
 
 
-def set_stage_status(state: AssessmentState, stage: str, status: StageStatus) -> AssessmentState:
-    """Promote/demote a stage's status after a deterministic gate runs
-    (e.g. verify_stage2_vectors' PASS/FAIL), without re-hashing the file."""
+def set_stage_status(
+    state: AssessmentState,
+    stage: str,
+    status: StageStatus,
+) -> AssessmentState:
+    """
+    Change a stage's status after a deterministic gate runs.
+
+    This does not rehash or recommit the stage output.
+    """
+
     if stage not in state.stages:
         raise ValueError(f"unknown stage '{stage}'")
+
     state.stages[stage].status = status
+    return state
+
+
+def reset_stage_for_retry(
+    state: AssessmentState,
+    stage: str,
+    *,
+    reason: str,
+    quarantine_manifest: str | None = None,
+) -> AssessmentState:
+    """
+    Clear a failed stage's stale artifact identity before retrying it.
+
+    Previous artifacts remain preserved through the quarantine manifest.
+    The previous state record is captured in gate_decisions before the
+    stage record is replaced.
+    """
+
+    if stage not in STAGE_NAMES:
+        raise ValueError(
+            f"unknown stage '{stage}' — must be one of {STAGE_NAMES}"
+        )
+
+    if stage not in state.stages:
+        raise ValueError(
+            f"stage '{stage}' is not present in assessment state"
+        )
+
+    previous_record = state.stages[stage]
+
+    state.gate_decisions.append(
+        {
+            "decision_type": "STAGE_RETRY",
+            "stage": stage,
+            "reason": reason,
+            "previous_status": previous_record.status.value,
+            "previous_output_path": previous_record.output_path,
+            "previous_output_hash": previous_record.output_hash,
+            "quarantine_manifest": quarantine_manifest,
+            "recorded_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        }
+    )
+
+    # Replace the complete record so no rejected path, hash, timestamp,
+    # schema version, or gap count can carry into the new attempt.
+    state.stages[stage] = StageRecord(
+        status=StageStatus.PENDING,
+    )
+    state.current_stage = stage
+
     return state
 
 
@@ -136,12 +260,24 @@ def append_gap(
     flagged_by: str,
     node_id: Optional[str] = None,
 ) -> AssessmentState:
-    """Add one gap to the flat, cross-stage gap_log. Also increments that
-    stage's gap_count on the StageRecord if it already exists."""
-    entry = GapLogEntry(stage=stage, node_id=node_id, description=description, flagged_by=flagged_by)
+    """
+    Add a gap to the cross-stage gap log.
+
+    Also increments the corresponding stage's gap count when the stage exists.
+    """
+
+    entry = GapLogEntry(
+        stage=stage,
+        node_id=node_id,
+        description=description,
+        flagged_by=flagged_by,
+    )
+
     state.gap_log.append(entry)
+
     if stage in state.stages:
         state.stages[stage].gap_count += 1
+
     return state
 
 
@@ -154,56 +290,78 @@ def finalize_stage4_state(
     base: str = "outputs",
 ) -> AssessmentState:
     """
-    Single production implementation of the Stage 4 finalize transition.
-    crew.py and the test suite both call this function directly, rather
-    than crew.py doing its own inline sequencing and tests reproducing that
-    sequencing separately -- a real bug (a missing mission-plan artifact
-    could still be marked PASS) shipped specifically because the original
-    test verified a hand-written simulation of this logic, not this logic.
+    Perform the final Stage 4 state transition.
 
-    Caller contract: by the time this is called, stage4_path must already
-    be its FINAL, immutable content -- any post-processing (e.g. appending
-    a corpus-version footer) must happen before this call, not after, since
-    the committed hash is only meaningful if nothing modifies the file
-    afterward.
-
-    Sets current_stage='stage4' immediately, before either outcome, so a
-    run that reached Stage 4 and was then rejected is never
-    indistinguishable in the audit trail from one that stalled two stages
-    earlier.
-
-    Fails closed on a missing artifact: refuses to mark stage4 PASS with no
-    file, no hash, no mission plan on disk, regardless of what a safety
-    check computed against empty text. Raises RuntimeError in both failure
-    paths, after persisting the FAIL status -- state is always saved before
-    the exception propagates.
+    The Stage 4 artifact must already contain its final immutable content
+    before this function is called.
     """
+
     state.current_stage = "stage4"
 
     if not os.path.exists(stage4_path):
-        set_stage_status(state, "stage4", StageStatus.FAIL)
-        save_assessment_state(state, run_id, base)
+        set_stage_status(
+            state,
+            "stage4",
+            StageStatus.FAIL,
+        )
+        save_assessment_state(
+            state,
+            run_id,
+            base,
+        )
+
         raise RuntimeError(
-            f"Stage 4 did not produce {stage4_path} — the run cannot be "
-            f"finalized. Run audit trail: "
+            f"Stage 4 did not produce {stage4_path} — "
+            "the run cannot be finalized. "
+            "Run audit trail: "
             f"{run_output_dir(run_id, base)}/assessment_state.json"
         )
 
-    commit_stage_output(state, "stage4", stage4_path, status=StageStatus.PENDING)
-    save_assessment_state(state, run_id, base)
+    commit_stage_output(
+        state,
+        "stage4",
+        stage4_path,
+        status=StageStatus.PENDING,
+    )
+    save_assessment_state(
+        state,
+        run_id,
+        base,
+    )
 
     if not is_compliant:
-        set_stage_status(state, "stage4", StageStatus.FAIL)
-        save_assessment_state(state, run_id, base)
+        set_stage_status(
+            state,
+            "stage4",
+            StageStatus.FAIL,
+        )
+        save_assessment_state(
+            state,
+            run_id,
+            base,
+        )
+
         raise RuntimeError(
-            f"Phase 0 Safety Gate compliance FAILED: {safety_summary} "
-            f"Mission plan NOT finalized. Run audit trail: "
+            "Phase 0 Safety Gate compliance FAILED: "
+            f"{safety_summary} "
+            "Mission plan NOT finalized. "
+            "Run audit trail: "
             f"{run_output_dir(run_id, base)}/assessment_state.json"
         )
 
-    set_stage_status(state, "stage4", StageStatus.PASS)
+    set_stage_status(
+        state,
+        "stage4",
+        StageStatus.PASS,
+    )
     state.current_stage = "complete"
-    save_assessment_state(state, run_id, base)
+
+    save_assessment_state(
+        state,
+        run_id,
+        base,
+    )
+
     return state
 
 
@@ -215,35 +373,44 @@ def enforce_stage3_safety_gate(
     base: str = "outputs",
 ) -> AssessmentState:
     """
-    Single production implementation of the pre-Stage-4 gate's state
-    transition. crew.py and the test suite both call this function
-    directly, same reasoning as finalize_stage4_state: a test that
-    reproduces "mark FAIL and raise" locally instead of calling this
-    function can pass even if crew.py's actual wiring is broken (e.g. if
-    crew.py forgot to check is_compliant before constructing Stage 4 at
-    all — which is exactly the property this gate exists to guarantee).
+    Apply the Stage 3 prose safety-gate state transition.
 
-    Sets current_stage='stage3' on failure specifically, so a rejected
-    run is never indistinguishable from one that stalled at an earlier,
-    unrelated point.
-
-    Mirrors finalize_stage4_state's separation of concerns: this function
-    does NOT call check_stage3_safety_gate itself and does NOT write the
-    gate report artifact — the caller (crew.py) computes is_compliant
-    from that checker and writes the stamped report BEFORE calling this.
+    The caller computes and persists the gate report before invoking this
+    function.
     """
+
     if not is_compliant:
-        set_stage_status(state, "stage3", StageStatus.FAIL)
+        set_stage_status(
+            state,
+            "stage3",
+            StageStatus.FAIL,
+        )
         state.current_stage = "stage3"
-        save_assessment_state(state, run_id, base)
+
+        save_assessment_state(
+            state,
+            run_id,
+            base,
+        )
+
         raise RuntimeError(
-            f"Stage 3 safety gate FAILED: {summary} Stage 4 was not "
-            f"constructed. Run audit trail: "
+            f"Stage 3 safety gate FAILED: {summary} "
+            "Stage 4 was not constructed. "
+            "Run audit trail: "
             f"{run_output_dir(run_id, base)}/assessment_state.json"
         )
 
-    set_stage_status(state, "stage3", StageStatus.PASS)
-    save_assessment_state(state, run_id, base)
+    set_stage_status(
+        state,
+        "stage3",
+        StageStatus.PASS,
+    )
+    save_assessment_state(
+        state,
+        run_id,
+        base,
+    )
+
     return state
 
 
@@ -256,34 +423,33 @@ def enforce_stage3_test_plan_validation(
     base: str = "outputs",
 ) -> None:
     """
-    Single production implementation of the structured Stage 3 test-plan
-    gate's state transition. Runs BEFORE enforce_stage3_safety_gate() in
-    crew.py's real wiring -- an LLM-generated plan that is incomplete or
-    references a nonexistent graph node, edge, or technique ID must never
-    reach the prose safety gate, let alone Stage 4, merely because its
-    prose sounds convincing.
+    Apply the structured Stage 3 test-plan validation transition.
 
-    Deliberately does NOT mark Stage 3 PASS on success -- only FAIL, on
-    failure. The existing prose safety gate (enforce_stage3_safety_gate)
-    remains the single place that owns the transition to PASS; this
-    function's job is narrower: block progress on a structural or
-    cross-artifact failure, without pre-empting that later decision.
-
-    Mirrors enforce_stage3_safety_gate's separation of concerns: this
-    function does NOT call validate_stage3_test_plan() or
-    check_stage3_artifact_consistency() itself and does NOT write the
-    stamped validation report artifact -- the caller (crew.py) computes
-    is_valid from those checks and writes the report BEFORE calling this.
+    Success does not mark Stage 3 PASS. The subsequent prose safety gate owns
+    that transition.
     """
+
     if is_valid:
         return
 
-    set_stage_status(state, "stage3", StageStatus.FAIL)
+    set_stage_status(
+        state,
+        "stage3",
+        StageStatus.FAIL,
+    )
     state.current_stage = "stage3"
-    save_assessment_state(state, run_id, base)
+
+    save_assessment_state(
+        state,
+        run_id,
+        base,
+    )
+
     raise RuntimeError(
-        f"Stage 3 structured test-plan validation FAILED: {summary} "
-        f"Stage 4 was not constructed. Run audit trail: "
+        "Stage 3 structured test-plan validation FAILED: "
+        f"{summary} "
+        "Stage 4 was not constructed. "
+        "Run audit trail: "
         f"{run_output_dir(run_id, base)}/assessment_state.json"
     )
 
@@ -297,38 +463,32 @@ def enforce_stage4_execution_plan_validation(
     base: str = "outputs",
 ) -> None:
     """
-    Single production implementation of the structured Stage 4
-    execution-plan gate's state transition. Runs BEFORE the existing
-    final Phase 0 prose check and finalize_stage4_state() in crew.py's
-    real wiring, but necessarily AFTER stage4_crew.kickoff() and its
-    human_input approval -- both Stage 4 artifacts are products of that
-    task and cannot exist before it, so this gate cannot intercept the
-    human review itself, only prevent the run from completing on top of
-    a plan that silently dropped, altered, or invented a Stage 3 test
-    concept, weakened an inherited requirement, or weakened the approved
-    Category 2/3 termination time or approving roles.
+    Apply the structured Stage 4 execution-plan validation transition.
 
-    Deliberately does NOT mark Stage 4 PASS on success -- only FAIL, on
-    failure. finalize_stage4_state() remains the single place that owns
-    the transition to PASS (and to current_stage='complete'); this
-    function's job is narrower: block final completion on a structural
-    or cross-artifact failure, without pre-empting that later decision.
-    Exact mirror of enforce_stage3_test_plan_validation's separation of
-    concerns relative to enforce_stage3_safety_gate.
-
-    Does NOT call validate_stage4_execution_plan() or
-    check_stage4_artifact_consistency() itself and does NOT write the
-    stamped validation report artifact -- the caller (crew.py) computes
-    is_valid from those checks and writes the report BEFORE calling this.
+    Success does not mark Stage 4 PASS. finalize_stage4_state() owns the final
+    PASS transition.
     """
+
     if is_valid:
         return
 
-    set_stage_status(state, "stage4", StageStatus.FAIL)
+    set_stage_status(
+        state,
+        "stage4",
+        StageStatus.FAIL,
+    )
     state.current_stage = "stage4"
-    save_assessment_state(state, run_id, base)
+
+    save_assessment_state(
+        state,
+        run_id,
+        base,
+    )
+
     raise RuntimeError(
-        f"Stage 4 structured execution-plan validation FAILED: {summary} "
-        f"Run was not finalized. Run audit trail: "
+        "Stage 4 structured execution-plan validation FAILED: "
+        f"{summary} "
+        "Run was not finalized. "
+        "Run audit trail: "
         f"{run_output_dir(run_id, base)}/assessment_state.json"
     )

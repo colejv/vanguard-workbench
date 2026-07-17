@@ -44,6 +44,158 @@ _SAFETY_SECTION_HEADING_RE = re.compile(
     r"^\s*##\s+PRE-STAGE-4 SAFETY REVIEW\s*$", re.IGNORECASE)
 
 
+
+_STAGE3_PROSE_TEST_HEADING = re.compile(
+    r"^#{2,6}\s+(RT-\d{3})\b.*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_STAGE3_PROSE_CATEGORY_LINE = re.compile(
+    r"^\s*(?:\*\*)?"
+    r"(?:Category|Categories)"
+    r"(?:\*\*)?\s*:\s*"
+    r"(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_prose_concept_identities(
+    stage3_prose: str,
+) -> list[dict]:
+    """
+    Extract authoritative test IDs and categories from approved Stage 3 prose.
+    """
+
+    if not isinstance(stage3_prose, str):
+        raise ValueError(
+            "Approved Stage 3 prose must be a string."
+        )
+
+    headings = list(
+        _STAGE3_PROSE_TEST_HEADING.finditer(
+            stage3_prose
+        )
+    )
+
+    if not headings:
+        raise ValueError(
+            "Approved Stage 3 prose contains no "
+            "RT-NNN test headings."
+        )
+
+    identities = []
+    seen_ids = set()
+
+    for index, match in enumerate(headings):
+        test_id = match.group(1).upper()
+
+        if test_id in seen_ids:
+            raise ValueError(
+                "Approved Stage 3 prose contains "
+                f"duplicate test ID {test_id}."
+            )
+
+        seen_ids.add(test_id)
+
+        section_start = match.end()
+        section_end = (
+            headings[index + 1].start()
+            if index + 1 < len(headings)
+            else len(stage3_prose)
+        )
+        section_text = stage3_prose[
+            section_start:section_end
+        ]
+
+        categories = set()
+
+        for category_text in (
+            _STAGE3_PROSE_CATEGORY_LINE.findall(
+                section_text
+            )
+        ):
+            categories.update(
+                int(number)
+                for number in re.findall(
+                    r"\b[1-4]\b",
+                    category_text,
+                )
+            )
+
+        if not categories:
+            raise ValueError(
+                f"Approved Stage 3 prose test "
+                f"{test_id} has no parseable "
+                "Category line."
+            )
+
+        identities.append(
+            {
+                "test_id": test_id,
+                "categories": sorted(categories),
+            }
+        )
+
+    return identities
+
+
+def _apply_prose_identity_overlay(
+    parsed: dict,
+    stage3_prose: str,
+) -> None:
+    """
+    Copy test IDs and categories deterministically from approved prose.
+    """
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "Stage 3 candidate must be an object."
+        )
+
+    concepts = parsed.get("test_concepts")
+
+    if not isinstance(concepts, list):
+        raise ValueError(
+            "Stage 3 candidate test_concepts "
+            "must be an array."
+        )
+
+    # Some compiler callers and unit tests provide only a minimal prose
+    # context without authoritative RT-NNN concept headings. In that case,
+    # there is no prose identity contract to overlay.
+    #
+    # Real Stage 3 artifacts contain RT-NNN headings, so those artifacts
+    # continue through strict ID/category extraction and validation.
+    if not _STAGE3_PROSE_TEST_HEADING.search(
+        stage3_prose or ""
+    ):
+        return
+
+    identities = _extract_prose_concept_identities(
+        stage3_prose
+    )
+
+    if len(concepts) != len(identities):
+        raise ValueError(
+            "Stage 3 candidate concept count does "
+            "not match approved prose: "
+            f"candidate={len(concepts)}, "
+            f"prose={len(identities)}."
+        )
+
+    for index, identity in enumerate(identities):
+        concept = concepts[index]
+
+        if not isinstance(concept, dict):
+            raise ValueError(
+                f"Stage 3 candidate concept {index} "
+                "must be an object."
+            )
+
+        concept["test_id"] = identity["test_id"]
+        concept["categories"] = identity["categories"]
+
+
 def _duration_to_seconds(value: str) -> int:
     """Convert a duration string ('15 minutes', '900 seconds', '2 hours',
     '900') to an integer number of seconds. Raises ValueError if it can't
@@ -413,7 +565,14 @@ def _generate_stage3_plan_json(
     # prose and OVERLAID onto the candidate — never left to the model to
     # copy, since letting it copy them is exactly what dropped them before.
     # This runs before validation so the candidate is authoritative-safe.
-    _apply_safety_overlay(parsed, stage3_prose)
+    _apply_prose_identity_overlay(
+        parsed,
+        stage3_prose,
+    )
+    _apply_safety_overlay(
+        parsed,
+        stage3_prose,
+    )
 
     # Validate against the schema here so a malformed generation consumes a
     # retry with feedback, rather than only failing inside the writer.

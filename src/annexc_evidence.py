@@ -134,37 +134,93 @@ def make_candidate_id(*, source_sha256: str, chunk_id: str, quote: str) -> str:
     return "ev_" + hashlib.sha256(payload).hexdigest()[:16]
 
 
-def verify_candidate(*, candidate: dict, chunk: EvidenceChunk,
-                     prior: str) -> VerifiedCandidate | None:
-    """Exact quote verification + deterministic locator generation.
-
-    The quote must appear VERBATIM (after normalization) in this chunk's
-    text. Offsets are derived in code — model-supplied offsets are never
-    trusted. Returns None for any candidate that cannot be verified.
+def verify_candidate(
+    *,
+    candidate: dict,
+    chunk: EvidenceChunk,
+    prior: str,
+) -> VerifiedCandidate | None:
     """
-    quote = normalize_source_text(candidate.get("quote", ""))
+    Verify one model-proposed evidence candidate.
+
+    Invalid candidate types are rejected rather than raising. Quotes must
+    occur verbatim after deterministic whitespace normalization.
+    """
+
+    if not isinstance(candidate, dict):
+        return None
+
+    raw_quote = candidate.get(
+        "quote",
+        "",
+    )
+
+    if not isinstance(raw_quote, str):
+        return None
+
+    quote = normalize_source_text(
+        raw_quote
+    )
+
     if not quote:
         return None
 
-    idx = chunk.text.find(quote)
-    if idx < 0:
-        return None  # not verbatim in this chunk -> rejected
+    index = chunk.text.find(quote)
 
-    start_char = chunk.start_char + idx
-    end_char = start_char + len(quote)
+    if index < 0:
+        return None
+
+    raw_interpretation = candidate.get(
+        "interpretation",
+        "",
+    )
+
+    if not isinstance(
+        raw_interpretation,
+        str,
+    ):
+        raw_interpretation = ""
+
+    subfield = candidate.get(
+        "subfield"
+    )
+
+    if (
+        subfield is not None
+        and not isinstance(subfield, str)
+    ):
+        return None
+
+    start_char = (
+        chunk.start_char
+        + index
+    )
+    end_char = (
+        start_char
+        + len(quote)
+    )
 
     return VerifiedCandidate(
         candidate_id=make_candidate_id(
-            source_sha256=chunk.source_sha256, chunk_id=chunk.chunk_id, quote=quote),
+            source_sha256=(
+                chunk.source_sha256
+            ),
+            chunk_id=chunk.chunk_id,
+            quote=quote,
+        ),
         prior=prior,
         source_file=chunk.source_file,
-        source_sha256=chunk.source_sha256,
+        source_sha256=(
+            chunk.source_sha256
+        ),
         chunk_id=chunk.chunk_id,
         start_char=start_char,
         end_char=end_char,
         quote=quote,
-        interpretation=(candidate.get("interpretation") or "").strip(),
-        subfield=candidate.get("subfield"),
+        interpretation=(
+            raw_interpretation.strip()
+        ),
+        subfield=subfield,
     )
 
 

@@ -36,6 +36,10 @@ from src.annexc_evidence import (
     CorpusScanCoverage,
 )
 
+import os
+import time
+from datetime import datetime, timezone
+
 MAX_CANDIDATES_PER_PRIOR_PER_CHUNK = 5
 DEFAULT_EXTRACTION_RETRIES = 2
 
@@ -94,7 +98,13 @@ _EXTRACTION_SYSTEM = (
     "false, or zero.\n"
     "An empty evidence list is correct when the chunk contains no relevant evidence.\n"
     "Return relevant contradictory evidence as well as supporting evidence.\n"
-    "Return all four top-level arrays even when empty. Return only the JSON object."
+    "Return all four top-level arrays even when empty.\n"
+    "Every array item MUST be a JSON object, never a bare string.\n"
+    "For capability_prior, tempo, and geopolitical_trigger_prior, every item "
+    "must contain string fields `quote` and `interpretation`.\n"
+    "For defensive_posture, every item must contain string fields `subfield`, "
+    "`quote`, and `interpretation`.\n"
+    "Return only the JSON object."
 )
 
 _PRIOR_DEFS = (
@@ -106,87 +116,398 @@ _PRIOR_DEFS = (
     "geopolitical_trigger_prior: geopolitical conditions raising/lowering trigger likelihood."
 )
 
+def _normalize_truncated_flag(
+    extraction: dict,
+) -> dict:
+    """
+    Normalize only unambiguous string representations of the JSON boolean.
 
-def _extract_with_retries(chunk, *, llm, retries: int, timeout_seconds: int,
-                          diag=None) -> dict:
-    """One chunk extraction with bounded retries. Raises IncompleteCorpusScan
-    if every attempt fails OR the model reports truncated output — the
-    caller treats that as incomplete coverage, NOT as an empty (no-evidence)
-    result. When diag is supplied, the raw response (or error) is recorded
-    regardless of outcome."""
-    prompt = (
+    Persisted and validated output remains a real bool. Missing values,
+    nulls, numbers, and arbitrary strings still fail closed.
+    """
+
+    if not isinstance(extraction, dict):
+        raise ValueError(
+            "top-level extraction must be a JSON object"
+        )
+
+    value = extraction.get("truncated")
+
+    if isinstance(value, bool):
+        return extraction
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized == "true":
+            extraction["truncated"] = True
+            return extraction
+
+        if normalized == "false":
+            extraction["truncated"] = False
+            return extraction
+
+    raise ValueError(
+        "`truncated` must be the JSON boolean true or false"
+    )
+
+def _validate_extraction_shape(
+    extraction,
+) -> None:
+    """
+    Validate the model's extraction response before quote verification.
+
+    A schema-invalid response is an extraction failure, not an empty-evidence
+    result. The caller retries it and ultimately marks corpus coverage
+    incomplete if the model cannot repair the response.
+    """
+
+    if not isinstance(extraction, Mapping):
+        raise ValueError(
+            "top-level extraction must be a JSON object"
+        )
+
+    truncated = extraction.get("truncated")
+
+    if not isinstance(truncated, bool):
+        raise ValueError(
+            "`truncated` must be a boolean"
+        )
+
+    for prior in FOUR_PRIORS:
+        if prior not in extraction:
+            raise ValueError(
+                f"missing required extraction array `{prior}`"
+            )
+
+        items = extraction[prior]
+
+        if not isinstance(items, list):
+            raise ValueError(
+                f"`{prior}` must be an array"
+            )
+
+        for index, candidate in enumerate(items):
+            candidate_path = (
+                f"{prior}[{index}]"
+            )
+
+            if not isinstance(candidate, Mapping):
+                raise ValueError(
+                    f"`{candidate_path}` must be an object, "
+                    f"not {type(candidate).__name__}"
+                )
+
+            quote = candidate.get("quote")
+            interpretation = candidate.get(
+                "interpretation"
+            )
+
+            if not isinstance(quote, str):
+                raise ValueError(
+                    f"`{candidate_path}.quote` must be a string"
+                )
+
+            if not isinstance(
+                interpretation,
+                str,
+            ):
+                raise ValueError(
+                    f"`{candidate_path}.interpretation` "
+                    "must be a string"
+                )
+
+            if prior == "defensive_posture":
+                subfield = candidate.get(
+                    "subfield"
+                )
+
+                if not isinstance(subfield, str):
+                    raise ValueError(
+                        f"`{candidate_path}.subfield` "
+                        "must be a string"
+                    )
+
+                if (
+                    subfield
+                    not in EXPECTED_DEFENSIVE_CONTROLS
+                ):
+                    raise ValueError(
+                        f"`{candidate_path}.subfield` must be one of "
+                        f"{sorted(EXPECTED_DEFENSIVE_CONTROLS)}"
+                    )
+
+def _extract_with_retries(
+    chunk,
+    *,
+    llm,
+    retries: int,
+    timeout_seconds: int,
+    diag=None,
+) -> dict:
+    """
+    Extract one chunk with bounded retries.
+
+    Malformed JSON, schema-invalid candidate shapes, timeouts, and other
+    response failures are retried. Exhaustion becomes an incomplete corpus
+    scan, never an empty-evidence result.
+    """
+
+    base_prompt = (
         f"PRIOR DEFINITIONS:\n{_PRIOR_DEFS}\n\n"
         f"CHUNK ({chunk.chunk_id}, source {chunk.source_file}):\n"
         f"\"\"\"\n{chunk.text}\n\"\"\"\n\n"
-        "Extract verbatim quotes from THIS chunk bearing on any prior. Set "
-        "truncated=true only if the chunk clearly cut off mid-evidence."
+        "Extract verbatim quotes from THIS chunk bearing on any prior. "
+        "Set truncated=true only if the chunk clearly cut off mid-evidence."
     )
-    last_err = None
-    for _ in range(retries + 1):
+
+    last_error: Exception | None = None
+    repair_feedback: str | None = None
+
+    for attempt in range(retries + 1):
         raw = None
+        parsed = None
+
+        request_prompt = base_prompt
+
+        if repair_feedback:
+            request_prompt += (
+                "\n\nPREVIOUS RESPONSE REJECTED:\n"
+                f"{repair_feedback}\n\n"
+                "Repair the response. Every prior field must be an array of "
+                "objects. Do not return bare strings as array items. "
+                "`truncated` must be the unquoted JSON boolean true or false. "
+                "Do not return \"true\", \"false\", null, 0, or 1. "
+                "If the previous response was truncated, return fewer candidates: "
+                "keep only the strongest 2 candidates per prior, keep each quote "
+                "short and contiguous, and keep each interpretation to one sentence."
+            )
+
         try:
             raw = generate_structured_json(
-                llm=llm, schema=_EXTRACTION_SCHEMA, prompt=prompt,
-                system_message=_EXTRACTION_SYSTEM, num_predict=4096,
-                timeout_seconds=timeout_seconds)
+                llm=llm,
+                schema=_EXTRACTION_SCHEMA,
+                prompt=request_prompt,
+                system_message=_EXTRACTION_SYSTEM,
+                num_predict=4096,
+                timeout_seconds=timeout_seconds,
+            )
+
             parsed = json.loads(raw)
-            if parsed.get("truncated"):
+
+            parsed = _normalize_truncated_flag(
+                parsed
+            )
+
+            _validate_extraction_shape(
+                parsed
+            )
+
+            if parsed["truncated"]:
                 if diag is not None:
-                    diag.record_extraction(chunk_id=chunk.chunk_id, request_prompt=prompt,
-                                           raw_response=raw, parsed=parsed,
-                                           error="MODEL_OUTPUT_TRUNCATED")
-                    diag.record_truncated(chunk.chunk_id)
-                # A truncated response is not a completed scan of this chunk.
-                # Do not retry into a longer response silently -- treat this
-                # attempt as failed coverage; caller marks the chunk incomplete.
-                raise IncompleteCorpusScan(
-                    f"{chunk.chunk_id}: MODEL_OUTPUT_TRUNCATED")
+                    diag.record_extraction(
+                        chunk_id=chunk.chunk_id,
+                        request_prompt=request_prompt,
+                        raw_response=raw,
+                        parsed=parsed,
+                        error="MODEL_OUTPUT_TRUNCATED",
+                    )
+                    diag.record_truncated(
+                        chunk.chunk_id
+                    )
+
+                raise ValueError(
+                    "MODEL_OUTPUT_TRUNCATED: retry with fewer "
+                    "evidence candidates and shorter interpretations"
+                )
+
             if diag is not None:
-                diag.record_extraction(chunk_id=chunk.chunk_id, request_prompt=prompt,
-                                       raw_response=raw, parsed=parsed)
+                diag.record_extraction(
+                    chunk_id=chunk.chunk_id,
+                    request_prompt=request_prompt,
+                    raw_response=raw,
+                    parsed=parsed,
+                )
+
             return parsed
+
         except IncompleteCorpusScan:
             raise
-        except Exception as e:  # timeout, malformed JSON, incomplete response
-            last_err = e
+
+        except Exception as exc:
+            last_error = exc
+            repair_feedback = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
             if diag is not None:
-                diag.record_extraction(chunk_id=chunk.chunk_id, request_prompt=prompt,
-                                       raw_response=raw, error=str(e))
-            continue
-    raise IncompleteCorpusScan(f"{chunk.chunk_id}: {last_err}")
+                diagnostic_kwargs = {
+                    "chunk_id": chunk.chunk_id,
+                    "request_prompt": (
+                        request_prompt
+                    ),
+                    "raw_response": raw,
+                    "error": (
+                        "INVALID_EXTRACTION_RESPONSE: "
+                        f"{repair_feedback}"
+                    ),
+                }
 
+                if isinstance(parsed, Mapping):
+                    diagnostic_kwargs[
+                        "parsed"
+                    ] = parsed
 
-def _verify_chunk_extraction(extraction: dict, chunk, diag=None) -> list:
-    """Verify every extracted quote against this chunk's frozen text. Returns
-    verified candidates only (bounded per prior, deduplicated per chunk).
-    Rejections are recorded with a reason code when diag is supplied."""
-    from src.annexc_evidence import (
-        REJECT_EMPTY_QUOTE, REJECT_QUOTE_NOT_FOUND, quote_rejection_diagnostic,
+                diag.record_extraction(
+                    **diagnostic_kwargs
+                )
+
+            if attempt < retries:
+                continue
+
+    raise IncompleteCorpusScan(
+        f"{chunk.chunk_id}: extraction failed after "
+        f"{retries + 1} attempt(s): {last_error}"
     )
+
+
+def _verify_chunk_extraction(
+    extraction: dict,
+    chunk,
+    diag=None,
+) -> list:
+    """
+    Verify every extracted quote against the frozen chunk.
+
+    Invalid candidate shapes are rejected deterministically instead of
+    raising AttributeError. Normally they are intercepted earlier by
+    _validate_extraction_shape(); this remains defense in depth.
+    """
+
+    from src.annexc_evidence import (
+        REJECT_EMPTY_QUOTE,
+        REJECT_QUOTE_NOT_FOUND,
+        quote_rejection_diagnostic,
+    )
+
     verified = []
+
+    if not isinstance(extraction, Mapping):
+        return verified
+
     for prior in FOUR_PRIORS:
-        items = extraction.get(prior, []) or []
+        items = extraction.get(
+            prior,
+            [],
+        ) or []
+
+        if not isinstance(items, list):
+            if diag is not None:
+                diag.record_rejected_candidate(
+                    reason=(
+                        "INVALID_CANDIDATE_COLLECTION"
+                    ),
+                    prior=prior,
+                    diagnostic={
+                        "chunk_id": chunk.chunk_id,
+                        "actual_type": (
+                            type(items).__name__
+                        ),
+                    },
+                )
+
+            continue
+
         kept = 0
-        for cand in items:
-            if kept >= MAX_CANDIDATES_PER_PRIOR_PER_CHUNK:
+
+        for index, candidate in enumerate(items):
+            if (
+                kept
+                >= MAX_CANDIDATES_PER_PRIOR_PER_CHUNK
+            ):
                 if diag is not None:
                     diag.record_rejected_candidate(
-                        reason="CANDIDATE_LIMIT_EXCEEDED", prior=prior,
-                        diagnostic={"chunk_id": chunk.chunk_id})
+                        reason=(
+                            "CANDIDATE_LIMIT_EXCEEDED"
+                        ),
+                        prior=prior,
+                        diagnostic={
+                            "chunk_id": (
+                                chunk.chunk_id
+                            )
+                        },
+                    )
+
                 break
-            vc = verify_candidate(candidate=cand, chunk=chunk, prior=prior)
-            if vc is not None:
-                verified.append(vc)
+
+            if not isinstance(candidate, Mapping):
+                if diag is not None:
+                    diag.record_rejected_candidate(
+                        reason=(
+                            "INVALID_CANDIDATE_SHAPE"
+                        ),
+                        prior=prior,
+                        diagnostic={
+                            "chunk_id": (
+                                chunk.chunk_id
+                            ),
+                            "candidate_index": index,
+                            "actual_type": (
+                                type(candidate).__name__
+                            ),
+                        },
+                    )
+
+                continue
+
+            verified_candidate = verify_candidate(
+                candidate=dict(candidate),
+                chunk=chunk,
+                prior=prior,
+            )
+
+            if verified_candidate is not None:
+                verified.append(
+                    verified_candidate
+                )
                 kept += 1
+
                 if diag is not None:
                     diag.record_accepted_candidate()
-            elif diag is not None:
-                quote = cand.get("quote", "")
-                reason = REJECT_EMPTY_QUOTE if not quote.strip() else REJECT_QUOTE_NOT_FOUND
-                diag.record_rejected_candidate(
-                    reason=reason, prior=prior,
-                    diagnostic=quote_rejection_diagnostic(
-                        quote=quote, chunk=chunk, source_file=chunk.source_file))
+
+                continue
+
+            if diag is None:
+                continue
+
+            quote = candidate.get(
+                "quote",
+                "",
+            )
+
+            if not isinstance(quote, str):
+                quote = ""
+
+            reason = (
+                REJECT_EMPTY_QUOTE
+                if not quote.strip()
+                else REJECT_QUOTE_NOT_FOUND
+            )
+
+            diag.record_rejected_candidate(
+                reason=reason,
+                prior=prior,
+                diagnostic=(
+                    quote_rejection_diagnostic(
+                        quote=quote,
+                        chunk=chunk,
+                        source_file=(
+                            chunk.source_file
+                        ),
+                    )
+                ),
+            )
+
     return verified
 
 
@@ -449,99 +770,527 @@ def _blocked_synthesis_record(prior: str) -> dict:
 
 # ---- orchestration ----
 
-def propose_priors_from_corpus(*, frozen_sources: Mapping, llm,
-                               timeout_seconds: int = 600,
-                               extraction_retries: int = DEFAULT_EXTRACTION_RETRIES,
-                               diagnostics_out_dir: str | None = None) -> dict:
-    """Full two-stage funnel. Returns {prior: record}. A prior may be:
-      - a SUPPORTED corpus record (verified evidence synthesized),
-      - omitted (complete scan, no/insufficient verified evidence -> caller's
-        no-evidence policy applies), or
-      - a BLOCKED record (INCOMPLETE_CORPUS_SCAN on coverage failure, or
-        analytical block when evidence existed but synthesis couldn't assess).
+def _write_live_progress(
+    *,
+    out_dir: str | None,
+    payload: dict,
+) -> None:
+    """Atomically write the current Annex C proposer position."""
 
-    diagnostics_out_dir: when supplied, writes the full instrumented-run
-    artifact set (chunk manifest, raw/parsed extraction + synthesis
-    responses, rejected-candidate reasons, run summary) under
-    <diagnostics_out_dir>/annexc_proposer/. Run-local only; never written to
-    a shared/general log, since the corpus may be sensitive. This does not
-    affect the derivation outcome in any way -- pure observability.
+    if not out_dir:
+        return
+
+    progress_dir = os.path.join(
+        out_dir,
+        "annexc_proposer",
+    )
+    os.makedirs(
+        progress_dir,
+        exist_ok=True,
+    )
+
+    progress_path = os.path.join(
+        progress_dir,
+        "progress.json",
+    )
+    temporary_path = (
+        progress_path
+        + ".tmp"
+    )
+
+    document = {
+        "updated_at": datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        **payload,
+    }
+
+    with open(
+        temporary_path,
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            document,
+            handle,
+            indent=2,
+        )
+        handle.flush()
+        os.fsync(
+            handle.fileno()
+        )
+
+    os.replace(
+        temporary_path,
+        progress_path,
+    )
+
+def propose_priors_from_corpus(
+    *,
+    frozen_sources: Mapping,
+    llm,
+    timeout_seconds: int = 180,
+    extraction_retries: int = DEFAULT_EXTRACTION_RETRIES,
+    diagnostics_out_dir: str | None = None,
+) -> dict:
     """
-    from src.annexc_diagnostics import ProposerDiagnostics
-    from src.annexc_evidence import REJECT_DUPLICATE_CANDIDATE
+    Run the two-stage Annex C evidence funnel.
 
-    diag = ProposerDiagnostics(model=str(llm)) if diagnostics_out_dir else None
+    Every chunk emits visible console progress and updates
+    annexc_proposer/progress.json. Each model call has a 180-second default
+    whole-call deadline.
+    """
 
-    chunks = build_prior_evidence_chunks(dict(frozen_sources))
-    coverage = CorpusScanCoverage(expected_chunks=len(chunks))
+    from src.annexc_diagnostics import (
+        ProposerDiagnostics,
+    )
+    from src.annexc_evidence import (
+        REJECT_DUPLICATE_CANDIDATE,
+    )
 
-    # PHASE A: extract + verify, tracking coverage explicitly.
+    diagnostics = (
+        ProposerDiagnostics(
+            model=str(llm)
+        )
+        if diagnostics_out_dir
+        else None
+    )
+
+    chunks = build_prior_evidence_chunks(
+        dict(frozen_sources)
+    )
+    total_chunks = len(chunks)
+
+    coverage = CorpusScanCoverage(
+        expected_chunks=total_chunks
+    )
+
+    print(
+        "[Annex C] Starting corpus evidence scan: "
+        f"{total_chunks} chunks, "
+        f"{timeout_seconds}s deadline per model call, "
+        f"{extraction_retries + 1} maximum attempts per chunk.",
+        flush=True,
+    )
+
+    _write_live_progress(
+        out_dir=diagnostics_out_dir,
+        payload={
+            "phase": "extraction",
+            "status": "STARTING",
+            "expected_chunks": total_chunks,
+            "successful_chunks": 0,
+            "failed_chunks": [],
+            "current_chunk_index": 0,
+            "current_chunk_id": None,
+        },
+    )
+
     all_verified = []
     scan_failed = False
-    for chunk in chunks:
-        if diag is not None:
-            diag.record_chunk(chunk)
+
+    for chunk_index, chunk in enumerate(
+        chunks,
+        start=1,
+    ):
+        if diagnostics is not None:
+            diagnostics.record_chunk(
+                chunk
+            )
+
+        print(
+            "[Annex C] "
+            f"Chunk {chunk_index}/{total_chunks} "
+            f"START {chunk.chunk_id} "
+            f"({len(chunk.text):,} chars)",
+            flush=True,
+        )
+
+        _write_live_progress(
+            out_dir=diagnostics_out_dir,
+            payload={
+                "phase": "extraction",
+                "status": "RUNNING",
+                "expected_chunks": total_chunks,
+                "successful_chunks": (
+                    coverage.successful_chunks
+                ),
+                "failed_chunks": list(
+                    coverage.failed_chunks
+                ),
+                "current_chunk_index": (
+                    chunk_index
+                ),
+                "current_chunk_id": (
+                    chunk.chunk_id
+                ),
+                "current_source_file": (
+                    chunk.source_file
+                ),
+            },
+        )
+
+        started_at = time.monotonic()
+
         try:
             extraction = _extract_with_retries(
-                chunk, llm=llm, retries=extraction_retries,
-                timeout_seconds=timeout_seconds, diag=diag)
-        except IncompleteCorpusScan as e:
-            coverage.failed_chunks.append(chunk.chunk_id)
-            scan_failed = True
-            if diag is not None:
-                diag.record_failed_chunk(chunk.chunk_id, str(e))
-            continue
-        coverage.successful_chunks += 1
-        all_verified.extend(_verify_chunk_extraction(extraction, chunk, diag=diag))
+                chunk,
+                llm=llm,
+                retries=extraction_retries,
+                timeout_seconds=timeout_seconds,
+                diag=diagnostics,
+            )
 
-    # FAIL CLOSED: an incomplete scan blocks every prior. No no-evidence
-    # default may run, because that would conceal the failure.
-    if scan_failed or not coverage.complete:
-        records = {prior: _blocked_incomplete_record(prior, coverage) for prior in FOUR_PRIORS}
-        if diag is not None:
-            diag.write(diagnostics_out_dir, resolved_priors=[],
-                      blocked_priors=list(records.keys()))
+        except IncompleteCorpusScan as exc:
+            elapsed = (
+                time.monotonic()
+                - started_at
+            )
+
+            coverage.failed_chunks.append(
+                chunk.chunk_id
+            )
+            scan_failed = True
+
+            if diagnostics is not None:
+                diagnostics.record_failed_chunk(
+                    chunk.chunk_id,
+                    str(exc),
+                )
+
+            print(
+                "[Annex C] "
+                f"Chunk {chunk_index}/{total_chunks} "
+                f"FAILED after {elapsed:.1f}s: {exc}",
+                flush=True,
+            )
+
+            _write_live_progress(
+                out_dir=diagnostics_out_dir,
+                payload={
+                    "phase": "extraction",
+                    "status": "CHUNK_FAILED",
+                    "expected_chunks": (
+                        total_chunks
+                    ),
+                    "successful_chunks": (
+                        coverage.successful_chunks
+                    ),
+                    "failed_chunks": list(
+                        coverage.failed_chunks
+                    ),
+                    "current_chunk_index": (
+                        chunk_index
+                    ),
+                    "current_chunk_id": (
+                        chunk.chunk_id
+                    ),
+                    "last_error": str(exc),
+                },
+            )
+
+            continue
+
+        verified = _verify_chunk_extraction(
+            extraction,
+            chunk,
+            diag=diagnostics,
+        )
+
+        all_verified.extend(
+            verified
+        )
+        coverage.successful_chunks += 1
+
+        elapsed = (
+            time.monotonic()
+            - started_at
+        )
+
+        print(
+            "[Annex C] "
+            f"Chunk {chunk_index}/{total_chunks} "
+            f"PASS in {elapsed:.1f}s; "
+            f"{len(verified)} verified candidate(s).",
+            flush=True,
+        )
+
+        _write_live_progress(
+            out_dir=diagnostics_out_dir,
+            payload={
+                "phase": "extraction",
+                "status": "CHUNK_COMPLETE",
+                "expected_chunks": total_chunks,
+                "successful_chunks": (
+                    coverage.successful_chunks
+                ),
+                "failed_chunks": list(
+                    coverage.failed_chunks
+                ),
+                "current_chunk_index": (
+                    chunk_index
+                ),
+                "current_chunk_id": (
+                    chunk.chunk_id
+                ),
+                "verified_candidates_so_far": (
+                    len(all_verified)
+                ),
+            },
+        )
+
+    if (
+        scan_failed
+        or not coverage.complete
+    ):
+        records = {
+            prior: _blocked_incomplete_record(
+                prior,
+                coverage,
+            )
+            for prior in FOUR_PRIORS
+        }
+
+        print(
+            "[Annex C] Extraction scan INCOMPLETE: "
+            f"{coverage.successful_chunks}/{total_chunks} passed; "
+            f"{len(coverage.failed_chunks)} failed.",
+            flush=True,
+        )
+
+        _write_live_progress(
+            out_dir=diagnostics_out_dir,
+            payload={
+                "phase": "complete",
+                "status": "INCOMPLETE",
+                **coverage.as_dict(),
+            },
+        )
+
+        if diagnostics is not None:
+            diagnostics.write(
+                diagnostics_out_dir,
+                resolved_priors=[],
+                blocked_priors=list(
+                    records.keys()
+                ),
+            )
+
         return records
 
-    before_dedup = len(all_verified)
-    all_verified = deduplicate_candidates(all_verified)
-    if diag is not None and len(all_verified) < before_dedup:
-        diag.record_rejected_candidate(
-            reason=REJECT_DUPLICATE_CANDIDATE, prior="*",
-            diagnostic={"removed_count": before_dedup - len(all_verified)})
-        # Deduplicated candidates were already counted as accepted; correct.
-        diag.accepted_candidate_count -= (before_dedup - len(all_verified))
+    before_deduplication = len(
+        all_verified
+    )
+    all_verified = deduplicate_candidates(
+        all_verified
+    )
 
-    by_id = {c.candidate_id: c for c in all_verified}
+    removed_duplicates = (
+        before_deduplication
+        - len(all_verified)
+    )
 
-    def _for(prior):
-        return [c for c in all_verified if c.prior == prior]
+    if (
+        diagnostics is not None
+        and removed_duplicates > 0
+    ):
+        diagnostics.record_rejected_candidate(
+            reason=(
+                REJECT_DUPLICATE_CANDIDATE
+            ),
+            prior="*",
+            diagnostic={
+                "removed_count": (
+                    removed_duplicates
+                )
+            },
+        )
+        diagnostics.accepted_candidate_count -= (
+            removed_duplicates
+        )
 
-    # PHASE B: focused synthesis per prior. Omit a prior (-> no-evidence
-    # policy) only on a COMPLETE scan with no supporting record.
+    print(
+        "[Annex C] Extraction scan COMPLETE: "
+        f"{coverage.successful_chunks}/{total_chunks} chunks; "
+        f"{len(all_verified)} unique verified candidate(s).",
+        flush=True,
+    )
+
+    by_id = {
+        candidate.candidate_id: candidate
+        for candidate in all_verified
+    }
+
+    def candidates_for(
+        prior: str,
+    ) -> list:
+        return [
+            candidate
+            for candidate in all_verified
+            if candidate.prior == prior
+        ]
+
     proposed = {}
-    for prior in FOUR_PRIORS:
-        candidates = _for(prior)
+
+    for prior_index, prior in enumerate(
+        FOUR_PRIORS,
+        start=1,
+    ):
+        candidates = candidates_for(
+            prior
+        )
+
         if not candidates:
-            continue  # complete scan, no relevant quotes -> policy applies
+            print(
+                "[Annex C] "
+                f"Synthesis {prior_index}/4 SKIP {prior}: "
+                "no verified candidates; policy will apply.",
+                flush=True,
+            )
+            continue
+
+        print(
+            "[Annex C] "
+            f"Synthesis {prior_index}/4 START {prior}: "
+            f"{len(candidates)} candidate(s).",
+            flush=True,
+        )
+
+        _write_live_progress(
+            out_dir=diagnostics_out_dir,
+            payload={
+                "phase": "synthesis",
+                "status": "RUNNING",
+                "prior_index": prior_index,
+                "prior": prior,
+                "candidate_count": (
+                    len(candidates)
+                ),
+                **coverage.as_dict(),
+            },
+        )
+
+        started_at = time.monotonic()
+
         try:
             if prior == "defensive_posture":
-                synth = _synthesize_defensive_posture(
-                    candidates=candidates, llm=llm, timeout_seconds=timeout_seconds, diag=diag)
-                record = _assemble_posture_record(synthesis=synth, by_id=by_id, diag=diag)
+                synthesis = (
+                    _synthesize_defensive_posture(
+                        candidates=candidates,
+                        llm=llm,
+                        timeout_seconds=(
+                            timeout_seconds
+                        ),
+                        diag=diagnostics,
+                    )
+                )
+
+                record = _assemble_posture_record(
+                    synthesis=synthesis,
+                    by_id=by_id,
+                    diag=diagnostics,
+                )
+
             else:
-                synth = _synthesize_simple_prior(
-                    prior=prior, candidates=candidates, llm=llm,
-                    timeout_seconds=timeout_seconds, diag=diag)
-                record = _assemble_simple_record(prior=prior, synthesis=synth, by_id=by_id)
-        except Exception:
-            record = _blocked_synthesis_record(prior)
+                synthesis = (
+                    _synthesize_simple_prior(
+                        prior=prior,
+                        candidates=candidates,
+                        llm=llm,
+                        timeout_seconds=(
+                            timeout_seconds
+                        ),
+                        diag=diagnostics,
+                    )
+                )
+
+                record = _assemble_simple_record(
+                    prior=prior,
+                    synthesis=synthesis,
+                    by_id=by_id,
+                )
+
+        except Exception as exc:
+            record = _blocked_synthesis_record(
+                prior
+            )
+
+            print(
+                "[Annex C] "
+                f"Synthesis {prior} FAILED: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
         if record is not None:
             proposed[prior] = record
 
-    if diag is not None:
-        resolved = [p for p, r in proposed.items() if r.get("status") == "SUPPORTED"]
-        blocked = [p for p, r in proposed.items() if r.get("status") == "BLOCKED"]
-        diag.write(diagnostics_out_dir, resolved_priors=resolved, blocked_priors=blocked)
+        elapsed = (
+            time.monotonic()
+            - started_at
+        )
+
+        result_status = (
+            record.get("status")
+            if record is not None
+            else "NO_SUPPORTED_RECORD"
+        )
+
+        print(
+            "[Annex C] "
+            f"Synthesis {prior_index}/4 END {prior} "
+            f"in {elapsed:.1f}s: {result_status}.",
+            flush=True,
+        )
+
+    if diagnostics is not None:
+        resolved = [
+            prior
+            for prior, record in proposed.items()
+            if record.get("status")
+            == "SUPPORTED"
+        ]
+        blocked = [
+            prior
+            for prior, record in proposed.items()
+            if record.get("status")
+            == "BLOCKED"
+        ]
+
+        diagnostics.write(
+            diagnostics_out_dir,
+            resolved_priors=resolved,
+            blocked_priors=blocked,
+        )
+
+    _write_live_progress(
+        out_dir=diagnostics_out_dir,
+        payload={
+            "phase": "complete",
+            "status": "COMPLETE",
+            "resolved_priors": [
+                prior
+                for prior, record
+                in proposed.items()
+                if record.get("status")
+                == "SUPPORTED"
+            ],
+            "blocked_priors": [
+                prior
+                for prior, record
+                in proposed.items()
+                if record.get("status")
+                == "BLOCKED"
+            ],
+            **coverage.as_dict(),
+        },
+    )
+
+    print(
+        "[Annex C] Prior proposal complete.",
+        flush=True,
+    )
 
     return proposed

@@ -16,10 +16,8 @@ from src.stage3_identity import SemanticIdentityMutation
 from src.stage_transition import evaluate_stage3_transition, StageTransitionBlocked
 from src.safety_timeline import (build_safety_timeline_contract,
                                  SafetyTimelineContradiction, SafetyTimelineAmbiguous)
-from src.annexc_artifact_gate import (
-    run_annexc_derivation_gate,
-    DerivationApprovalBlocked,
-)
+from src.annexc_derivation import (
+    run_annexc_derivation_gate, DerivationApprovalBlocked)
 from src.stage3_writer import compile_stage3_structured_output, build_referential_context
 from src.stage4_validation import (validate_stage4_execution_plan, check_stage4_artifact_consistency,
                                    build_stage4_validation_report, stage4_candidate_hash)
@@ -33,10 +31,6 @@ from src.state import (new_run_id, run_output_dir, init_assessment_state,
                         canonical_json_sha256, reset_stage_for_retry)
 from src import run_context
 from src.heartbeat import heartbeat
-from src.final_report import (
-    generate_or_reuse_final_report,
-    validate_existing_final_report,
-)
 from src.stage2_diagnostics import (
     describe_missing_stage2_vectors,
 )
@@ -133,10 +127,6 @@ if __name__ == "__main__":
 
     # ---- CLI: --resume <run_id> -------------------------------------------
     resume_run_id = None
-    force_final_report = (
-        "--regenerate-final-report"
-        in sys.argv
-    )
     if "--resume" in sys.argv:
         idx = sys.argv.index("--resume")
         if idx + 1 >= len(sys.argv):
@@ -219,157 +209,6 @@ if __name__ == "__main__":
             f"drifted file(s) before re-running. "
             f"Run audit trail: {out_dir}/assessment_state.json"
         )
-
-    # ---- COMPLETED-RUN / FINALIZATION-ONLY RESUME -------------------------
-    # A valid completion package ends the resume immediately. If Stage 4 has
-    # already passed but the final package is missing, invalid, or explicitly
-    # forced, generate only the final report instead of replaying the
-    # human-approved Stage 3 and Stage 4 tasks.
-    if resume_run_id:
-        existing_final_report = (
-            validate_existing_final_report(
-                out_dir
-            )
-        )
-
-        if (
-            existing_final_report["is_valid"]
-            and not force_final_report
-        ):
-            print(
-                "Final report already complete and verified; "
-                "nothing to resume."
-            )
-            print(
-                "Final report: "
-                + existing_final_report[
-                    "outputs"
-                ]["report_markdown"]
-            )
-            print(
-                "Completion record: "
-                + existing_final_report[
-                    "outputs"
-                ]["completion"]
-            )
-            print(
-                "Execution authorization: NOT_GRANTED"
-            )
-            raise SystemExit(0)
-
-        stage4_record = state.stages.get(
-            "stage4"
-        )
-
-        stage4_passed = (
-            stage4_record is not None
-            and stage4_record.status
-            == StageStatus.PASS
-        )
-
-        stage4_ready_for_finalization = False
-
-        if stage4_passed:
-            resume_stage4_prose = (
-                run_context.artifact_path(
-                    "stage4_mission_plan.md"
-                )
-            )
-            resume_stage4_plan = (
-                run_context.artifact_path(
-                    "stage4_execution_plan.json"
-                )
-            )
-            resume_stage4_validation = (
-                run_context.artifact_path(
-                    "stage4_execution_plan_validation.json"
-                )
-            )
-
-            try:
-                run_context.read_stamped_prose(
-                    resume_stage4_prose
-                )
-                existing_stage4_plan = (
-                    run_context.read_stamped_json(
-                        resume_stage4_plan
-                    )
-                )
-                run_context.read_stamped_json(
-                    resume_stage4_validation
-                )
-
-                stage4_ready_for_finalization = (
-                    stage4_is_semantically_complete(
-                        artifact_path=(
-                            resume_stage4_plan
-                        ),
-                        validation_report_path=(
-                            resume_stage4_validation
-                        ),
-                        current_candidate_hash=(
-                            stage4_candidate_hash(
-                                existing_stage4_plan
-                            )
-                        ),
-                    )
-                )
-            except Exception as exc:
-                print(
-                    "Final-report-only resume unavailable: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-        if stage4_ready_for_finalization:
-            from config.llm import reason_llm
-
-            final_report_timeout = int(
-                os.environ.get(
-                    "FINAL_REPORT_TIMEOUT_SECONDS",
-                    "600",
-                )
-            )
-
-            print(
-                "Stage 4 is already PASS; running only "
-                "the comprehensive final-report stage."
-            )
-
-            final_outcome = (
-                generate_or_reuse_final_report(
-                    out_dir=out_dir,
-                    llm=reason_llm,
-                    timeout_seconds=(
-                        final_report_timeout
-                    ),
-                    force=force_final_report,
-                )
-            )
-
-            if final_outcome["quarantine"]:
-                print(
-                    "Previous final-report artifacts "
-                    "quarantined: "
-                    + final_outcome[
-                        "quarantine"
-                    ]
-                )
-
-            print(
-                "\n=== FINAL REPORT COMPLETE ==="
-            )
-
-            for name, path in (
-                final_outcome[
-                    "outputs"
-                ].items()
-            ):
-                print(f"{name}: {path}")
-
-            print(
-                "Execution authorization: NOT_GRANTED"
-            )
-            raise SystemExit(0)
 
     print("Reading assessment brief...")
     with open("collection/brief.md") as f:
@@ -996,262 +835,71 @@ if __name__ == "__main__":
               "stage3_test_plan.json missing — compiling the structured "
               "plan from existing prose without rerunning analysis_crew.")
     else:
-        # ---- ANNEX B FIRST -------------------------------------------------
-        # Annex C now consumes completed Stage 0/1/2 and Annex B artifacts.
-        # Run Annex B in its own crew before the Annex C derivation gate.
-
-        stage2_prose_path = run_context.artifact_path(
-            "stage2.md"
-        )
-
-        if not os.path.exists(stage2_prose_path):
-            raise RuntimeError(
-                "Stage 2 prose is missing before Annex B: "
-                f"{stage2_prose_path}"
-            )
-
-        run_context.stamp_prose_file(
-            stage2_prose_path
-        )
-        stage2_content_for_downstream = (
-            run_context.read_stamped_prose(
-                stage2_prose_path
-            )
-        )
-
-        # Rebuild Annex B with injected Stage 2 content. A task in a separate
-        # CrewAI kickoff cannot rely on a live context reference to a task
-        # that ran in a different crew.
-        resume_context["t_annexB"] = (
-            stage2_content_for_downstream
-        )
-        resume_context["t_stage3_stage2"] = (
-            stage2_content_for_downstream
-        )
-
-        annexb_task_set = build_tasks(
-            out_dir,
-            resume_context=resume_context,
-        )
-        t_annexB = annexb_task_set[
-            "t_annexB"
-        ]
-
-        if not annexB_done:
-            if t_kcag_review is None:
-                raise RuntimeError(
-                    "Annex B is incomplete but its KCAG "
-                    "review task was not constructed."
-                )
-
-            annexb_tasks = [
-                t_kcag_review,
-                t_annexB,
-            ]
-
-            print(
-                "annexb_crew will run "
-                f"{len(annexb_tasks)} task(s): "
-                f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in annexb_tasks]}"
-            )
-
-            annexb_crew = Crew(
-                agents=[modeler],
-                tasks=annexb_tasks,
-                process=Process.sequential,
-                verbose=True,
-            )
-
-            annexb_heartbeat_log = (
-                run_context.artifact_path(
-                    "heartbeat.log"
-                )
-            )
-
-            with heartbeat(
-                "annexb_crew",
-                log_path=(
-                    annexb_heartbeat_log
-                ),
-            ):
-                annexb_crew.kickoff(
-                    inputs={
-                        "sut_brief": brief_text,
-                        "file_count": c_count,
-                        "corpus_version": (
-                            c_version
-                        ),
-                    }
-                )
-
-            finalize_kcag_review_artifact(
-                review_was_required=True
-            )
-
-            kcag_report_path = (
-                run_context.artifact_path(
-                    "kcag_report.json"
-                )
-            )
-
-            if not os.path.exists(
-                kcag_report_path
-            ):
-                raise RuntimeError(
-                    "Annex B did not produce "
-                    f"{kcag_report_path}."
-                )
-
-            annexB_done = True
-
-        # Whether Annex B ran above or was already complete on resume, load
-        # its stamped prose and inject it into fresh Annex C / Stage 3 tasks.
-        annexB_prose_path = (
-            run_context.artifact_path(
-                "annexB_kcag.md"
-            )
-        )
-
-        if not os.path.exists(
-            annexB_prose_path
-        ):
-            raise RuntimeError(
-                "Annex B report prose is missing: "
-                f"{annexB_prose_path}"
-            )
-
-        run_context.stamp_prose_file(
-            annexB_prose_path
-        )
-        annexB_content_for_downstream = (
-            run_context.read_stamped_prose(
-                annexB_prose_path
-            )
-        )
-
-        resume_context["t_annexC"] = (
-            annexB_content_for_downstream
-        )
-        resume_context["t_stage3_annexb"] = (
-            annexB_content_for_downstream
-        )
-
-        downstream_task_set = build_tasks(
-            out_dir,
-            resume_context=resume_context,
-        )
-        t_annexC = downstream_task_set[
-            "t_annexC"
-        ]
-        t_stage3 = downstream_task_set[
-            "t_stage3"
-        ]
-
-        # ---- ARTIFACT-BASED ANNEX C DERIVATION + APPROVAL GATE ------------
-        # This performs one structured model call over Stage 0/1/2 and Annex B
-        # artifacts. It does not rescan the frozen source corpus.
+        # ---- ANNEX C DERIVATION + APPROVAL GATE (two-phase, fail closed) ----
+        # Before the analysis crew runs t_annexC (which scores the APPROVED
+        # config), the four BBN priors must be derived from the frozen corpus,
+        # validated, compiled, and APPROVED by the analyst. Two-phase human
+        # gate (derive+stop, then approve+resume), same shape as the Annex C
+        # -> Stage 3 block. Delegated to a single module function so the whole
+        # gate is one patchable unit and crew.py stays thin.
         run_annexc_derivation_gate(
-            state=state,
-            run_id=run_id,
-            out_dir=out_dir,
-            corpus_manifest_hash=(
-                corpus_manifest_hash
-            ),
-            run_context=run_context,
-            set_stage_status=(
-                set_stage_status
-            ),
-            save_assessment_state=(
-                save_assessment_state
-            ),
-            StageStatus=StageStatus,
+            state=state, run_id=run_id, out_dir=out_dir,
+            corpus_manifest_hash=corpus_manifest_hash,
+            run_context=run_context, set_stage_status=set_stage_status,
+            save_assessment_state=save_assessment_state, StageStatus=StageStatus,
         )
 
-        # Annex B is already complete. The remaining analysis crew contains
-        # only Annex C scoring and Stage 3 prose as required.
-        analysis_tasks = (
-            build_analysis_tasks(
-                t_kcag_review=None,
-                t_annexB=t_annexB,
-                t_annexC=t_annexC,
-                t_stage3=t_stage3,
-                annexB_done=True,
-                annexC_done=annexC_done,
-                stage3_prose_done=(
-                    stage3_prose_done
-                ),
-            )
+        analysis_tasks = build_analysis_tasks(
+            t_kcag_review=t_kcag_review,
+            t_annexB=t_annexB,
+            t_annexC=t_annexC,
+            t_stage3=t_stage3,
+            annexB_done=annexB_done,
+            annexC_done=annexC_done,
+            stage3_prose_done=stage3_prose_done,
         )
 
-        print(
-            "analysis_crew will run "
-            f"{len(analysis_tasks)} task(s): "
-            f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in analysis_tasks]}"
-        )
+        print(f"analysis_crew will run {len(analysis_tasks)} task(s): "
+              f"{[t.output_file.split('/')[-1] if t.output_file else t.agent.role for t in analysis_tasks]}")
 
         if analysis_tasks:
             analysis_crew = Crew(
-                agents=[
-                    modeler,
-                    red_team_lead,
-                ],
+                agents=[modeler, red_team_lead],
                 tasks=analysis_tasks,
                 process=Process.sequential,
                 verbose=True,
             )
+            analysis_heartbeat_log = run_context.artifact_path("heartbeat.log")
+            with heartbeat("analysis_crew", log_path=analysis_heartbeat_log):
+                analysis_crew.kickoff(inputs={
+                    "sut_brief": brief_text,
+                    "file_count": c_count,
+                    "corpus_version": c_version,
+                })
 
-            analysis_heartbeat_log = (
-                run_context.artifact_path(
-                    "heartbeat.log"
-                )
-            )
+        # ---- FINALIZE KCAG REVIEW ARTIFACT (advisory; existence enforced,
+        # content is not) ----
+        # See finalize_kcag_review_artifact()'s docstring in tasks.py for
+        # why this is a shared helper rather than inline logic, and for
+        # what exactly is/isn't enforced.
+        finalize_kcag_review_artifact(review_was_required=t_kcag_review is not None)
 
-            with heartbeat(
-                "analysis_crew",
-                log_path=(
-                    analysis_heartbeat_log
-                ),
-            ):
-                analysis_crew.kickoff(
-                    inputs={
-                        "sut_brief": brief_text,
-                        "file_count": c_count,
-                        "corpus_version": (
-                            c_version
-                        ),
-                    }
-                )
-
-        if not os.path.exists(
-            stage3_prose_path
-        ):
+        # Stamp any prose newly produced by this crew run. stamp_prose_file
+        # is idempotent (no-op on already-stamped files), but we only stamp
+        # files that could be new this invocation — existing stamped prose
+        # is validated by read_stamped_prose below, not re-stamped.
+        if not os.path.exists(stage3_prose_path):
             state.current_stage = "stage3"
-            set_stage_status(
-                state,
-                "stage3",
-                StageStatus.FAIL,
-            )
-            save_assessment_state(
-                state,
-                run_id,
-            )
-
+            set_stage_status(state, "stage3", StageStatus.FAIL)
+            save_assessment_state(state, run_id)
             raise RuntimeError(
-                "Stage 3 did not produce "
-                f"{stage3_prose_path} — Stage 4 "
-                "cannot be constructed. Run audit "
-                "trail: "
+                f"Stage 3 did not produce {stage3_prose_path} — Stage 4 "
+                f"cannot be constructed. Run audit trail: "
                 f"{out_dir}/assessment_state.json"
             )
-
-        for path in (
-            annexC_prose_path,
-            stage3_prose_path,
-        ):
-            if os.path.exists(path):
-                run_context.stamp_prose_file(
-                    path
-                )
+        for p in (annexB_prose_path, annexC_prose_path, stage3_prose_path):
+            if os.path.exists(p):
+                run_context.stamp_prose_file(p)
 
     # ---- ANNEX C -> STAGE 3 TRANSITION GATE (fail closed) ----
     # The framework requires the Annex C BBN threat score/phase estimate
@@ -1671,65 +1319,6 @@ if __name__ == "__main__":
         stage4_path=stage4_prose_path,
         is_compliant=safety["is_compliant"],
         safety_summary=safety["summary"],
-    )
-
-    # ---- AUTOMATIC COMPREHENSIVE FINAL REPORT ----------------------------
-    # Stage 4 is already PASS at this point. A final-report failure does not
-    # rewrite Stage 4 as failed; it prevents the overall pipeline-completion
-    # marker and can be resumed later through the finalization-only path.
-    from config.llm import reason_llm
-
-    final_report_timeout = int(
-        os.environ.get(
-            "FINAL_REPORT_TIMEOUT_SECONDS",
-            "600",
-        )
-    )
-
-    print(
-        "\nStage 4 PASS; generating comprehensive "
-        "final assessment report..."
-    )
-
-    final_outcome = (
-        generate_or_reuse_final_report(
-            out_dir=out_dir,
-            llm=reason_llm,
-            timeout_seconds=(
-                final_report_timeout
-            ),
-            force=force_final_report,
-        )
-    )
-
-    if final_outcome["reused"]:
-        print(
-            "Existing verified final report reused."
-        )
-    else:
-        print(
-            "Comprehensive final report generated "
-            "and validated."
-        )
-
-    if final_outcome["quarantine"]:
-        print(
-            "Previous final-report artifacts "
-            "quarantined: "
-            + final_outcome[
-                "quarantine"
-            ]
-        )
-
-    print("\n=== FINAL REPORT COMPLETE ===")
-
-    for name, path in (
-        final_outcome["outputs"].items()
-    ):
-        print(f"{name}: {path}")
-
-    print(
-        "Execution authorization: NOT_GRANTED"
     )
 
     print("\n\n=== PIPELINE FINISHED ===")

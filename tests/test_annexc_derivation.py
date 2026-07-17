@@ -284,6 +284,27 @@ def test_quote_present_normalizes_whitespace():
                             "the actor showed sustained access, tailored tooling here")
     assert not quote_is_present("nope", "something else")
 
+@pytest.fixture
+def frozen_annexc_loader(monkeypatch):
+    import src.annexc_derivation as derivation_module
+
+    frozen = {
+        "actor-report.pdf": {
+            "sha256": "sha256:aaa",
+            "text": (
+                "The assessed actor demonstrated sustained access, "
+                "tailored tooling, and disciplined operational security."
+            ),
+        }
+    }
+
+    monkeypatch.setattr(
+        derivation_module,
+        "load_frozen_corpus_sources",
+        lambda out_dir: frozen,
+    )
+
+    return frozen
 
 # ---- two-phase gate integration ----
 
@@ -313,48 +334,97 @@ def _noop(*a, **k):
     pass
 
 
-def test_gate_phase1_stops_for_approval(tmp_path):
-    from src.annexc_derivation import run_annexc_derivation_gate, DerivationApprovalBlocked
+def test_gate_phase1_stops_for_approval(
+    tmp_path,
+    frozen_annexc_loader,
+):
+    from src.annexc_derivation import (
+        DerivationApprovalBlocked,
+        run_annexc_derivation_gate,
+    )
     import os
-    # policy must exist at the default path
+
     policy_file = str(tmp_path / "policy.json")
-    import json
-    json.dump(POLICY, open(policy_file, "w"))
-    rc = _FakeRunContext(str(tmp_path))
 
-    class _SS:
-        PASS = "PASS"
-    with pytest.raises(DerivationApprovalBlocked, match="ANNEXC_DERIVATION_AWAITING_APPROVAL"):
-        run_annexc_derivation_gate(
-            state=_FakeState(), run_id=RUN, out_dir=str(tmp_path),
-            corpus_manifest_hash=CORPUS, run_context=rc,
-            set_stage_status=_noop, save_assessment_state=_noop, StageStatus=_SS,
-            policy_path=policy_file)
-    # Phase 1 wrote the derivation + config artifacts.
-    assert os.path.exists(rc.artifact_path("annexc_derivation.json"))
-    assert os.path.exists(rc.artifact_path("annexc_assessment_config.json"))
+    with open(policy_file, "w", encoding="utf-8") as handle:
+        json.dump(POLICY, handle)
 
-
-def test_gate_phase2_blocks_without_approval(tmp_path):
-    from src.annexc_derivation import run_annexc_derivation_gate, DerivationApprovalBlocked
-    import json
-    policy_file = str(tmp_path / "policy.json")
-    json.dump(POLICY, open(policy_file, "w"))
     rc = _FakeRunContext(str(tmp_path))
 
     class _SS:
         PASS = "PASS"
 
-    # Phase 1 stops.
-    with pytest.raises(DerivationApprovalBlocked):
+    with pytest.raises(
+        DerivationApprovalBlocked,
+        match="ANNEXC_DERIVATION_AWAITING_APPROVAL",
+    ):
         run_annexc_derivation_gate(
-            state=_FakeState(), run_id=RUN, out_dir=str(tmp_path), corpus_manifest_hash=CORPUS,
-            run_context=rc, set_stage_status=_noop, save_assessment_state=_noop,
-            StageStatus=_SS, policy_path=policy_file)
+            state=_FakeState(),
+            run_id=RUN,
+            out_dir=str(tmp_path),
+            corpus_manifest_hash=CORPUS,
+            run_context=rc,
+            set_stage_status=_noop,
+            save_assessment_state=_noop,
+            StageStatus=_SS,
+            policy_path=policy_file,
+        )
 
-    # Phase 2 with no approval -> still blocks (stub derivation has BLOCKED tempo/posture).
-    with pytest.raises(DerivationApprovalBlocked):
+    assert os.path.exists(
+        rc.artifact_path("annexc_derivation.json")
+    )
+    assert os.path.exists(
+        rc.artifact_path("annexc_assessment_config.json")
+    )
+
+
+def test_gate_phase2_blocks_without_approval(
+    tmp_path,
+    frozen_annexc_loader,
+):
+    from src.annexc_derivation import (
+        DerivationApprovalBlocked,
+        run_annexc_derivation_gate,
+    )
+
+    policy_file = str(tmp_path / "policy.json")
+
+    with open(policy_file, "w", encoding="utf-8") as handle:
+        json.dump(POLICY, handle)
+
+    rc = _FakeRunContext(str(tmp_path))
+
+    class _SS:
+        PASS = "PASS"
+
+    with pytest.raises(
+        DerivationApprovalBlocked,
+        match="ANNEXC_DERIVATION_AWAITING_APPROVAL",
+    ):
         run_annexc_derivation_gate(
-            state=_FakeState(), run_id=RUN, out_dir=str(tmp_path), corpus_manifest_hash=CORPUS,
-            run_context=rc, set_stage_status=_noop, save_assessment_state=_noop,
-            StageStatus=_SS, policy_path=policy_file)
+            state=_FakeState(),
+            run_id=RUN,
+            out_dir=str(tmp_path),
+            corpus_manifest_hash=CORPUS,
+            run_context=rc,
+            set_stage_status=_noop,
+            save_assessment_state=_noop,
+            StageStatus=_SS,
+            policy_path=policy_file,
+        )
+
+    with pytest.raises(
+        DerivationApprovalBlocked,
+        match="DERIVATION_NOT_RESOLVED",
+    ):
+        run_annexc_derivation_gate(
+            state=_FakeState(),
+            run_id=RUN,
+            out_dir=str(tmp_path),
+            corpus_manifest_hash=CORPUS,
+            run_context=rc,
+            set_stage_status=_noop,
+            save_assessment_state=_noop,
+            StageStatus=_SS,
+            policy_path=policy_file,
+        )

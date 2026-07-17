@@ -1042,6 +1042,21 @@ KCAG_NODE_TYPES = frozenset({
 KCAG_DIFFICULTIES = frozenset({"LOW", "MEDIUM", "HIGH"})
 KCAG_EFFECTS = frozenset({None, "DECEIVE", "DISRUPT", "DEGRADE", "DESTROY"})
 KCAG_VECTOR_ID_PATTERN = re.compile(r"^V-\d{2,}$")
+KCAG_REQUIRED_EDGE_FIELDS = frozenset({
+    "source",
+    "target",
+    "technique",
+    "difficulty",
+    "effect",
+    "vec",
+})
+
+KCAG_VECTOR_PLACEHOLDERS = frozenset({
+    "V-NN",
+    "V-N",
+    "V-XX",
+    "V-00",
+})
 
 # Reconciles single-digit vec IDs (V-1) to the canonical zero-padded,
 # two-digit form (V-01) required by KCAG_VECTOR_ID_PATTERN. Deliberately
@@ -1062,6 +1077,30 @@ def normalize_vec_id(value: str) -> str:
         return f"V-0{match.group(1)}"
     return value
 
+def _write_stage2_writer_status(
+    *,
+    status: str,
+    nodes: object,
+    edges: object,
+    errors: list[str] | None = None,
+    artifact_path: str | None = None,
+) -> str:
+    """Persist the latest Stage 2 writer attempt for orchestration diagnostics."""
+
+    status_path = run_context.artifact_path(
+        "stage2_writer_status.json"
+    )
+
+    payload = {
+        "status": status,
+        "node_count": len(nodes) if isinstance(nodes, list) else None,
+        "edge_count": len(edges) if isinstance(edges, list) else None,
+        "errors": list(errors or []),
+        "artifact_path": artifact_path,
+    }
+
+    run_context.write_stamped_json(status_path, payload)
+    return status_path
 
 @tool("write_stage2_vectors")
 def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> str:
@@ -1089,7 +1128,21 @@ def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]
     VALID_DIFF = KCAG_DIFFICULTIES
 
     if not isinstance(nodes, list) or not isinstance(edges, list):
-        return "REJECTED: 'nodes' and 'edges' must both be lists. Nothing written."
+        errors = [
+            "'nodes' and 'edges' must both be lists"
+        ]
+
+        status_path = _write_stage2_writer_status(
+            status="REJECTED",
+            nodes=nodes,
+            edges=edges,
+            errors=errors,
+        )
+
+        return (
+            "REJECTED: 'nodes' and 'edges' must both be lists. "
+            f"Nothing written. Diagnostic: {status_path}"
+        )
 
     # Normalize single-digit vec IDs (V-1 -> V-01) to the canonical
     # zero-padded form BEFORE duplicate detection, validation, hashing,
@@ -1100,14 +1153,50 @@ def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]
     # both become V-01), so duplicate-vec detection runs on the normalized
     # values below.
     normalized_edges = []
-    for e in edges:
-        if isinstance(e, dict):
-            ne = dict(e)
-            ne["vec"] = normalize_vec_id(str(ne.get("vec", "")))
-            normalized_edges.append(ne)
+    for edge in edges:
+        if isinstance(edge, dict):
+            normalized_edge = dict(edge)
+
+            # Preserve a genuinely missing vec field so required-field
+            # validation can report it. Do not manufacture vec="".
+            if "vec" in normalized_edge:
+                normalized_edge["vec"] = normalize_vec_id(
+                    str(normalized_edge["vec"]).strip()
+                )
+
+            normalized_edges.append(normalized_edge)
         else:
-            normalized_edges.append(e)
+            normalized_edges.append(edge)
+
     edges = normalized_edges
+
+    # ---- PLACEHOLDER VEC CHECK (runs BEFORE duplicate detection) -----------
+    # `vec (V-NN)` in this tool's own docstring/task instructions is
+    # NOTATION describing the expected format, not a literal value — but a
+    # local model will sometimes copy it verbatim as data. If every edge
+    # gets the same literal placeholder, duplicate-vec detection below would
+    # produce N-1 derivative "duplicate vec" errors that don't name the real
+    # problem. Catch the placeholder directly here first, with ONE message
+    # that gives the exact corrected sequence — far easier for a small local
+    # model to repair than a pile of collision errors.
+    PLACEHOLDER_VECS = {"V-NN", "V-N", "V-XX", "V-00"}
+    placeholder_edges = [
+        i for i, e in enumerate(edges)
+        if isinstance(e, dict) and str(e.get("vec", "")).strip().upper() in PLACEHOLDER_VECS
+    ]
+    if placeholder_edges:
+        corrected = "\n  ".join(
+            f"edge[{i}] = V-{i + 1:02d}" for i in range(len(edges))
+        )
+        return (
+            "REJECTED: edge list failed validation. Nothing written.\n\n"
+            f"- All {len(placeholder_edges)} of {len(edges)} edge(s) use a placeholder vec value "
+            f"(e.g. 'V-NN'). 'V-NN' is NOTATION in the instructions describing the expected "
+            "format — it is not a value to copy.\n"
+            "- Replace them with unique concrete values in edge order:\n  "
+            f"{corrected}\n\n"
+            "Correct the payload and call write_stage2_vectors again."
+        )
 
     errors = []
     node_ids = set()
@@ -1126,23 +1215,112 @@ def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]
             errors.append(f"node '{nid}' criticality must be int 1-10, got {crit}")
 
     seen_vecs = set()
-    for i, e in enumerate(edges):
-        if not isinstance(e, dict) or "source" not in e or "target" not in e:
-            errors.append(f"edge[{i}] missing source/target"); continue
-        if e["source"] not in node_ids:
-            errors.append(f"edge[{i}] source '{e['source']}' is not a declared node")
-        if e["target"] not in node_ids:
-            errors.append(f"edge[{i}] target '{e['target']}' is not a declared node")
-        diff = str(e.get("difficulty", "MEDIUM")).upper()
-        if diff not in VALID_DIFF:
-            errors.append(f"edge[{i}] difficulty '{diff}' invalid (LOW|MEDIUM|HIGH)")
-        # Duplicate vec detection runs on NORMALIZED values, so a payload
-        # containing both V-1 and V-01 (which collide to V-01) is caught.
-        vec_val = e.get("vec")
-        if vec_val in seen_vecs:
-            errors.append(f"edge[{i}] has duplicate vec '{vec_val}' "
-                          f"(possibly a collision created by V-N/V-0N normalization)")
-        seen_vecs.add(vec_val)
+
+    for i, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            errors.append(f"edge[{i}] must be an object")
+            continue
+
+        missing_fields = sorted(KCAG_REQUIRED_EDGE_FIELDS - edge.keys())
+        if missing_fields:
+            errors.append(
+                f"edge[{i}] missing required field(s): "
+                f"{', '.join(missing_fields)}"
+            )
+
+        source = str(edge.get("source", "")).strip()
+        target = str(edge.get("target", "")).strip()
+
+        if not source:
+            errors.append(f"edge[{i}] source must be non-empty")
+        elif source not in node_ids:
+            errors.append(
+                f"edge[{i}] source '{source}' is not a declared node"
+            )
+
+        if not target:
+            errors.append(f"edge[{i}] target must be non-empty")
+        elif target not in node_ids:
+            errors.append(
+                f"edge[{i}] target '{target}' is not a declared node"
+            )
+
+        # Do not default missing difficulty to MEDIUM. Missing means invalid.
+        if "difficulty" in edge:
+            difficulty = str(edge["difficulty"]).strip().upper()
+            if difficulty not in KCAG_DIFFICULTIES:
+                errors.append(
+                    f"edge[{i}] difficulty {edge['difficulty']!r} invalid; "
+                    "expected LOW, MEDIUM, or HIGH"
+                )
+
+        if "effect" in edge:
+            raw_effect = edge["effect"]
+            normalized_effect = (
+                raw_effect.strip().upper()
+                if isinstance(raw_effect, str)
+                else raw_effect
+            )
+
+            if normalized_effect not in KCAG_EFFECTS:
+                errors.append(
+                    f"edge[{i}] effect {raw_effect!r} invalid; expected "
+                    "DECEIVE, DISRUPT, DEGRADE, DESTROY, or null"
+                )
+
+        if "vec" in edge:
+            vec_value = str(edge["vec"]).strip()
+
+            if vec_value in KCAG_VECTOR_PLACEHOLDERS:
+                errors.append(
+                    f"edge[{i}].vec is the placeholder {vec_value!r}; "
+                    "assign a unique concrete ID such as "
+                    "'V-01', 'V-02', or 'V-03'"
+                )
+            elif not KCAG_VECTOR_ID_PATTERN.fullmatch(vec_value):
+                errors.append(
+                    f"edge[{i}].vec must be a concrete vector ID such as "
+                    f"'V-01', 'V-02', or 'V-03'; received {vec_value!r}"
+                )
+            elif vec_value in seen_vecs:
+                errors.append(
+                    f"edge[{i}] has duplicate vec '{vec_value}' "
+                    "(possibly a collision created by V-N/V-0N normalization)"
+                )
+            else:
+                seen_vecs.add(vec_value)
+
+    # Every declared node must participate in at least one edge.
+    #
+    # Without this check, unused nodes become additional roots and dead
+    # ends that pass the writer but fail the deeper KCAG structural gate.
+    incident_node_ids: set[str] = set()
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+
+        source = str(edge.get("source", "")).strip()
+        target = str(edge.get("target", "")).strip()
+
+        if source:
+            incident_node_ids.add(source)
+
+        if target:
+            incident_node_ids.add(target)
+
+    unused_node_ids = sorted(
+        node_id
+        for node_id in node_ids
+        if node_id not in incident_node_ids
+    )
+
+    if unused_node_ids:
+        errors.append(
+            "declared node(s) are unused and must either be removed "
+            "or connected by an edge: "
+            + ", ".join(unused_node_ids)
+        )
 
     goal_nodes = [n["id"] for n in nodes if isinstance(n, dict) and n.get("node_type") == "goal"]
     if not goal_nodes:
@@ -1155,15 +1333,39 @@ def write_stage2_vectors(nodes: list[dict[str, Any]], edges: list[dict[str, Any]
         errors.append("no entry node (every node has an incoming edge) — graph has no start")
 
     if errors:
-        return ("REJECTED: edge list failed validation. Nothing written. Fix and resubmit:\n  - "
-                + "\n  - ".join(errors))
+        status_path = _write_stage2_writer_status(
+            status="REJECTED",
+            nodes=nodes,
+            edges=edges,
+            errors=errors,
+        )
+
+        return (
+            "REJECTED: edge list failed validation. Nothing written. "
+            "Fix and resubmit:\n - "
+            + "\n - ".join(errors)
+            + f"\n\nDiagnostic: {status_path}"
+        )
 
     out_path = run_context.artifact_path("stage2_vectors.json")
     run_context.write_stamped_json(out_path, {"nodes": nodes, "edges": edges})
 
-    return (f"WRITTEN: {out_path} | "
-            f"{len(nodes)} nodes, {len(edges)} edges, {len(goal_nodes)} goal(s), "
-            f"entry node(s): {entry_nodes}. Annex B may now build the KCAG.")
+    status_path = _write_stage2_writer_status(
+        status="WRITTEN",
+        nodes=nodes,
+        edges=edges,
+        errors=[],
+        artifact_path=out_path,
+    )
+
+    return (
+        f"WRITTEN: {out_path} | "
+        f"{len(nodes)} nodes, {len(edges)} edges, "
+        f"{len(goal_nodes)} goal(s), "
+        f"entry node(s): {entry_nodes}. "
+        f"Writer status: {status_path}. "
+        "Annex B may now build the KCAG."
+    )
 
 
 MAX_REPORTED_KCAG_CYCLES = 20
@@ -1758,6 +1960,41 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
         except json.JSONDecodeError as e:
             return f"ERROR: cpd_config_json is not valid JSON ({e}). Refusing to run on undefined input."
 
+    # Resolve an agent-supplied approved-config basename against the active
+    # run directory. Agents frequently provide `annexc_assessment_config.json`
+    # rather than the full outputs/<run_id>/ path.
+    if approved_config_path:
+        supplied_approved_path = os.path.expanduser(
+            approved_config_path
+        )
+
+        if os.path.exists(supplied_approved_path):
+            approved_config_path = supplied_approved_path
+        else:
+            run_scoped_approved_path = (
+                run_context.artifact_path(
+                    os.path.basename(
+                        supplied_approved_path
+                    )
+                )
+            )
+
+            if os.path.exists(
+                run_scoped_approved_path
+            ):
+                approved_config_path = (
+                    run_scoped_approved_path
+                )
+            else:
+                return (
+                    "ERROR: approved Annex C configuration "
+                    "was not found at either "
+                    f"{supplied_approved_path!r} or "
+                    f"{run_scoped_approved_path!r}. "
+                    "Refusing to score an undefined "
+                    "assessment configuration."
+                )
+
     # ---- APPROVED-CONFIG BOUNDARY (fail closed) -----------------------------
     # When an approved run-scoped Annex C assessment config exists, it is the
     # ONLY configuration that may be scored. The analyst reviewed and approved
@@ -1880,6 +2117,8 @@ def bbn_threat_score(cpd_config_json: str = "", priors_path: str = "config/bbn_p
     cpd_audit_log = AUDIT + baseline.cpd_audit_log
 
     report = {
+        "status": "PASS",
+        "annex_c_status": "PASS",
         "threat_score": baseline.threat_score,
         "threat_level": baseline.threat_level,
         "baseline_score": baseline.baseline_score,

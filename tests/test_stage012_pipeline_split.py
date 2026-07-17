@@ -143,6 +143,70 @@ def _build_mock_kickoff(captured, *, stage1_should_fail=False):
     return mock_kickoff
 
 
+
+
+@pytest.fixture(autouse=True)
+def _stub_automatic_final_report_stage(
+    monkeypatch,
+):
+    """
+    These tests exercise Stage 0/1/2 crew sequencing and use intentionally
+    incomplete downstream artifact fixtures. Final-report behavior is tested
+    independently in tests/test_final_report.py.
+    """
+
+    def fake_generate_or_reuse_final_report(
+        *,
+        out_dir,
+        llm,
+        timeout_seconds=600,
+        force=False,
+    ):
+        return {
+            "reused": False,
+            "quarantine": None,
+            "outputs": {
+                "context": (
+                    f"{out_dir}/final_report_context.json"
+                ),
+                "inventory": (
+                    f"{out_dir}/artifact_inventory.json"
+                ),
+                "report_json": (
+                    f"{out_dir}/final_assessment_report.json"
+                ),
+                "report_markdown": (
+                    f"{out_dir}/final_assessment_report.md"
+                ),
+                "validation": (
+                    f"{out_dir}/final_report_validation.json"
+                ),
+                "completion": (
+                    f"{out_dir}/assessment_completion.json"
+                ),
+            },
+        }
+
+    def fake_validate_existing_final_report(
+        out_dir,
+    ):
+        return {
+            "is_valid": False,
+            "status": "INCOMPLETE",
+            "errors": [],
+            "outputs": {},
+        }
+
+    monkeypatch.setattr(
+        "src.final_report.generate_or_reuse_final_report",
+        fake_generate_or_reuse_final_report,
+    )
+
+    monkeypatch.setattr(
+        "src.final_report.validate_existing_final_report",
+        fake_validate_existing_final_report,
+    )
+
 @pytest.fixture
 def pipeline_workspace(tmp_path, monkeypatch):
     import shutil
@@ -298,7 +362,7 @@ def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=F
     sys.argv = ["src.crew"]
 
     import unittest.mock as _mock
-    import src.annexc_derivation as _annexc_mod
+    import src.annexc_artifact_gate as _annexc_mod
 
     # The Annex C derivation approval gate is exercised by its own dedicated
     # tests (test_annexc_derivation.py). Here we bypass it so this pipeline
@@ -331,7 +395,14 @@ def _run_pipeline(run_id_hint, *, stage1_should_fail=False, stage3_should_fail=F
 def test_full_pipeline_succeeds_with_split_stage012_crews(pipeline_workspace):
     result, captured, _ = _run_pipeline("happy_run")
     assert result == "SUCCESS", result
-    assert captured["crews_run"] == ["stage0", "stage1", "stage2", "analysis", "stage4"]
+    assert captured["crews_run"] == [
+        "stage0",
+        "stage1",
+        "stage2",
+        "analysis",  # Annex B
+        "analysis",  # Annex C and Stage 3
+        "stage4",
+    ]
 
 
 def test_stage1_crew_runs_prose_only_with_direct_write_outside_executor(pipeline_workspace):

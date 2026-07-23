@@ -1,277 +1,120 @@
 # Vanguard Workbench
 
-**AI-augmented threat modeling and human-governed assessment planning**
+**Local-first threat modeling and human-governed assessment planning**
 
-Vanguard Workbench is a local-first, agentic analysis pipeline for authorized Information Warfare, Red Team, and Purple Team assessment planning.
+Vanguard Workbench is an agentic analysis pipeline for authorized Information Warfare, Red Team, and Purple Team assessment planning.
 
-It converts an approved source corpus into:
+It uses locally hosted language models and deterministic Python tooling to turn an approved source corpus into structured threat analysis, assessment concepts, mission-planning artifacts, and defensive validation material.
 
-* Reverse IPB findings
-* Structured system decomposition
-* Framework-grounded attack vectors
-* Kill Chain Attack Graph analysis
-* Bayesian threat estimates
-* Human-reviewed test concepts
-* MDMP-style mission plans
-* Defensive coverage and Sigma-rule scaffolds
-
-Vanguard is a **decision-support system**. It does not autonomously execute tests against a System Under Test. Human operators remain responsible for authorization, model review, implementation, execution, safety, and final assessment decisions.
+> [!IMPORTANT]
+> **Project status: Experimental / research prototype**
+>
+> This is a private, independently developed project made publicly visible for reference and collaboration. It is not a production system, commercial product, or officially supported assessment platform.
+>
+> Interfaces, schemas, workflows, and generated artifacts may change as the project evolves.
 
 > [!WARNING]
 > Use Vanguard only on systems you own or are explicitly authorized to assess.
 >
-> Generated findings, threat scores, test concepts, mission plans, and detection rules require qualified human review before operational use.
-
----
-
-## Table of Contents
-
-* [What Vanguard Does](#what-vanguard-does)
-* [How the Pipeline Works](#how-the-pipeline-works)
-* [System Requirements](#system-requirements)
-* [Installation](#installation)
-* [Model Setup](#model-setup)
-* [Quick Start](#quick-start)
-* [Prepare the Assessment Brief](#prepare-the-assessment-brief)
-* [Add Source Material](#add-source-material)
-* [Optional Source Collection](#optional-source-collection)
-* [Freeze the Corpus](#freeze-the-corpus)
-* [Run an Assessment](#run-an-assessment)
-* [Monitor a Running Assessment](#monitor-a-running-assessment)
-* [Resume an Interrupted Assessment](#resume-an-interrupted-assessment)
-* [Assessment Outputs](#assessment-outputs)
-* [Pipeline Stages](#pipeline-stages)
-* [Purple Team Workflow](#purple-team-workflow)
-* [Dashboard](#dashboard)
-* [Testing](#testing)
-* [Security Considerations](#security-considerations)
-* [Current Limitations](#current-limitations)
-* [Troubleshooting](#troubleshooting)
-* [Repository Layout](#repository-layout)
-* [Responsible Use](#responsible-use)
-
----
+> Vanguard does not autonomously execute tests against a System Under Test. Human operators remain responsible for authorization, implementation, execution, safety, model review, and final assessment decisions.
 
 ## What Vanguard Does
 
-Vanguard helps an authorized assessment team answer four questions:
+Vanguard processes an approved source corpus through a staged assessment workflow:
 
-1. Where should we test first?
-2. Why is that path important?
-3. How should the test be controlled?
-4. What should defenders observe and measure?
+```text
+Assessment brief and approved sources
+                ↓
+        Frozen corpus verification
+                ↓
+        System and threat analysis
+                ↓
+       Attack-surface and graph analysis
+                ↓
+        Quantitative threat modeling
+                ↓
+       Human-reviewed test concepts
+                ↓
+      Human-reviewed mission planning
+                ↓
+       Final assessment artifacts
+```
 
-The project combines local language models with deterministic Python tools.
+The pipeline combines:
 
-AI agents organize evidence, build structured analysis, and draft planning artifacts. Deterministic tools perform corpus verification, framework-ID validation, graph calculations, Bayesian inference, artifact hashing, and safety-language checks.
+* Local language models for analysis and drafting
+* Deterministic validation and safety checks
+* Run-scoped artifact storage
+* Human approval gates
+* Resume support for interrupted runs
+* Optional Purple Team and dashboard workflows
 
-The intended operating model is:
+Vanguard is a decision-support system:
 
 > **Vanguard proposes, prioritizes, explains, and documents. Humans authorize, implement, execute, and decide.**
 
----
-
-## How the Pipeline Works
-
-```text
-Approved source corpus
-        ↓
-Corpus lock verification
-        ↓
-Stage 0 — Reverse IPB
-        ↓
-Stage 1 — System decomposition
-        ↓
-Stage 2 — Attack-surface mapping
-        ↓
-Deterministic framework verification
-        ↓
-Deterministic KCAG structural validation
-        ↓
-Read-only quantitative KCAG review
-        ↓
-Annex B — Kill Chain Attack Graph
-        ↓
-Annex C — Bayesian threat model
-        ↓
-Deterministic BBN sensitivity analysis
-        ↓
-Stage 3 — Human-reviewed test concepts
-        ↓
-Deterministic structured Stage 3 test-plan validation
-        ↓
-Deterministic pre-Stage-4 safety gate
-        ↓
-Stage 4 — MDMP-style mission plan
-        ↓
-Deterministic structured Stage 4 execution-plan validation
-        ↓
-Final defense-in-depth safety check
-        ↓
-Purple Team defensive validation
-```
-
-Vanguard currently uses:
-
-* **CrewAI** for multi-agent orchestration
-* **Ollama** for local model inference
-* **Pydantic** for structured artifacts
-* **NetworkX** for KCAG analysis
-* **pgmpy** for Bayesian inference
-* **SearXNG** for optional locally brokered web search
-* **Streamlit** for the experimental dashboard
-
----
-
-## System Requirements
+## Requirements
 
 ### Required
 
 * macOS or Linux
 * Python 3.12 is the currently tested version
 * Git
-* Ollama, or another supported local inference service
-* Sufficient local memory for your selected model and corpus
+* Ollama or another compatible local inference service
+* Sufficient local memory for the selected models and source corpus
 
 ### Optional
 
-* Docker with Docker Compose for the SearXNG collection workflow
-* A second terminal for monitoring the heartbeat log
+* Docker with Docker Compose for the source-collection workflow
+* A second terminal for monitoring active runs
 
-### Hardware considerations
-
-The reasoning model is a 27-billion-parameter local model. Runtime depends heavily on:
-
-* Available RAM or unified memory
-* Model quantization
-* CPU or GPU acceleration
-* Corpus size
-* Number of generated graph nodes and edges
-
-Large Stage 1, Stage 2, and Annex C generations may take substantially longer than simple extraction tasks.
-
-## Model Setup
-
-Vanguard is designed to run with local language models. This keeps model inference and assessment content on infrastructure controlled by the operator.
-
-You may configure any local model that is compatible with the pipeline’s inference, context-window, structured-output, and tool-use requirements. Model selection depends on your available hardware, desired runtime, and assessment complexity.
-
-Model configuration is stored in:
-
-```text
-config/llm.py
-```
-
-After configuring your preferred model, confirm that the local inference service is running and that the configured model is available.
-
-For Ollama:
-
-```bash
-ollama list
-
-curl http://localhost:11434/api/tags
-```
-
-Model quality varies significantly. Operators are responsible for validating generated analysis and selecting models appropriate for their use case.  
-
----
+Runtime depends on the selected models, available hardware, corpus size, context-window requirements, and generated output size.
 
 ## Installation
 
-### 1. Clone the repository
+Clone the repository:
 
 ```bash
 git clone https://github.com/colejv/vanguard-workbench.git
 cd vanguard-workbench
 ```
 
-### 2. Create a virtual environment
+Create and activate a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-### 3. Upgrade the packaging tools
+Upgrade the Python packaging tools:
 
 ```bash
 python -m pip install --upgrade pip setuptools wheel
 ```
 
-### 4. Install the project dependencies
+Install the project dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-This installs all required dependencies, including `pypdf` for PDF source ingestion.
-
-### 5. Create the runtime directories
+Create the runtime directories:
 
 ```bash
 mkdir -p sources outputs corpus-index
 ```
 
-### 6. Verify the Python import path
-
-Run this command from the repository root:
+Confirm that the project imports successfully:
 
 ```bash
 python -c "import src.crew; print('Vanguard imports successfully')"
 ```
 
----
+Run all commands from the repository root.
 
-## Model Setup
+## Configure a Local Model
 
-Start Ollama using the normal method for your operating system.
-
-### Core analysis models
-
-The current core pipeline uses:
-
-* `gemma4:e4b` for lightweight extraction
-* `qwen3.6:27b` for reasoning, structured output, and tool execution
-
-Install them:
-
-```bash
-ollama pull gemma4:e4b
-ollama pull qwen3.6:27b
-```
-
-### Optional collection and Sigma model
-
-The current collection query planner and Sigma generator still reference:
-
-```text
-gemma4:12b-mlx
-```
-
-Install it when using those optional components:
-
-```bash
-ollama pull gemma4:12b-mlx
-```
-
-### Verify the models
-
-```bash
-ollama list
-```
-
-Verify the Ollama API:
-
-```bash
-curl http://localhost:11434/api/tags
-```
+Vanguard is designed to use locally hosted language models.
 
 The core model configuration is stored in:
 
@@ -279,161 +122,76 @@ The core model configuration is stored in:
 config/llm.py
 ```
 
-The default endpoints are:
+You may use the local model that best fits your hardware and assessment requirements.
 
-```text
-OpenAI-compatible endpoint: http://localhost:11434/v1
-Native Ollama endpoint:     http://localhost:11434
+The selected model should provide:
+
+* Sufficient context capacity for the source corpus
+* Reliable structured output
+* Reliable tool calling
+* Adequate reasoning performance
+* Compatibility with the configured inference endpoint
+
+For Ollama, install your selected model:
+
+```bash
+ollama pull <model-name>
 ```
 
----
-
-## Quick Start
-
-After installation and model setup:
-
-````bash
-# 1. Edit the authorized assessment brief
-$EDITOR collection/brief.md
-
-# 2. Add approved sources
-cp /path/to/approved/material.md sources/
-cp /path/to/approved/manual.pdf sources/
-
-# 3. Freeze the corpus
-python - <<'PY'
-import hashlib
-import json
-from pathlib import Path
-
-source_dir = Path("sources")
-extensions = {".md", ".txt", ".json", ".pdf"}
-
-files = sorted(
-    path
-    for path in source_dir.iterdir()
-    if path.is_file()
-    and path.suffix.lower() in extensions
-    and not path.name.startswith("_")
-    and path.name != "corpus_manifest.md"
-)
-
-manifest = {
-    "files": [
-        {
-            "file": path.name,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-        for path in files
-    ]
-}
-
-manifest_path = source_dir / "corpus_manifest.md"
-manifest_path.write_text(
-    "# Frozen Corpus Manifest\n\n"
-    "This manifest binds the assessment to the exact files listed below.\n\n"
-    "```json\n"
-    + json.dumps(manifest, indent=2)
-    + "\n```\n",
-    encoding="utf-8",
-)
-
-print(f"Wrote {manifest_path}")
-print(f"Locked {len(files)} source files")
-PY
-
-# 4. Run Vanguard
-python -m src.crew
-````
-
-Vanguard prints the new run ID near the beginning of execution.
-
-Example:
+Update the model name and endpoint in:
 
 ```text
-Run ID: vaf_20260709_143022
+config/llm.py
 ```
 
-All assessment artifacts are written under:
+Confirm that Ollama is running:
 
-```text
-outputs/<run_id>/
+```bash
+ollama list
+curl http://localhost:11434/api/tags
 ```
 
----
+The configured model name must match the name reported by:
 
-## Prepare the Assessment Brief
+```bash
+ollama list
+```
 
-Edit:
+Optional components may maintain separate local-model settings in their respective configuration files.
+
+Model quality varies significantly. Generated analysis must be reviewed by a qualified operator before it is used for assessment planning or operational decisions.
+
+## Prepare an Assessment
+
+### 1. Edit the Assessment Brief
+
+Open:
 
 ```text
 collection/brief.md
 ```
 
-The brief should define the friendly System Under Test and the authorized assessment boundaries.
+For example:
 
-Recommended structure:
-
-```markdown
-# Assessment Brief
-
-## System Under Test
-
-- Name or designation:
-- System type:
-- Owner:
-- Vendor:
-- Mission or business purpose:
-- High-level architecture:
-
-## Assessment Purpose
-
-- Assessment objective:
-- Questions to answer:
-- Intended audience:
-- Required deliverables:
-
-## Authorization
-
-- Authorizing authority:
-- Authorization reference:
-- Authorized assets:
-- Authorized environments:
-- Authorized dates:
-- Expiration date:
-
-## Explicit Exclusions
-
-- Out-of-scope systems:
-- Prohibited actions:
-- Prohibited effects:
-- Restricted data:
-- Restricted collection areas:
-
-## Collection Priorities
-
-- Technical:
-- Procedural:
-- Organizational:
-- Cognitive:
-- Defensive telemetry:
-- Relevant threat actors:
-
-## Safety Requirements
-
-- Required approvers:
-- Range or test-environment owner:
-- Abort authority:
-- Rollback requirements:
-- Emergency contacts:
-- Additional physical-safety restrictions:
+```bash
+nano collection/brief.md
 ```
 
-Do not place credentials, classified data, export-controlled information, or sensitive operational material in the repository unless the system and workstation are approved to handle it.
+The brief should identify:
 
----
+* The System Under Test
+* The assessment objective
+* The authorizing authority
+* Authorized assets and environments
+* Explicit exclusions
+* Prohibited actions or effects
+* Collection priorities
+* Required reviewers and approvers
+* Abort and rollback requirements
 
-## Add Source Material
+Do not include credentials, classified data, export-controlled information, or sensitive operational material unless the workstation and repository are approved to handle it.
+
+### 2. Add Approved Source Material
 
 Place approved files in:
 
@@ -441,7 +199,7 @@ Place approved files in:
 sources/
 ```
 
-Supported extensions are:
+Supported source types are:
 
 ```text
 .md
@@ -458,128 +216,27 @@ cp ~/Documents/vendor-manual.pdf sources/
 cp ~/Documents/exercise-report.txt sources/
 ```
 
-Files beginning with `_` are treated as metadata and excluded from the analytical corpus.
+Files beginning with `_` are treated as metadata and are not included in the analytical corpus.
 
-Examples:
+For example:
 
 ```text
 sources/_provenance.jsonl
 ```
 
-The frozen manifest is also excluded:
+Text-based PDFs can be processed directly. Scanned or image-only PDFs must be converted with an approved OCR process before they are added to the corpus.
+
+## Freeze the Source Corpus
+
+Vanguard requires a frozen manifest at:
 
 ```text
 sources/corpus_manifest.md
 ```
 
-### PDF requirements
+The manifest binds the assessment to the exact source files and file hashes reviewed by the operator.
 
-Text-based PDFs are extracted with `pypdf`.
-
-Scanned or image-only PDFs must be processed with an approved OCR workflow before ingestion. Confirm that text can be extracted before freezing the corpus.
-
----
-
-## Optional Source Collection
-
-Vanguard includes an optional open-web collection workflow using a local SearXNG service.
-
-> [!CAUTION]
-> The collection workflow is internet-connected.
->
-> SearXNG runs locally, but the collector retrieves selected destination webpages directly. Local SearXNG does not make collection offline, anonymous, or fully isolated.
-
-### 1. Start SearXNG
-
-From the repository root:
-
-```bash
-docker compose \
-  -f collection/searxng/docker-compose.yml \
-  up -d
-```
-
-Confirm that the service is available:
-
-```bash
-curl http://localhost:8080
-```
-
-Check container status:
-
-```bash
-docker compose \
-  -f collection/searxng/docker-compose.yml \
-  ps
-```
-
-### 2. Install the collection model
-
-The current query planner uses `gemma4:12b-mlx`:
-
-```bash
-ollama pull gemma4:12b-mlx
-```
-
-### 3. Run the collector
-
-```bash
-python collection/collector.py collection/brief.md
-```
-
-The collector:
-
-* Generates bounded search queries
-* Queries the local SearXNG instance
-* Retrieves candidate webpages
-* Scores document relevance
-* Saves retained documents under `sources/`
-* Appends provenance records to `sources/_provenance.jsonl`
-
-The collector currently uses hard limits for:
-
-* Query expansion depth
-* Total searches
-* Retained documents
-* Minimum relevance
-
-Review all collected material before freezing the corpus.
-
-### 4. Stop SearXNG
-
-```bash
-docker compose \
-  -f collection/searxng/docker-compose.yml \
-  down
-```
-
-### Collection security recommendations
-
-For sensitive assessments:
-
-* Run collection separately from analysis.
-* Use a restricted container or virtual machine.
-* Route traffic through an approved proxy.
-* Apply outbound network controls.
-* Block private, loopback, link-local, and metadata-service addresses.
-* Review redirects and destination domains.
-* Inspect all collected documents before transferring them into the analysis environment.
-
----
-
-## Freeze the Corpus
-
-Vanguard refuses to start Stage 0 unless the corpus matches:
-
-```text
-sources/corpus_manifest.md
-```
-
-The manifest must contain a JSON block listing every source filename and SHA-256 hash.
-
-### Create the manifest
-
-Run from the repository root:
+Run the following command from the repository root after adding or changing source files:
 
 ````bash
 python - <<'PY'
@@ -588,15 +245,15 @@ import json
 from pathlib import Path
 
 source_dir = Path("sources")
-extensions = {".md", ".txt", ".json", ".pdf"}
-
 source_dir.mkdir(parents=True, exist_ok=True)
+
+supported = {".md", ".txt", ".json", ".pdf"}
 
 files = sorted(
     path
     for path in source_dir.iterdir()
     if path.is_file()
-    and path.suffix.lower() in extensions
+    and path.suffix.lower() in supported
     and not path.name.startswith("_")
     and path.name != "corpus_manifest.md"
 )
@@ -626,94 +283,80 @@ print(f"Locked {len(files)} source files")
 PY
 ````
 
-Review it:
+Review the generated manifest:
 
 ```bash
 cat sources/corpus_manifest.md
 ```
 
-### Corpus-lock behavior
-
-Before Stage 0, Vanguard re-hashes the current source files.
-
-The run fails closed when:
+Vanguard will refuse to begin the assessment when:
 
 * The manifest is missing
-* The JSON block is malformed
-* A source file is missing
-* A new source was added
-* A source file changed
-* A source cannot be read
+* The manifest is malformed
+* A listed source is missing
+* A new source has been added
+* A source file has changed
+* A source file cannot be read
 
-After intentionally changing the corpus:
+After intentionally changing the source corpus:
 
-1. Review the new or changed material.
+1. Review the changed material.
 2. Regenerate `sources/corpus_manifest.md`.
 3. Start a new assessment run.
 
 Do not resume an older run against a changed corpus.
 
----
+## Run the Preflight Check
 
-## Run an Assessment
+Before starting an assessment, run:
 
-From the repository root:
+```bash
+python preflight_check.py
+```
+
+The preflight check validates the local project configuration without starting the full workflow or calling the language model.
+
+Resolve any reported failures before beginning the assessment.
+
+## Run Vanguard
+
+Start a new assessment from the repository root:
 
 ```bash
 python -m src.crew
 ```
 
-The pipeline will:
+Vanguard will print a run ID near the beginning of execution.
 
-1. Discover the current corpus.
-2. Create or reuse a versioned corpus snapshot.
-3. Generate a unique run ID.
-4. Create a run-specific output directory.
-5. Initialize `assessment_state.json`.
-6. Verify the frozen corpus manifest.
-7. Request human confirmation of the corpus lock.
-8. Read and chunk the source corpus.
-9. Extract named systems, interfaces, organizations, people, and events.
-10. Generate Stage 0 Reverse IPB. Halt if the structured signature list was never written.
-11. Generate Stage 1 system decomposition. Halt if the structured node inventory was never written.
-12. Generate Stage 2 attack vectors and graph topology. Halt if the structured edge list was never written.
-13. Verify Stage 2 framework identifiers.
-14. Halt if Stage 2 verification fails.
-15. Run Annex B KCAG analysis, including deterministic structural validation (`validate_kcag`) and a read-only quantitative review.
-16. Run Annex C Bayesian inference, including deterministic one-way sensitivity analysis.
-17. Request human review for Stage 3.
-18. Validate the structured Stage 3 test plan against the real Stage 2 graph, KCAG report, and technique index. Halt before the pre-Stage-4 safety gate if it fails.
-19. Run the deterministic pre-Stage-4 safety gate. Halt before Stage 4 is even constructed if it fails.
-20. Request human review for Stage 4 — only reached if the gate above passed.
-21. Validate the structured Stage 4 execution plan against the real Stage 3 test plan. Halt before the final safety check if it fails.
-22. Run the final defense-in-depth Phase 0 safety-language check.
-23. Preserve the artifacts in the run directory.
+Example:
 
-### Human-input prompts
+```text
+Run ID: vaf_20260709_143022
+```
 
-Vanguard currently requests human input at:
+All artifacts for that assessment are stored under:
 
-* Corpus-lock confirmation
-* Stage 3 authorization
-* Stage 4 mission-plan release
+```text
+outputs/<run_id>/
+```
 
-Stage 4's prompt is only reached if the deterministic pre-Stage-4 safety gate passed — a Category 2/3 test concept without a complete safety review halts the run before a human ever sees a Stage 4 draft.
+The workflow contains interactive human-review prompts.
 
 Do not approve a stage unless:
 
-* The System Under Test is authorized.
-* The assets are within the approved scope.
-* The proposed effects are permitted.
-* The required owners and operators are present.
-* Abort authority is assigned.
-* Rollback procedures are understood.
-* Required safety personnel have approved the activity.
+* The System Under Test is authorized
+* The proposed activity is within scope
+* The proposed effects are permitted
+* Required owners and operators are available
+* Abort authority has been assigned
+* Rollback procedures are understood
+* Required safety personnel have approved the activity
 
----
+A generated plan is not execution authorization.
 
 ## Monitor a Running Assessment
 
-Each run writes a heartbeat log to:
+Each run writes a heartbeat log:
 
 ```text
 outputs/<run_id>/heartbeat.log
@@ -731,13 +374,11 @@ Example:
 tail -f outputs/vaf_20260709_143022/heartbeat.log
 ```
 
-The heartbeat log labels each phase by name — `stage0_crew`, `stage1_crew`, `stage2_crew` (each gated separately, replacing the earlier single shared `pre_crew` that ran Stage 0 through Stage 2 in one kickoff), `analysis_crew` (Annex B, Annex C, Stage 3), and `stage4_crew` (Stage 4 alone) — so it indicates which specific crew is still active during long local-model operations, not just "still running somewhere."
-
----
+Local model operations may take significant time, especially with large corpora or larger models.
 
 ## Resume an Interrupted Assessment
 
-Resume an existing run with:
+Resume a run with:
 
 ```bash
 python -m src.crew --resume <run_id>
@@ -749,611 +390,109 @@ Example:
 python -m src.crew --resume vaf_20260709_143022
 ```
 
-Vanguard detects completed artifacts and can skip eligible completed work, including:
+Vanguard detects eligible completed artifacts and avoids repeating work that can be safely reused.
 
-* Corpus chunking
-* Stage 0
-* Stage 1
-* Stage 2
-* The quantitative KCAG review (tied to Annex B's own skip decision — see below)
-* Annex B
-* Annex C
+Human-reviewed stages may require fresh approval when resumed.
 
-Stage 3 and Stage 4 are intentionally executed again because they contain human approval prompts. The two deterministic Stage 2 gates (framework-ID verification and KCAG structural validation) also always rerun regardless of resume state — they're cheap, and their result depends only on the Stage 2 artifact already on disk.
+Vanguard refuses to resume when the current corpus differs from the corpus associated with the original run. Start a new assessment instead of forcing artifacts from different corpora into the same run.
 
-### Resume safety
-
-Vanguard refuses to resume when the current corpus snapshot differs from the corpus associated with the original run.
-
-This prevents artifacts from two different corpora from being mixed under the same run ID.
-
-### Find existing runs
+List existing runs:
 
 ```bash
 find outputs -maxdepth 1 -type d -name 'vaf_*' | sort
 ```
 
-Inspect a run:
+Inspect the files from a run:
 
 ```bash
 find outputs/<run_id> -maxdepth 1 -type f | sort
 ```
 
----
-
 ## Assessment Outputs
 
-Each assessment receives its own directory:
+Each assessment receives an isolated output directory:
 
 ```text
 outputs/<run_id>/
 ```
 
-Example:
+Depending on how far the run progresses, the directory may contain:
+
+* Assessment state and audit information
+* Heartbeat logs
+* Corpus snapshots and extracted chunks
+* System-decomposition artifacts
+* Attack-surface and graph artifacts
+* Framework-validation results
+* Quantitative threat-model reports
+* Human-reviewed test concepts
+* Mission-planning artifacts
+* Safety-gate results
+* Final assessment reports
+
+Markdown files provide human-readable reports. JSON files provide structured artifacts used by later stages and deterministic validators.
+
+Protect the following directories according to the sensitivity of the assessment:
 
 ```text
-outputs/vaf_20260709_143022/
-├── assessment_state.json
-├── heartbeat.log
-├── corpus_chunks.json
-├── corpus_lock_confirmation.md
-├── _stage0_scratch.md
-├── stage0.md
-├── stage0_output.json
-├── stage1.md
-├── stage1_output.json
-├── attribution_check.md
-├── stage2.md
-├── stage2_vectors.json
-├── stage2_verification.md
-├── kcag_validation.json
-├── model_assumptions.md
-├── annexB_kcag.md
-├── kcag_report.json
-├── annexC_bbn.md
-├── bbn_report.json
-├── bbn_sensitivity.json
-├── stage3.md
-├── stage3_test_plan.json
-├── stage3_test_plan_validation.json
-├── stage3_safety_gate.json
-├── stage4_mission_plan.md
-├── stage4_execution_plan.json
-├── stage4_execution_plan_validation.json
-└── phase0_safety_check.md
-```
-
-The exact set of files depends on how far the run progressed.
-
-### Artifact isolation
-
-Per-run tools resolve their paths through the active run context.
-
-Structured JSON and Markdown artifacts are stamped with run and corpus identity information. This reduces the risk of accidentally accepting an artifact from another run.
-
-### Shared corpus history
-
-The following directory is intentionally shared across runs:
-
-```text
+sources/
+outputs/
 corpus-index/
 ```
 
-It records corpus versions and framework indexes rather than assessment-specific artifacts.
+These files may reveal system architecture, trust relationships, defensive gaps, candidate attack paths, operational assumptions, or assessment procedures.
 
----
+## Optional Source Collection
 
-## Pipeline Stages
+Vanguard includes an optional internet-connected source-collection workflow using a local SearXNG service.
 
-### Pre-flight corpus snapshot
-
-Vanguard hashes all supported source files and compares the result with earlier corpus snapshots.
-
-Versioned snapshots are written under:
-
-```text
-corpus-index/manifest_vN.json
-```
-
-This snapshot tracks corpus changes across assessments.
-
-It is separate from the operator-approved frozen manifest:
-
-```text
-sources/corpus_manifest.md
-```
-
-### Corpus lock gate
-
-The deterministic corpus-lock gate verifies that the current files match the frozen source manifest before Stage 0 begins.
-
-The result is also presented to a human reviewer through the first CrewAI approval prompt.
-
-### Chunking and extraction
-
-The corpus is assembled into chunks of approximately 60,000 characters.
-
-The decomposer extracts:
-
-* Named systems
-* Subsystems
-* Vendor products
-* Interfaces
-* Protocols
-* Versions
-* Exercise events
-* Named people
-* Organizations
-
-The extracted findings are accumulated in:
-
-```text
-_stage0_scratch.md
-```
-
-> [!NOTE]
-> Stage 0, Stage 1, and Stage 2 each run in their own separately gated crew — `stage0_crew`, `stage1_crew`, `stage2_crew` — not a single shared crew. After each one finishes, Vanguard requires its structured JSON artifact to actually exist on disk before the next stage's crew is even constructed; a stage whose agent produced prose but never successfully wrote its structured artifact halts the run there; the next stage never starts against missing or stale upstream data. Each stage's writer tool (`write_stage0_output`, `write_stage1_output`, `write_stage2_vectors`) also takes real structured tool-call arguments — lists and objects — rather than a single JSON-encoded string parameter, removing an extra layer of serialization a local model previously had to get right in one shot.
->
-> Stage 1 specifically is split into two sequential tasks within `stage1_crew`: one that writes the three-layer prose decomposition, and a second, single-purpose task whose only job is calling `write_stage1_output` from that decomposition. This was a real observed failure, not a theoretical one — Stage 1's combined prompt (three full prose layers, then a trailing four-argument tool call roughly 70 lines later) let the model treat a complete-looking prose answer as satisfying the whole task, with the tool call never attempted at all (confirmed directly in a debug log: zero `Action`/tool-call entries for `write_stage1_output`, not a rejected or malformed one). A short, freshly-started task whose entire job is the tool call is far more reliable for actually getting that call made than a trailing instruction buried at the end of a long compound one.
-
-### Stage 0 — Reverse IPB
-
-Stage 0 synthesizes technical, procedural, cognitive, and social or personnel signatures.
-
-Outputs:
-
-```text
-stage0.md
-stage0_output.json
-```
-
-The structured output contains a curated set of significant signatures with:
-
-* Signature IDs
-* Categories
-* Descriptions
-* Confidence levels
-* Gap markers
-* Deception-candidate markers
-
-### Stage 1 — System decomposition
-
-Stage 1 models:
-
-* Technical components
-* Procedural workflows
-* Cognitive dependencies
-* Asset-control states
-* Information flows
-* Downstream dependencies
-* Trust boundaries
-* Centers-of-gravity candidates
-
-Outputs:
-
-```text
-stage1.md
-stage1_output.json
-```
-
-### Attribution-boundary check
-
-After Stage 0 and Stage 1, Vanguard checks whether named entities in the generated prose can be traced to:
-
-1. The extraction scratchpad
-2. The locked source corpus
-
-Output:
-
-```text
-attribution_check.md
-```
-
-The attribution check is currently advisory. High-confidence untraceable entities are reported for human review but do not automatically halt the run.
-
-### Stage 2 — Attack-surface mapping
-
-Stage 2 maps candidate vectors against the local framework index.
-
-It can reference identifiers from frameworks such as:
-
-* MITRE ATT&CK Enterprise
-* MITRE ATT&CK ICS
-* MITRE ATT&CK Mobile
-* MITRE ATLAS
-* CAPEC
-* EMB3D
-* SPARTA
-* MITRE Engage
-
-Outputs:
-
-```text
-stage2.md
-stage2_vectors.json
-stage2_verification.md
-```
-
-The structured Stage 2 artifact contains graph nodes and edges used by Annex B.
-
-### Stage 2 verification gate (framework identifiers)
-
-A deterministic verifier checks generated technique identifiers against:
-
-```text
-corpus-index/technique_index.json
-```
-
-When verification fails:
-
-* Stage 2 is marked as failed.
-* The KCAG structural gate below does not run.
-* Annex B does not run.
-* Downstream stages are blocked.
-
-Review:
-
-```text
-stage2_verification.md
-```
-
-### Stage 2 structural gate (KCAG topology)
-
-A second, independent deterministic check (`validate_kcag`) verifies the graph itself, separately from framework-ID correctness: `ADV_START` is present, has `node_type='privilege'`, has no incoming edges, and is the sole zero-indegree node; at least one goal node exists and every goal is terminal (no outgoing edges); every node is reachable from `ADV_START`; no duplicate directed edge pairs exist (which `networkx.DiGraph` would otherwise silently collapse); and every node/edge field uses a valid enum value. Directed cycles, non-goal dead ends, and isolated countermeasures are recorded as warnings, not failures.
-
-Neither gate mutates `stage2_vectors.json` — Annex B always reads the same original stamped artifact regardless of which gates ran. Stage 2 is only promoted to `PASS` after **both** gates succeed.
-
-Output:
-
-```text
-kcag_validation.json
-```
-
-When structural validation fails:
-
-* Stage 2 is marked as failed, even if the framework-ID gate above passed.
-* Annex B does not run.
-* Downstream stages are blocked.
-
-### Quantitative KCAG review
-
-After deterministic KCAG validation passes, the Quantitative Threat Modeler performs a read-only semantic review of the graph before Annex B runs.
-
-The distinction from the two deterministic gates above:
-
-```text
-verify_stage2_vectors()   Are the technique IDs real and correctly formatted?
-validate_kcag()           Is the graph structurally well-formed?
-Quantitative KCAG review  Does the graph appear analytically coherent?
-```
-
-A graph can pass both deterministic checks and still be conceptually questionable — an edge pointing in the wrong prerequisite direction, a countermeasure positioned as though it enables an attack, difficulty labels that contradict the described preconditions, and so on. The review examines edge direction, goal semantics, privilege-transition plausibility, countermeasure placement, cycle interpretation, and unsupported assumptions. It cites the specific node IDs, edge endpoints, and vector IDs behind any finding.
-
-The reviewer cannot add, remove, rewrite, or reorder any graph node or edge, does not repeat framework-ID verification, and does not perform or reproduce the NetworkX/Bayesian calculations Annex B performs. It closes with one of three dispositions: `ACCEPT`, `ACCEPT WITH CAVEATS`, or `RECOMMEND STAGE 2 REGENERATION`.
-
-The result is written to:
-
-```text
-outputs/<run_id>/model_assumptions.md
-```
-
-**The review is advisory in this version.** The disposition is not parsed or acted on programmatically — all three outcomes let Annex B proceed identically, using the original, unchanged, deterministically-validated Stage 2 graph. What's enforced is that the artifact exists and is bound to the current run and corpus, not what it concludes. A later commit may add a human-approved blocking disposition once the report format has been exercised against real assessments.
-
-> [!NOTE]
-> This task is assigned to `modeler` (the Quantitative Threat Modeler) with no tools declared, but CrewAI's own `Task` model falls back to an agent's full tool list whenever a task's own tool list is empty. In practice this means the task has `kcag_min_cut` and `bbn_threat_score` technically available at runtime. "Read-only" for this task is a prompt-level instruction ("do not call these tools, do not perform these calculations"), not a mechanical restriction — worth knowing if you're auditing what this agent could theoretically do versus what it's instructed to do.
-
-### Annex B — Kill Chain Attack Graph
-
-Annex B reads the Stage 2 graph artifact and uses NetworkX to calculate:
-
-* Graph size
-* Goal nodes
-* Minimum node cuts
-* Betweenness centrality
-* Candidate attack paths
-* A priority path
-
-Outputs:
-
-```text
-annexB_kcag.md
-kcag_report.json
-```
-
-`kcag_report.json` schema version 2 uses `top_path_score` (per objective) and `score` (per ranked path) — not `top_path_prob` / `probability`, which the schema no longer emits. Each report also carries a `scoring_model` block stating explicitly that these are uncalibrated heuristic values, not probabilities.
-
-The score is calculated by mapping each edge's qualitative difficulty label to a configured traversal value (`TRAVERSAL_SCORE_BY_DIFFICULTY`: LOW→0.8, MEDIUM→0.5, HIGH→0.2) and multiplying those values along each candidate path. It supports relative ranking of candidate paths only.
-
-Reports generated before this terminology migration may still contain the legacy `top_path_prob` field. Vanguard reads that field for resume compatibility (so an interrupted run whose Annex B already completed under old code doesn't need to rerun it) but interprets it as the same heuristic traversal score it always was, never as an empirical probability. Old reports are never rewritten in place — their hashes and audit history stay intact.
-
-> [!IMPORTANT]
-> The KCAG path values are heuristic traversal scores based on fixed difficulty mappings.
->
-> They are useful for relative ranking but are not empirically calibrated real-world probabilities.
-
-### Annex C — Bayesian threat model
-
-Annex C uses pgmpy to build a Bayesian model from:
-
-* Annex B results
-* An adversary capability prior
-* Assessed operational tempo
-* Defensive posture
-* A geopolitical trigger prior
-* Optional observed evidence
-* Structural priors from `config/bbn_priors.json`
-
-Outputs:
-
-```text
-annexC_bbn.md
-bbn_report.json
-bbn_sensitivity.json
-```
-
-Annex C consumes the maximum KCAG objective traversal score as a heuristic scaling factor in the fixed BBN — read via `extract_kcag_objective_score()`, which accepts either the current `top_path_score` field or the legacy `top_path_prob` field and records in the CPD audit log which one it used. The KCAG graph is not converted into the Bayesian network, and the traversal score is not itself a Bayesian prior; it scales specific CPD values the same way the other per-assessment inputs do. A `kcag_report.json` with conflicting current and legacy score values, or a score outside `[0.0, 1.0]`, fails Annex C closed rather than silently picking one.
-
-The BBN refuses to use silent per-assessment defaults for required inputs.
-
-Both the per-assessment configuration and `config/bbn_priors.json` are validated deterministically (`src/bbn_validation.py`) *before* any pgmpy model is constructed — not just "is this field present," but shape, type, range, and sum: probability vectors must sum to 1.0, CPD matrix columns must sum to 1.0, evidence deltas must sum to 0.0, booleans and numeric strings are rejected as numbers, NaN and infinity are rejected even where Python's own JSON parser would otherwise accept them, and every prior requires nonempty provenance. All 24 derived `KillChainPhase` combinations (3 capability classes × 2 phishing × 2 scanning × 2 auth-anomaly states) are checked before runtime, catching a delta set that's individually well-formed but invalid once combined. `preflight_check.py` calls this exact same validator, so a clean preflight run means Annex C's own gate will also pass, not just preflight's own separate guess.
-
-`adversary.capability_prior` is used exactly as supplied once validated — it is no longer silently floored and renormalized. A valid analyst-supplied zero stays exactly zero.
-
-The priors file currently contains several analyst-judgment template values. These are not empirically calibrated for a specific assessment and must be reviewed before relying on the resulting scores.
-
-A Bayesian result is conditional on:
-
-* The model structure
-* The supplied priors
-* The conditional probability tables
-* The observed evidence
-* The analyst assumptions
-
-It should not be treated as objective ground truth.
-
-### BBN sensitivity analysis
-
-After the baseline BBN result, Annex C runs deterministic one-way sensitivity analysis: change exactly one input or model parameter, rebuild the complete BBN, run inference with the same evidence as the baseline, compare against the baseline, then restore and move to the next scenario. No Monte Carlo, no random sampling, no Sobol indices, no correlated variation — those require defensible parameter distributions this codebase does not yet have.
-
-Scenarios cover:
-
-* `adversary.capability_prior` — each of the three states (hacktivist/criminal/nation-state) shifted ±10% of the probability simplex, taking or releasing mass proportionally from the other two states
-* `adversary.tempo` — the other two categorical states
-* Each `defensive_posture` control — toggled independently
-* `geopolitical_trigger_prior` and the KCAG objective traversal score — ±0.10, clipped to `[0.0, 1.0]`
-* Twelve scalar model priors (defensive multiplier floor/scale, IW-effect phase bases, the objective convergence factor and cap, posture multipliers, geopolitical multiplier and cap) — perturbed by 10% of their validated range where bounded, or ±10% relative where only a lower bound exists
-
-Observed evidence is held fixed across every scenario — it is not an uncertain prior, and varying it would be a different method (counterfactual-evidence analysis). A scenario is recorded `SKIPPED`, with a stated reason, whenever: a perturbation would cross a simplex or range boundary already at its edge, supplied evidence fixes the node being varied (`AdversaryCapability` masks capability-prior scenarios, `GeopoliticalTrigger` masks geopolitical-prior scenarios), or the perturbed candidate fails the same deterministic validator (`src/bbn_validation.py`) real inputs must pass — the validator is never weakened to let a scenario through. An unexpected failure (model construction, `check_model()`, inference, or a non-finite result) is distinct from an expected skip: it marks the whole sensitivity run `FAIL`, and neither `bbn_report.json` nor `bbn_sensitivity.json` is written for that run.
-
-Output:
-
-```text
-outputs/<run_id>/bbn_sensitivity.json
-```
-
-Scenarios are ranked by parameter using maximum absolute threat-score change, with a deterministic tie-break by parameter name. The report also states whether the qualitative threat-level classification (`LOW`/`ELEVATED`/`HIGH`/`CRITICAL`) stayed stable across every executed scenario — stability here means only that none of these specific deterministic stress tests crossed a classification boundary, not proof of general model robustness. The report records exact source hashes for the assessment configuration, the priors file, and the KCAG report it was computed against, plus the versioned perturbation policy, so a report can always be tied back to the exact inputs that produced it.
-
-> [!IMPORTANT]
-> These are deterministic stress perturbations, not confidence intervals, error margins, standard deviations, or credible intervals. The Quantitative Threat Modeler is instructed to report the tool's own ranking and summary without recalculating or reframing it as a statistical estimate.
-
-### Quantitative Threat Modeler
-
-Annex B and Annex C are both executed by the Quantitative Threat Modeler agent.
-
-The agent runs Vanguard's deterministic KCAG and Bayesian-analysis tools (`kcag_min_cut`, `bbn_threat_score`). It does not author the Stage 2 graph topology, and it may not invent priors, conditional probability values, or observed evidence. Required per-assessment inputs for Annex C (adversary capability, tempo, defensive posture, geopolitical trigger, observed evidence) must trace to an approved assessment input or an explicitly labeled analyst judgment — an untraceable required value is reported as a blocking gap, not filled in with a plausible number.
-
-The agent also distinguishes deterministic calculations from configured heuristic scores. The current KCAG path-ranking value in particular is a configured heuristic (fixed difficulty-to-value mappings multiplied along a path), not a calibrated, empirically-derived probability, even where legacy field names or phrasing elsewhere may still call it one.
-
-Mathematical consistency does not establish that a model accurately represents the real system. KCAG and BBN results require review by both a quantitative specialist and a system-domain expert.
-
-> [!NOTE]
-> Graph-theoretic structural validation (`validate_kcag` — node/edge integrity, `ADV_START` as sole root, goal reachability, no duplicate edges) and a read-only analytical review by this agent (`model_assumptions.md`, disposition `ACCEPT` / `ACCEPT WITH CAVEATS` / `RECOMMEND STAGE 2 REGENERATION`) both run as part of Annex B, described above. The review's disposition remains advisory only; it is never parsed or acted on programmatically, and never blocks Annex B — see [Current Limitations](#current-limitations).
-
-### Stage 3 — Human-reviewed test concepts
-
-Stage 3 reviews the verified attack vectors and Annex B priority path.
-
-It drafts categorized test concepts for human review. For any test concept carrying Category 2 (Degradation & Destruction) or Category 3 (Physical Behavior Alteration), Stage 3 is required to include a complete `PRE-STAGE-4 SAFETY REVIEW` section: affected assets, required approving roles, safety authority, abort authority, abort criteria, maximum termination time, rollback procedure, and an explicit release condition. When no Category 2/3 concepts exist, Stage 3 must instead state so explicitly — silence is never treated as compliant.
-
-Alongside the prose, Stage 3 also writes a structured, machine-checkable test plan via `write_stage3_test_plan` — the same test concepts (test ID, objective, category numbers, Stage 2 vector references, KCAG path, execution technique references, success/abort criteria, safety controls where applicable) in a closed Pydantic schema (`src/stage3_schema.py`), rather than only free-form prose.
-
-Output:
-
-```text
-stage3.md
-stage3_test_plan.json
-```
-
-Stage 3 requires human input.
-
-The human reviewer remains responsible for determining whether each concept is:
-
-* Authorized
-* Technically grounded
-* Safe
-* Within scope
-* Appropriate for the actual system architecture
-
-### Structured test-plan validation
-
-Before the existing pre-Stage-4 safety gate runs, Vanguard deterministically validates the structured test plan against the real, already-verified Stage 2 graph, KCAG report, and technique index (`src/stage3_validation.py`) — not just whether the plan is well-formed, but whether it's *true*: every Stage 2 vector reference actually exists; every KCAG path starts at `ADV_START`, ends at a goal node, and only uses edges that are actually in the graph; a path declared as the Annex B priority path actually matches it; every execution technique reference is either a real ID from the technique index or the exact `[UNMAPPED]` marker with a stated rationale; every Category 2/3 concept carries complete safety controls, and every concept without Category 2/3 carries none; and the assessment-wide safety review's `covered_test_ids` exactly matches the concepts that actually carry Category 2/3 — no more, no fewer.
-
-A separate check (`check_stage3_artifact_consistency`) confirms the structured plan and the human-reviewed prose describe the *same* test concepts: every test ID in one has a matching heading or entry in the other, declared category numbers agree, and the prose never contains the "no Category 2/3" sentence when the structured plan declares Category 2/3 concepts.
-
-This is intentionally a hard gate, not advisory: an LLM-generated plan that references a nonexistent graph node, edge, or technique ID never reaches Stage 4 merely because its prose reads convincingly. `write_stage3_test_plan` (the writer tool) only performs shallow, writer-time checks — schema shape, size limits, placeholder values — deliberately deferring every referential and cross-artifact check to this later, deterministic pass, once every input artifact is final.
-
-Output:
-
-```text
-stage3_test_plan_validation.json
-```
-
-A failing result halts the run before the existing pre-Stage-4 safety gate below ever runs, and before Stage 4 is constructed.
-
-### Pre-Stage-4 safety gate
-
-After the structured test-plan validation above passes, Vanguard deterministically checks the stamped, verified Stage 3 prose artifact for the safety-review requirement described above. This remains an independent check over the human-readable prose — intentionally duplicating part of what the structured validation already checked — and it remains the single place Stage 3 is promoted to `PASS`.
-
-Output:
-
-```text
-stage3_safety_gate.json
-```
-
-A noncompliant result halts the run immediately. Stage 4 is never built and the Stage 4 human-approval prompt is never reached — this is the actual enforcement point for Stage 3's safety-review requirement, not the final check described below.
-
-### Stage 4 — MDMP-style mission plan
-
-Stage 4 produces a phased mission plan containing:
-
-* Planned actions
-* Framework mappings
-* Execution sequencing
-* OPSEC measures
-* Blue Team telemetry requirements
-* Detection criteria
-* Safety-gate language where required
-
-Alongside the prose, Stage 4 also writes a structured, machine-checkable execution plan via `write_stage4_execution_plan` — the same phases and actions (phase/action identifiers, one Stage 3 test binding per concept, responsible roles, preconditions, success/abort criteria, recovery steps, telemetry requirements, alert triggers, OPSEC measures, and the Phase 0 safety disposition) in a closed Pydantic schema (`src/stage4_schema.py`). The schema fixes `"execution_authorization": "NOT_GRANTED"` — this artifact is a planning product, and human review of a CrewAI task is not equivalent to signed operational authorization.
-
-Output:
-
-```text
-stage4_mission_plan.md
-stage4_execution_plan.json
-```
-
-Stage 4 requires human input. This prompt is only reached if the pre-Stage-4 safety gate above passed.
-
-### Structured Stage 4 validation
-
-After Stage 4 completes, Vanguard deterministically validates the structured execution plan against the real, already-verified Stage 3 test plan (`src/stage4_validation.py`) — every Stage 3 test concept has exactly one binding, and that binding's categories, Stage 2 vector references, KCAG path, and technique references exactly restate what Stage 3 already declared; every Stage 3 concept is assigned to at least one Stage 4 action (a concept may be split across several actions or phases, as long as their combined fields still cover everything Stage 3 required for it — success criteria, abort criteria, recovery steps, telemetry requirements, and preconditions); every action independently carries a responsible role, an alert trigger, and an OPSEC measure; and for a Category 2/3 concept, Stage 4's Phase 0 safety gate cannot weaken the approved maximum termination time or drop a required approving role or assessment-level abort criterion. A separate check confirms the structured plan and the prose describe the same phases and actions, and that the Phase 0 disposition agrees between them.
-
-This necessarily runs after Stage 4's own human-input approval — both Stage 4 artifacts are products of that task and cannot exist before it — so it cannot intercept that review. It can, and does, prevent the run from completing on top of a plan that silently dropped, altered, or invented a Stage 3 test concept.
-
-The validation report records `source_identity` — canonical content hashes of the exact `stage4_execution_plan.json` and `stage3_test_plan.json` it validated. This is what the Purple Team compiler later checks to confirm the plan it's about to compile is the exact plan this validation ran against, not a same-run replacement — see [Purple Team Workflow](#purple-team-workflow).
-
-Output:
-
-```text
-stage4_execution_plan_validation.json
-```
-
-A failing result halts the run before the final defense-in-depth safety check below ever runs.
-
-### Final defense-in-depth safety check
-
-After the structured Stage 4 validation above passes, Vanguard runs a third, independent check confirming the generated mission plan **prose** carries forward the required Phase 0 safety-gate language and does not contradict the already-approved Stage 3 assessment.
-
-Output:
-
-```text
-phase0_safety_check.md
-```
-
-A noncompliant result prevents the run from completing successfully.
-
-> [!WARNING]
-> This third check runs after the Stage 4 human-input prompt, so it cannot intercept that approval — it can prevent the run from finalizing, but a human will have already seen and approved the Stage 4 draft by the time it runs.
->
-> The pre-Stage-4 gate is the check that actually runs before that prompt. The structured Stage 4 validation above and this prose check both exist as defense in depth after it: the structured check catches a plan that silently drops or alters a Stage 3 test concept or weakens an approved safety control; this prose check catches the case where Stage 3 and Stage 4 directly contradict each other in the human-readable artifacts (e.g. Stage 3 declares Category 2/3 concepts but Stage 4's prose claims none apply).
-
----
-
-## Purple Team Workflow
-
-Vanguard includes a separate Purple Team workflow for:
-
-* Compiling the verified, run-scoped structured Stage 4 execution plan into defensive artifacts
-* Crosswalking ATT&CK technique references against Atomic Red Team
-* Identifying coverage gaps
-* Generating draft Sigma rules
-
-No prose parsing occurs in the default path. The compiler reads `stage4_execution_plan.json` directly — the same structured artifact the deterministic Stage 4 validator already checked against Stage 3 before the run could reach `PASS`.
-
-> [!IMPORTANT]
-> **Purple Team output must derive from the exact structured Stage 4 plan that passed deterministic validation for the selected run — not from a copied, regex-parsed prose file.** The compiler enforces this: it requires Stage 4 status `PASS`, requires `stage4_execution_plan_validation.json` to report `is_valid: true`, and (via the same stamped-JSON mechanism used throughout the pipeline) refuses an artifact copied in from a different run or a different corpus. It also hashes the current `stage4_execution_plan.json` and `stage3_test_plan.json` and compares them against the content hashes the validation report recorded when it ran — a plan that was replaced *after* validation, even within the same run and with matching stamps, is rejected, since a same-run swap to a merely schema-valid plan would otherwise defeat the entire point of this boundary. A missing or invalid structured plan is an error — the compiler never silently falls back to Markdown parsing.
-
-### Run the Purple Team compiler
+Start SearXNG:
 
 ```bash
-python -m src.purple.purple_compiler --run-id vaf_20260709_143022
+docker compose \
+  -f collection/searxng/docker-compose.yml \
+  up -d
 ```
 
-For each Stage 4 action, the compiler:
+Confirm that it is available:
 
-* Restates that action's Stage 3 test binding (categories, Stage 2 vector IDs, KCAG path, technique IDs) directly from the verified structured plan
-* Crosswalks its technique IDs against the Atomic Red Team index (cached at `corpus-index/art_index.json`, fetched and cached automatically if absent)
-* Records `VETTED_REFERENCE_AVAILABLE` where a published Atomic Red Team test exists, or `COVERAGE_GAP` otherwise — a vetted reference means a published test exists, not that it is approved, safe, or ready for this specific environment; the Purple operator still decides that
+```bash
+curl http://localhost:8080
+```
 
-Outputs:
+Run the collector:
+
+```bash
+python collection/collector.py collection/brief.md
+```
+
+The collector saves retained material under:
 
 ```text
-outputs/<run_id>/purple_scaffold.json
-outputs/<run_id>/purple_graph.json
+sources/
 ```
 
-`purple_scaffold.json` is a versioned, run-stamped object (one record per Stage 4 action, plus a `coverage_summary` and the propagated `execution_authorization: NOT_GRANTED` / Phase 0 execution-release disposition) — not a bare list. `purple_graph.json` (renamed from the earlier `kcag_data.json`, which was never actually the KCAG) is a node/edge graph over actions, with edges labeled `WITHIN_PHASE` or `PHASE_TRANSITION`.
+Review every collected document before including it in an assessment.
 
-Refresh the cached Atomic Red Team index explicitly if needed:
+After collection:
+
+1. Remove irrelevant or unapproved material.
+2. Review the retained sources.
+3. Freeze the source corpus.
+4. Run the preflight check.
+5. Start a new assessment.
+
+Stop SearXNG when collection is complete:
 
 ```bash
-python -m src.purple.purple_compiler --run-id vaf_20260709_143022 --refresh-art-index
+docker compose \
+  -f collection/searxng/docker-compose.yml \
+  down
 ```
 
-### Legacy Markdown compatibility
+SearXNG running locally does not make web collection offline, anonymous, or isolated. The collector still communicates with internet destinations.
 
-A run predating structured Stage 4 has no `stage4_execution_plan.json`. For that case only, pass the prose plan explicitly:
-
-```bash
-python -m src.purple.purple_compiler \
-  --run-id vaf_20260709_143022 \
-  --legacy-markdown outputs/vaf_20260709_143022/stage4_mission_plan.md
-```
-
-This is never triggered automatically. It emits a deprecation warning, still writes into the selected run's directory, and marks every resulting record `provenance_status: LEGACY_PARTIAL` — structured fields unavailable from prose (test ID, Stage 2 vectors, KCAG path, safety disposition) are left as explicit empty values, never invented ones.
-
-### Generate Sigma-rule scaffolds
-
-The Sigma generator uses `gemma4:12b-mlx`:
-
-```bash
-ollama pull gemma4:12b-mlx
-```
-
-Then run:
-
-```bash
-python -m src.purple.sigma_generator --run-id vaf_20260709_143022
-```
-
-One rule is generated per Stage 4 action that has at least one telemetry requirement or alert trigger, drafted from that action's structured `telemetry_requirements`, `alert_triggers`, `action_summary`, Stage 3 `test_id`, and `technique_ids` — not a concatenated prose phase parsed from Markdown.
-
-Outputs:
-
-```text
-outputs/<run_id>/sigma_rules/ACT-001_RT-001.yml
-outputs/<run_id>/sigma_rules_manifest.json
-```
-
-The manifest is run-stamped and binds every generated (or failed) rule file to its action and test ID. An LLM call that fails (e.g. Ollama unreachable) is recorded as `GENERATION_FAILED` in the manifest rather than silently omitted or reported as success.
-
-Generated rules are drafts, not production-ready detections.
-
-Before deployment, validate:
-
-* Sigma syntax
-* Log-source availability
-* Field mappings
-* SIEM backend compatibility
-* False-positive behavior
-* Expected event volume
-* Detection latency
-* Test-case coverage
-
----
-
-## Dashboard
+## Optional Dashboard
 
 The experimental Streamlit dashboard is located at:
 
@@ -1367,455 +506,120 @@ Start it from the repository root:
 streamlit run src/ui/dashboard.py
 ```
 
-The dashboard contains views for:
+The dashboard reads assessment data from run-specific directories under:
 
-* Threat surface (an interactive action graph)
-* Coverage map (Atomic Red Team crosswalk per technique reference)
-* Defensive validation (generated Sigma rules)
+```text
+outputs/
+```
 
-A sidebar run selector lists every directory under `outputs/` that has an `assessment_state.json`, most recent first. Selecting a run establishes it as the active run (`run_context.set_active_run`) for the rest of the session, and all three views read that run's stamped `purple_scaffold.json`, `purple_graph.json`, and `sigma_rules/` directly — no flat compatibility paths, no copying required.
+Some dashboard views require a completed assessment and generated Purple Team artifacts.
 
-Clicking a node in the threat-surface graph drills the Coverage Map and Defensive Validation tabs down to that specific Stage 4 action; "Reset View (Show All)" in the sidebar clears the filter. Graph nodes are Stage 4 action IDs (e.g. `ACT-001`), not the sequential phase indices the legacy graph used.
+## Troubleshooting
 
-If a selected run hasn't had the Purple Team compiler or Sigma generator run against it yet, each view reports that plainly rather than showing stale or empty data silently.
+### Import Errors
 
----
-
-## Testing
-
-Activate the virtual environment:
+Confirm that the virtual environment is active:
 
 ```bash
 source .venv/bin/activate
 ```
 
-Run the test suite:
-
-```bash
-pytest -q
-```
-
-Run an import smoke test:
-
-```bash
-python -c "import src.crew"
-```
-
-The current test suite includes coverage for:
-
-* Pydantic schemas (Stage 0, Stage 1, and the structured Stage 3 test-plan schema)
-* Stage 0 and Stage 1 tools and writer validation
-* Assessment state behavior and crew/state integration
-* The Stage 3 / Stage 4 crew split, including the pre-Stage-4 trust boundary
-* KCAG structural validation (`validate_kcag`), the read-only quantitative review task, and the KCAG probability-to-heuristic-score terminology migration (including legacy-report compatibility)
-* The Quantitative Threat Modeler agent's role and tooling
-* Deterministic numeric validation of BBN per-assessment inputs and priors (`src/bbn_validation.py`), including the pure BBN evaluator (`src/bbn_model.py`)
-* Deterministic BBN sensitivity analysis (`src/bbn_sensitivity.py`) — scenario generation, evidence masking, driver ranking, and fail-closed behavior on an unexpected scenario failure
-* The Stage 3 prose safety gate (`check_stage3_safety_gate`)
-* The structured Stage 3 test-plan writer, deterministic referential validation against the real Stage 2 graph/KCAG report/technique index, and prose/JSON cross-artifact consistency
-* The structured Stage 4 execution-plan writer, deterministic Stage 3 test-binding validation (categories, Stage 2 vectors, KCAG path, technique IDs, criteria inheritance across split actions), structured Phase 0 safety-gate coverage, and prose/JSON cross-artifact consistency
-* The Purple Team compiler's run trust boundary (Stage 4 `PASS`, a passing validation report, cross-run/cross-corpus stamp rejection), structured compilation into one record per Stage 4 action, the Atomic Red Team crosswalk, the isolated legacy Markdown parser (never triggered automatically), and the Sigma generator's run-scoped manifest — none of these tests perform live network or LLM calls
-* The Streamlit dashboard's run selector, and its three views reading real, compiled run-scoped Purple Team artifacts (via `streamlit.testing.v1.AppTest`, which runs the actual app code in a simulated session) — including the coverage-map status-color mapping and graceful handling of a run with no Purple artifacts yet
-* The structured (non-stringified-JSON) tool-call arguments for `write_stage0_output`, `write_stage1_output`, and `write_stage2_vectors`, the Stage 0 / Stage 1 / Stage 2 crew split, and Stage 1's own prose/write task split — including a real, end-to-end mocked pipeline run confirming a stage whose crew ran but never actually wrote its structured artifact halts before the next stage's crew is even constructed, and a direct assertion that `stage1_crew` is constructed with both tasks rather than the split existing only in prompt text
-
-The live model pipeline is significantly more expensive and less deterministic than the unit tests. Use mocked or fixture-based tests for routine development wherever practical.
-
----
-
-## Security Considerations
-
-### Vanguard is not an autonomous execution platform
-
-The core pipeline generates analysis and planning artifacts.
-
-It does not, by itself, establish:
-
-* Legal authority
-* Rules of engagement
-* System-owner approval
-* Safety approval
-* Technical correctness
-* Operational feasibility
-
-Those remain human responsibilities.
-
-### Local inference does not mean the entire project is offline
-
-The core analysis models run through local Ollama endpoints.
-
-However, network access may still occur during:
-
-* Package installation
-* Model installation
-* Optional web collection
-* Atomic Red Team index retrieval
-* Repository updates
-
-### Collection content is untrusted
-
-External webpages and documents may contain:
-
-* Incorrect information
-* Fabricated identifiers
-* Prompt-injection attempts
-* Misleading instructions
-* Hidden or malformed content
-
-Treat source documents as evidence, not as trusted agent instructions.
-
-### Review generated artifacts
-
-LLMs can produce:
-
-* Unsupported claims
-* Incorrect architecture assumptions
-* Incorrect framework mappings
-* Internally inconsistent plans
-* Overconfident conclusions
-
-Deterministic validation reduces some failure modes but does not eliminate the need for expert review.
-
-### Protect sensitive artifacts
-
-Assessment outputs may disclose:
-
-* System architecture
-* Trust relationships
-* Defensive gaps
-* Candidate attack paths
-* Operational procedures
-* Safety assumptions
-
-Protect `sources/`, `outputs/`, and `corpus-index/` according to the sensitivity of the assessment.
-
----
-
-## Current Limitations
-
-Vanguard is an active research prototype.
-
-Current limitations include:
-
-* A read-only Quantitative Threat Modeler review of the KCAG graph exists (`model_assumptions.md`), but its disposition (ACCEPT / ACCEPT WITH CAVEATS / RECOMMEND STAGE 2 REGENERATION) is advisory only — never parsed or acted on programmatically, and never blocks Annex B.
-* The BBN contains analyst-judgment template priors that require case-specific review.
-* BBN sensitivity analysis is deterministic one-way perturbation only (no Monte Carlo, no joint/correlated scenarios, no CPD-matrix or probability-vector-prior perturbation yet).
-* The structured Stage 3 test-plan validator checks referential integrity against the real Stage 2 graph, KCAG report, and technique index, plus internal quality rules (no identical success/abort criteria, no duplicate list entries) — it does not evaluate whether a test concept is itself well-designed, ethically sound, or operationally realistic. That remains the human reviewer's responsibility.
-* The final defense-in-depth safety check still runs after the Stage 4 human-input prompt, so it cannot intercept that specific approval (the pre-Stage-4 gate is what actually runs before it, and does intercept).
-* The attribution-boundary check is advisory rather than blocking.
-* The optional collector still uses `gemma4:12b-mlx`, while the core reasoning agents use `qwen3.6:27b`.
-* `VETTED_REFERENCE_AVAILABLE` in the Purple Team crosswalk means a published Atomic Red Team test exists for that technique ID — it does not mean the test is approved, safe, applicable, or ready for this specific environment. The Purple operator still decides that.
-* The Purple Team compiler retrieves the Atomic Red Team index from the internet when no local cache exists.
-* The project has not been qualified for safety-critical or operational deployment.
-
----
-
-## Troubleshooting
-
-### `ModuleNotFoundError`
-
-Confirm that commands are being run from the repository root:
+Confirm that you are in the repository root:
 
 ```bash
 pwd
 ls
 ```
 
-The directory should contain:
-
-```text
-src/
-collection/
-config/
-requirements.txt
-```
-
-Activate the environment:
-
-```bash
-source .venv/bin/activate
-```
-
-Reinstall dependencies:
+Reinstall the dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-### Ollama connection failure
+### Local Model Connection Errors
 
-Check the API:
+Check the local Ollama service:
 
 ```bash
 curl http://localhost:11434/api/tags
-```
-
-List installed models:
-
-```bash
 ollama list
 ```
 
-Install the core models:
+Confirm that the model names and endpoints in `config/llm.py` match the local service.
 
-```bash
-ollama pull gemma4:e4b
-ollama pull qwen3.6:27b
-```
+### Missing Corpus Manifest
 
-Install the optional collection and Sigma model:
-
-```bash
-ollama pull gemma4:12b-mlx
-```
-
-### Model not found
-
-Compare the names shown by:
-
-```bash
-ollama list
-```
-
-with:
-
-```text
-config/llm.py
-collection/collector.py
-src/purple/sigma_generator.py
-```
-
-The model name must match exactly.
-
-### PDF source produces no useful text
-
-If a PDF fails to ingest or produces no extractable text, first confirm dependencies are current:
-
-```bash
-python -m pip install -r requirements.txt
-python -c "from pypdf import PdfReader; print('pypdf ready')"
-```
-
-If `pypdf` is present and text extraction still fails, the PDF is most likely image-only or scanned. Use an approved OCR process before adding it to the corpus, then regenerate the frozen manifest.
-
-### `corpus_manifest.md not found`
-
-The corpus has not been frozen.
-
-Create:
+Regenerate:
 
 ```text
 sources/corpus_manifest.md
 ```
 
-using the command in [Freeze the Corpus](#freeze-the-corpus).
+using the corpus-freeze command above.
 
-### Corpus lock violation
+### Corpus-Lock Failure
 
-One or more source files changed after the corpus was frozen.
+A source was added, removed, or changed after the corpus was frozen.
 
-The error will identify:
+Review the changes, regenerate the manifest, and start a new assessment.
 
-* Missing files
-* Added files
-* Changed files
+### Resume Refused
 
-Review the changes, regenerate the manifest, and start a new run.
+The current corpus does not match the corpus used by the original run.
 
-### Resume refused because the corpus changed
-
-Do not force the old run to continue.
-
-Start a new assessment:
+Do not force the old run to continue. Start a new run:
 
 ```bash
 python -m src.crew
 ```
 
-### Stage 2 verification failure
+### PDF Produces No Useful Text
 
-Review:
+The PDF may be scanned or image-only.
 
-```text
-outputs/<run_id>/stage2_verification.md
-```
+Use an approved OCR process, verify the extracted text, replace the source file, and regenerate the corpus manifest.
 
-Look for:
+## Limitations
 
-* Invalid framework identifiers
-* Unsupported mappings
-* Gap markers
-* Malformed vectors
-* Missing graph fields
+Vanguard is an active research prototype.
 
-Correct the source data, prompt, index, or mapping behavior before resuming.
+Local models may generate:
 
-### Annex B fails
+* Unsupported claims
+* Incorrect system assumptions
+* Incorrect framework mappings
+* Inconsistent structured artifacts
+* Overconfident conclusions
+* Incomplete safety considerations
 
-Confirm that this file exists and is valid:
+Deterministic validation reduces some failure modes but does not establish that generated analysis is correct, complete, safe, or operationally appropriate.
 
-```text
-outputs/<run_id>/stage2_vectors.json
-```
+Graph scores, Bayesian outputs, threat rankings, and other quantitative results are decision-support artifacts. They are not objective ground truth and must be reviewed in the context of the source material, model assumptions, and analyst judgment.
 
-Review both gates — either can independently block Annex B:
-
-```text
-outputs/<run_id>/stage2_verification.md
-outputs/<run_id>/kcag_validation.json
-```
-
-`stage2_verification.md` covers framework-ID correctness. `kcag_validation.json` covers graph topology (`ADV_START` as sole root, goal reachability, no duplicate edges, valid enums) — check its `errors` list for the specific structural problem.
-
-Annex B should not be bypassed by manually inventing a replacement graph.
-
-### Annex C fails
-
-Confirm that these files exist:
-
-```text
-outputs/<run_id>/kcag_report.json
-config/bbn_priors.json
-```
-
-Review the error for missing per-assessment fields such as:
-
-* `adversary.capability_prior`
-* `adversary.tempo`
-* `defensive_posture`
-* `geopolitical_trigger_prior`
-
-### Phase 0 safety check fails
-
-Review:
-
-```text
-outputs/<run_id>/phase0_safety_check.md
-```
-
-Do not satisfy the checker by adding keywords without completing the underlying safety, authorization, abort, and rollback review.
-
-### Purple Team compiler rejects a run
-
-The compiler enforces the same trust boundary the structured Stage 4 gate exists to create: Stage 4 status must be `PASS`, and `stage4_execution_plan_validation.json` must report `is_valid: true`. Its error message names exactly which of these failed.
-
-For a run that predates structured Stage 4 (no `stage4_execution_plan.json` at all), use the explicit legacy compatibility flag rather than trying to work around the check:
-
-```bash
-python -m src.purple.purple_compiler \
-  --run-id <run_id> \
-  --legacy-markdown "outputs/<run_id>/stage4_mission_plan.md"
-```
-
-There is no automatic fallback to Markdown parsing — a missing or invalid structured plan is always an error unless `--legacy-markdown` is passed explicitly.
-
-### Dashboard shows no data for a run
-
-Confirm the Purple Team compiler and Sigma generator have both been run for the run selected in the dashboard's sidebar:
-
-```bash
-ls -l outputs/<run_id>/purple_scaffold.json
-ls -l outputs/<run_id>/purple_graph.json
-find outputs/<run_id>/sigma_rules -type f
-```
-
-Each dashboard view reports plainly (not silently) when its underlying artifact is missing for the selected run. If the run doesn't appear in the sidebar selector at all, confirm `outputs/<run_id>/assessment_state.json` exists — that's what the selector uses to discover runs.
-
-Then start:
-
-```bash
-streamlit run src/ui/dashboard.py
-```
-
----
-
-## Repository Layout
-
-```text
-vanguard-workbench/
-├── collection/
-│   ├── brief.md
-│   ├── collector.py
-│   └── searxng/
-│       ├── config/
-│       └── docker-compose.yml
-├── config/
-│   ├── bbn_priors.json
-│   └── llm.py
-├── corpus-index/
-│   ├── technique_index.json
-│   └── manifest_vN.json
-├── outputs/
-│   └── <run_id>/
-├── sources/
-│   ├── corpus_manifest.md
-│   └── _provenance.jsonl
-├── src/
-│   ├── agents.py
-│   ├── crew.py
-│   ├── heartbeat.py
-│   ├── run_context.py
-│   ├── schemas.py
-│   ├── state.py
-│   ├── tasks.py
-│   ├── tools.py
-│   ├── purple/
-│   │   ├── purple_compiler.py
-│   │   └── sigma_generator.py
-│   └── ui/
-│       ├── dashboard.py
-│       ├── components/
-│       └── utils/
-├── tests/
-└── requirements.txt
-```
-
----
+The project has not been qualified for safety-critical or production deployment.
 
 ## Responsible Use
 
 Use Vanguard only for:
 
 * Authorized defensive research
-* Red Team assessments
+* Authorized Red Team assessments
 * Purple Team exercises
 * Controlled test ranges
 * Training environments
-* Systems with explicit written owner authorization
+* Systems with explicit owner authorization
 
 The operator is responsible for:
 
-* Written authorization
-* Scope control
-* Legal compliance
-* Rules of engagement
-* Safety controls
-* Data classification and handling
-* Source review
-* Model-assumption review
-* Test implementation
-* Test execution
-* Abort procedures
-* Rollback procedures
-* Defensive validation
-* Final operational decisions
+* Confirming written authorization
+* Maintaining assessment boundaries
+* Protecting sensitive inputs and outputs
+* Reviewing generated claims
+* Validating framework mappings
+* Reviewing quantitative assumptions
+* Approving test concepts
+* Defining abort and rollback procedures
+* Preventing unauthorized or unsafe execution
 
-Do not use generated material to access, disrupt, degrade, manipulate, or damage systems without explicit authorization from the system owner.
-
----
-
-## Project Status
-
-[!IMPORTANT]
-Project status: Experimental / research prototype
-
-Vanguard Workbench is a personal, independently developed research project. It is not a production system, commercial product, or officially supported assessment platform. Interfaces, schemas, workflows, and outputs may change as the project evolves.
-
-The current development priorities are:
-
-* Make the Quantitative KCAG review's disposition enforceable (a human-approved blocking path when it recommends Stage 2 regeneration, rather than advisory-only)
-* Convert Stage 3 into structured test-plan drafting (structured JSON schema, deterministic referential validation, and prose/JSON consistency checking are already implemented — `src/stage3_schema.py`, `src/stage3_validation.py`)
-* Convert Stage 4 into a structured execution plan with the same treatment (done — `src/stage4_schema.py`, `src/stage4_validation.py`), and migrate the Purple Team compiler, Sigma generator, and dashboard to consume it directly (done — `src/purple/purple_compiler.py`, `src/purple/sigma_generator.py`, `src/ui/dashboard.py` and its components)
-
-The project's intended direction is:
-
-> **Evidence-backed analysis, deterministic calculation, explicit uncertainty, human authorization, and controlled external execution.**
+Vanguard does not grant authorization, replace professional judgment, or remove the need for qualified human review.

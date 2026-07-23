@@ -9,7 +9,7 @@ It uses locally hosted language models and deterministic Python tooling to turn 
 > [!IMPORTANT]
 > **Project status: Experimental / research prototype**
 >
-> This is a private, independently developed project made publicly visible for reference and collaboration. It is not a production system, commercial product, or officially supported assessment platform.
+> This is a privately developed, independently maintained research project made publicly available for reference and collaboration.
 >
 > Interfaces, schemas, workflows, and generated artifacts may change as the project evolves.
 

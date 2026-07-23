@@ -128,10 +128,10 @@ Vanguard currently uses:
 ### Required
 
 * macOS or Linux
-* Python 3.12 or newer
+* Python 3.12 is the currently tested version
 * Git
-* Ollama
-* Sufficient local memory for the configured models
+* Ollama, or another supported local inference service
+* Sufficient local memory for your selected model and corpus
 
 ### Optional
 
@@ -149,6 +149,30 @@ The reasoning model is a 27-billion-parameter local model. Runtime depends heavi
 * Number of generated graph nodes and edges
 
 Large Stage 1, Stage 2, and Annex C generations may take substantially longer than simple extraction tasks.
+
+## Model Setup
+
+Vanguard is designed to run with local language models. This keeps model inference and assessment content on infrastructure controlled by the operator.
+
+You may configure any local model that is compatible with the pipeline’s inference, context-window, structured-output, and tool-use requirements. Model selection depends on your available hardware, desired runtime, and assessment complexity.
+
+Model configuration is stored in:
+
+```text
+config/llm.py
+```
+
+After configuring your preferred model, confirm that the local inference service is running and that the configured model is available.
+
+For Ollama:
+
+```bash
+ollama list
+
+curl http://localhost:11434/api/tags
+```
+
+Model quality varies significantly. Operators are responsible for validating generated analysis and selecting models appropriate for their use case.  
 
 ---
 
@@ -1781,7 +1805,10 @@ Do not use generated material to access, disrupt, degrade, manipulate, or damage
 
 ## Project Status
 
-Vanguard Workbench is an advanced research prototype.
+[!IMPORTANT]
+Project status: Experimental / research prototype
+
+Vanguard Workbench is a personal, independently developed research project. It is not a production system, commercial product, or officially supported assessment platform. Interfaces, schemas, workflows, and outputs may change as the project evolves.
 
 The current development priorities are:
 

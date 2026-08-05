@@ -26,7 +26,7 @@ crewai==1.14.7
 crewai-cli==1.14.7
 crewai-core==1.14.7
 crewai-tools==1.14.7
-cryptography==49.0.0
+cryptography==50.0.0
 dateparser==1.4.1
 deepdiff==9.1.0
 defusedxml==0.7.1

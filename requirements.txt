@@ -6,7 +6,7 @@ aiosqlite==0.21.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
 antlr4-python3-runtime==4.13.2
-anyio==4.14.0
+anyio==4.14.2
 appdirs==1.4.4
 attrs==26.1.0
 babel==2.18.0
